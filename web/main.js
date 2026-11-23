@@ -15,6 +15,7 @@ import {
 import { addRunwayLights } from './runway-lights.js';
 import { addLandingLights, createRunwayEvents } from './runway-events.js';
 import { makeAgentMesh, makeJetMesh, makeFighterMesh, makeDroneMesh } from './aircraft.js';
+import { createLocalFlair } from './local-flair.js';
 
 const WORLD_SIZE = 820;
 const INTERP_RATE = 10; // exponential smoothing constant (per second)
@@ -1058,6 +1059,7 @@ function ensureMesh(a) {
   label.renderOrder = 10;
   built.group.add(label);
   built.label = label;
+  built.labelBaseY = label.position.y;
   built.labelKey = null;
   updateAircraftLabel(built, a);
 
@@ -1082,6 +1084,9 @@ function ensureMesh(a) {
   built.model_class = a.model_class;
   built.ring = ring;
   built.contrails = makeContrailsFor(a);
+  if (a.kind === 'agent' && a.model_class === 'local') {
+    built.localFlair = createLocalFlair(scene, a);
+  }
   built.prop = built.group.getObjectByName('prop');
   built.gear = built.group.getObjectByName('gear');
 
@@ -1117,6 +1122,9 @@ function disposeMesh(id) {
   for (const m of entry.disposeMaterials) m.dispose();
   if (entry.contrails) {
     for (const c of entry.contrails) c.dispose();
+  }
+  if (entry.localFlair) {
+    entry.localFlair.dispose();
   }
   meshes.delete(id);
 }
@@ -1371,8 +1379,11 @@ function applySnapshot(snapshot) {
 
   for (const a of aircraft) {
     seen.add(a.id);
-    // Repaint when the thread switches model (new livery).
-    if (meshes.has(a.id) && meshes.get(a.id).model !== (a.model ?? null)) disposeMesh(a.id);
+    // Repaint when the thread switches model or airframe class (new livery / flair).
+    if (meshes.has(a.id) && (
+      meshes.get(a.id).model !== (a.model ?? null)
+      || meshes.get(a.id).model_class !== a.model_class
+    )) disposeMesh(a.id);
     const entry = ensureMesh(a);
     const y = worldYForAircraft(a, entry.wheelDrop);
     entry.target.set(a.position[0], y, a.position[1]);
@@ -1566,6 +1577,7 @@ function animate() {
     if (wrapped) {
       entry.group.position.copy(entry.target);
       if (entry.contrails) for (const c of entry.contrails) c.clear();
+      if (entry.localFlair) entry.localFlair.reset();
     } else {
       entry.group.position.lerp(entry.target, k);
     }
@@ -1586,7 +1598,10 @@ function animate() {
       ? Math.max(-maxBank, Math.min(maxBank, omega * 1.15))
       : 0;
     entry.roll += (targetRoll - entry.roll) * (1 - Math.exp(-5 * dt));
-    entry.group.rotation.z = entry.roll;
+
+    const stunt = entry.localFlair ? entry.localFlair.updateStunt(entry, dt, airborne) : null;
+    const totalRoll = entry.roll + (stunt ? stunt.roll : 0);
+    entry.group.rotation.z = totalRoll;
 
     // Pitch nose up smoothly during takeoff rotation and climb-out (negative X pitches +Z nose up).
     let targetPitch = 0;
@@ -1599,7 +1614,18 @@ function animate() {
       targetPitch = alt < 10 ? -0.12 : -0.04; // flare just before touchdown
     }
     entry.pitch = (entry.pitch || 0) + (targetPitch - (entry.pitch || 0)) * (1 - Math.exp(-3.5 * dt));
-    entry.group.rotation.x = entry.pitch;
+    entry.group.rotation.x = entry.pitch + (stunt ? stunt.pitch : 0);
+
+    // Keep floating label hovering upright above the fuselage during barrel rolls.
+    if (stunt && stunt.roll !== 0) {
+      entry.label.position.set(
+        Math.sin(totalRoll) * entry.labelBaseY,
+        Math.cos(totalRoll) * entry.labelBaseY,
+        0,
+      );
+    } else if (entry.label.position.x !== 0 || entry.label.position.y !== entry.labelBaseY) {
+      entry.label.position.set(0, entry.labelBaseY, 0);
+    }
 
     // Fade the floating label smoothly as a departing aircraft vanishes into the distant haze.
     if (entry.state === 'departing') {
@@ -1635,6 +1661,11 @@ function animate() {
       for (const c of entry.contrails) {
         c.update(entry.group, dt, emit);
       }
+    }
+
+    // Update local-model towed sky-banner & coloured airshow smoke bursts.
+    if (entry.localFlair) {
+      entry.localFlair.updateVisuals(entry, dt, now, airborne);
     }
 
     if (entry.prop && entry.state !== 'parked' && entry.state !== 'landed') {
