@@ -278,45 +278,102 @@ function makeAgentMesh() {
     color: 0x222831, transparent: true, opacity: 0.35, side: THREE.DoubleSide,
   });
 
-  // Cabin: rounded fuselage.
-  const fuselage = new THREE.Mesh(new THREE.CapsuleGeometry(1.3, 7, 6, 10), mat);
+  // Fuselage: rounded cabin section + tapered tail boom.
+  const fuselage = new THREE.Mesh(new THREE.CapsuleGeometry(1.3, 5, 8, 14), mat);
   fuselage.rotation.x = Math.PI / 2; // along Z
-  fuselage.position.z = -1;
+  fuselage.position.z = 0.6;
   group.add(fuselage);
 
-  // Nose cone + spinner.
-  const nose = new THREE.Mesh(new THREE.ConeGeometry(1.3, 3.5, 10), mat);
-  nose.rotation.x = Math.PI / 2; // point along +Z
-  nose.position.z = 5.5;
-  group.add(nose);
+  const boom = new THREE.Mesh(new THREE.ConeGeometry(1.3, 3, 14), mat);
+  boom.rotation.x = -Math.PI / 2; // taper to the tail
+  boom.position.z = -4.6;
+  group.add(boom);
 
-  // Tractor propeller at the nose (spinning disc).
-  const prop = new THREE.Mesh(new THREE.CircleGeometry(2.2, 14), propMat);
-  prop.position.z = 7.2;
+  // Engine cowl flaring back into the fuselage, plus spinner cone.
+  const cowl = new THREE.Mesh(new THREE.CylinderGeometry(1.0, 1.45, 2, 14), mat);
+  cowl.rotation.x = Math.PI / 2;
+  cowl.position.z = 4.9;
+  group.add(cowl);
+
+  const spinner = new THREE.Mesh(new THREE.ConeGeometry(0.55, 1.3, 12), mat);
+  spinner.rotation.x = Math.PI / 2;
+  spinner.position.z = 6.55;
+  group.add(spinner);
+
+  // Tractor propeller: blur disc plus a blade, spun by name in the loop.
+  const prop = new THREE.Group();
+  const disc = new THREE.Mesh(new THREE.CircleGeometry(2.3, 16), propMat);
+  const blades = new THREE.Mesh(new THREE.BoxGeometry(0.28, 4.4, 0.14), darkMat);
+  prop.add(disc, blades);
+  prop.position.z = 7.05;
   group.add(prop);
   prop.name = 'prop';
 
-  // High wing over the cabin.
-  const wings = new THREE.Mesh(new THREE.BoxGeometry(15, 0.4, 2.4), mat);
-  wings.position.set(0, 1.3, -0.5);
-  group.add(wings);
+  // Cabin block bridging fuselage and high wing.
+  const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.8, 1.1, 2.9), mat);
+  cabin.position.set(0, 1.35, 0.5);
+  group.add(cabin);
 
-  // Struts.
+  // High wing with dihedral; roots buried in the cabin.
   for (const side of [1, -1]) {
-    const strut = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.3, 2), darkMat);
-    strut.position.set(side * 4.5, 0.2, -0.5);
-    strut.rotation.z = side * 0.45;
+    const wing = new THREE.Mesh(new THREE.BoxGeometry(6.4, 0.42, 2.6), mat);
+    wing.position.set(side * 4.3, 2.05, -0.4);
+    wing.rotation.z = side * 0.16;
+    group.add(wing);
+  }
+
+  // Cockpit glazing: side window strips + raked windscreen.
+  for (const side of [1, -1]) {
+    const win = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.55, 2.3), darkMat);
+    win.position.set(side * 0.92, 1.1, 0.7);
+    group.add(win);
+  }
+  const glass = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.6, 0.18), darkMat);
+  glass.position.set(0, 1.55, 2.05);
+  glass.rotation.x = -0.55; // raked back
+  group.add(glass);
+
+  // Wing struts from the fuselage sides to the wing.
+  for (const side of [1, -1]) {
+    const strut = new THREE.Mesh(new THREE.BoxGeometry(0.22, 2.1, 0.22), darkMat);
+    strut.position.set(side * 1.95, 1.0, 0.35);
+    strut.rotation.z = side * -0.75;
     group.add(strut);
   }
 
   // Tailplane + fin.
-  const tail = new THREE.Mesh(new THREE.BoxGeometry(6, 0.4, 2), mat);
-  tail.position.set(0, 0.6, -5.5);
+  const tail = new THREE.Mesh(new THREE.BoxGeometry(5.6, 0.36, 1.9), mat);
+  tail.position.set(0, 0.55, -4.8);
   group.add(tail);
 
-  const fin = new THREE.Mesh(new THREE.BoxGeometry(0.4, 2.6, 2), mat);
-  fin.position.set(0, 1.8, -5.8);
+  const fin = new THREE.Mesh(new THREE.BoxGeometry(0.36, 2.3, 1.8), mat);
+  fin.position.set(0, 1.55, -5.15);
   group.add(fin);
+
+  // Landing gear: legs, wheels, slim spats, plus a tail wheel.
+  for (const side of [1, -1]) {
+    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 1.1, 8), darkMat);
+    leg.position.set(side * 1.45, -1.2, 0.4);
+    group.add(leg);
+
+    const wheel = new THREE.Mesh(new THREE.CylinderGeometry(0.52, 0.52, 0.4, 14), darkMat);
+    wheel.rotation.z = Math.PI / 2; // axle across the fuselage
+    wheel.position.set(side * 1.55, -1.72, 0.4);
+    group.add(wheel);
+
+    const spat = new THREE.Mesh(new THREE.CapsuleGeometry(0.4, 1.6, 4, 10), mat);
+    spat.rotation.x = Math.PI / 2; // fairing along Z
+    spat.position.set(side * 1.75, -1.7, 0.4);
+    group.add(spat);
+  }
+
+  const tailLeg = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.5, 8), darkMat);
+  tailLeg.position.set(0, -0.55, -5.4);
+  group.add(tailLeg);
+
+  const tailWheel = new THREE.Mesh(new THREE.SphereGeometry(0.28, 10, 8), darkMat);
+  tailWheel.position.set(0, -0.85, -5.4);
+  group.add(tailWheel);
 
   return { group, materials: [mat, darkMat, propMat] };
 }
