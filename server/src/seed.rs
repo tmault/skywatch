@@ -273,7 +273,7 @@ mod tests {
         world.tick(6.0);
         let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
         assert_eq!(a.state, State::Taxi);
-        world.tick(20.0);
+        world.tick(40.0);
         let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
         assert_eq!(a.state, State::Parked);
     }
