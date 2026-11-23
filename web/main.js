@@ -1181,13 +1181,101 @@ setupRadio({
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws`);
+/* ------------------------------------------------------ keyboard camera */
+// Arrows orbit around the current target (the followed aircraft when in
+// follow cam), +/- or PageUp/PageDown zoom, WASD pans the overview, Home
+// returns to the overview. Keys are held-state so motion is smooth per frame.
+
+const CAMERA_KEYS = new Set([
+  'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown',
+  'PageUp', 'PageDown', '+', '=', '-', '_',
+  'w', 'a', 's', 'd',
+]);
+const heldKeys = new Set();
+
+function isTypingTarget(el) {
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+}
+
 
   ws.addEventListener('open', () => {
     statusEl.textContent = 'connected';
     statusEl.classList.remove('error');
+    return;
   });
+  if (isTypingTarget(ev.target) || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  if (ev.key === 'Home') {
+    ev.preventDefault();
+    stopFollow(false);
+    returnOverview = true;
+    return;
+  }
+  const key = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
+  if (!CAMERA_KEYS.has(key)) return;
+  ev.preventDefault();
+  heldKeys.add(key);
+  // Manual input takes over from automatic swoop/return glides.
+  followSwoop = false;
+  returnOverview = false;
   ws.addEventListener('close', () => {
     statusEl.textContent = 'disconnected — reconnecting…';
+window.addEventListener('keyup', (ev) => {
+  const key = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
+  heldKeys.delete(key);
+});
+window.addEventListener('blur', () => heldKeys.clear());
+
+const _kbOffset = new THREE.Vector3();
+const _kbSpherical = new THREE.Spherical();
+const _kbForward = new THREE.Vector3();
+const _kbRight = new THREE.Vector3();
+
+function applyKeyboardCamera(dt) {
+  if (heldKeys.size === 0) return;
+  const has = (k) => heldKeys.has(k);
+
+  _kbOffset.copy(camera.position).sub(controls.target);
+  _kbSpherical.setFromVector3(_kbOffset);
+
+  const yaw = (has('ArrowRight') ? 1 : 0) - (has('ArrowLeft') ? 1 : 0);
+  const pitch = (has('ArrowDown') ? 1 : 0) - (has('ArrowUp') ? 1 : 0);
+  const zoom = (has('-') || has('_') || has('PageDown') ? 1 : 0)
+    - (has('+') || has('=') || has('PageUp') ? 1 : 0);
+
+  _kbSpherical.theta += yaw * 1.6 * dt;
+  _kbSpherical.phi = THREE.MathUtils.clamp(
+    _kbSpherical.phi + pitch * 1.0 * dt,
+    0.08,
+    controls.maxPolarAngle,
+  );
+  _kbSpherical.radius = THREE.MathUtils.clamp(
+    _kbSpherical.radius * Math.exp(zoom * 1.4 * dt),
+    controls.minDistance,
+    controls.maxDistance,
+  );
+  _kbOffset.setFromSpherical(_kbSpherical);
+  camera.position.copy(controls.target).add(_kbOffset);
+
+  // Ground-plane pan only in overview; in follow cam the target is the aircraft.
+  if (followId === null) {
+    const fwd = (has('w') ? 1 : 0) - (has('s') ? 1 : 0);
+    const side = (has('d') ? 1 : 0) - (has('a') ? 1 : 0);
+    if (fwd || side) {
+      camera.getWorldDirection(_kbForward);
+      _kbForward.y = 0;
+      if (_kbForward.lengthSq() < 1e-6) _kbForward.set(0, 0, -1);
+      _kbForward.normalize();
+      _kbRight.crossVectors(_kbForward, camera.up).normalize();
+      const speed = _kbSpherical.radius * 0.9 * dt;
+      const move = _kbForward.multiplyScalar(fwd * speed).addScaledVector(_kbRight, side * speed);
+      camera.position.add(move);
+      controls.target.add(move);
+    }
+  }
+}
+
     statusEl.classList.add('error');
     setTimeout(connect, 1500);
   });
@@ -1466,3 +1554,4 @@ window.addEventListener('resize', () => {
 
 connect();
 animate();
+  applyKeyboardCamera(dt);
