@@ -54,7 +54,7 @@ fn default_speed() -> f32 {
 }
 
 /// Sim area is 1000x1000; positions wrap around at the edges.
-const AREA_SIZE: f32 = 1000.0;
+const AREA_SIZE: f32 = 700.0;
 const TAKEOFF_RATE: f32 = 5.0; // m/s climb
 const CRUISE_ALTITUDE: f32 = 120.0;
 const AGENT_SPEED: f32 = 20.0; // m/s, local models
@@ -63,6 +63,12 @@ const DRONE_SPEED: f32 = 6.0; // m/s, drones always slow loiter
 const ORBIT_RADIUS: f32 = 40.0;
 const HOLD_TURN_RATE: f32 = 0.4; // rad/s turn rate while holding
 const HOLD_DRIFT_SPEED: f32 = ORBIT_RADIUS * 0.1; // m/s drift while holding
+
+/// Wrap a coordinate into [-AREA_SIZE/2, AREA_SIZE/2) so the world is
+/// centred on the origin (where the island sits).
+fn wrap_centered(v: f32) -> f32 {
+    (v + AREA_SIZE / 2.0).rem_euclid(AREA_SIZE) - AREA_SIZE / 2.0
+}
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -125,14 +131,14 @@ impl Aircraft {
                 self.heading = (self.heading + dt * HOLD_TURN_RATE) % std::f32::consts::TAU;
                 let dx = self.heading.cos() * HOLD_DRIFT_SPEED * dt;
                 let dy = self.heading.sin() * HOLD_DRIFT_SPEED * dt;
-                self.position[0] = (self.position[0] + dx).rem_euclid(AREA_SIZE);
-                self.position[1] = (self.position[1] + dy).rem_euclid(AREA_SIZE);
+                self.position[0] = wrap_centered(self.position[0] + dx);
+                self.position[1] = wrap_centered(self.position[1] + dy);
             }
             State::Cruising => {
                 let dx = self.heading.cos() * self.speed * dt;
                 let dy = self.heading.sin() * self.speed * dt;
-                self.position[0] = (self.position[0] + dx).rem_euclid(AREA_SIZE);
-                self.position[1] = (self.position[1] + dy).rem_euclid(AREA_SIZE);
+                self.position[0] = wrap_centered(self.position[0] + dx);
+                self.position[1] = wrap_centered(self.position[1] + dy);
             }
             State::Takeoff => {
                 self.altitude += TAKEOFF_RATE * dt;

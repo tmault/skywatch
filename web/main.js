@@ -8,7 +8,7 @@ import {
   appendHistory, stateColor,
 } from './radio.js';
 
-const WORLD_SIZE = 1000;
+const WORLD_SIZE = 700;
 const INTERP_RATE = 10; // exponential smoothing constant (per second)
 
 /* ---------------------------------------------------------------- scene */
@@ -40,11 +40,11 @@ scene.fog = new THREE.Fog(0x123a5c, 400, 1400);
 const camera = new THREE.PerspectiveCamera(
   55, window.innerWidth / window.innerHeight, 1, 3000,
 );
-camera.position.set(0, 480, 260);
+camera.position.set(0, 620, 400);
 camera.lookAt(0, 0, 0);
 
 const controls = new OrbitControls(camera, canvas);
-controls.target.set(0, 60, 0);
+controls.target.set(0, 30, 0);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.maxPolarAngle = Math.PI / 2 - 0.05;
