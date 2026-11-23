@@ -148,14 +148,16 @@ fn default_speed() -> f32 {
 
 /// Sim area is 820x820; positions wrap around at the edges.
 const AREA_SIZE: f32 = 820.0;
-const TAKEOFF_RATE: f32 = 5.0; // m/s climb
-const CRUISE_ALTITUDE: f32 = 100.0;
-const AGENT_SPEED: f32 = 20.0; // m/s, local models
-const FRONTIER_SPEED: f32 = 30.0; // m/s, frontier jets are faster
-const DRONE_SPEED: f32 = 7.0; // m/s, drones slow loiter
-const FIGHTER_SPEED: f32 = 42.0; // m/s, wingman catch-up speed
-const HOLD_TURN_RADIUS: f32 = 55.0; // m, holding orbit radius
-const HOLD_DRIFT_SPEED: f32 = 12.0; // m/s along the holding orbit
+const TAKEOFF_RATE: f32 = 6.0; // m/s climb
+const FRONTIER_ALTITUDE: f32 = 152.0; // high-altitude jet flight level
+const LOCAL_ALTITUDE: f32 = 92.0;     // mid-altitude private prop level
+const DRONE_ALTITUDE: f32 = 60.0;     // low-mid surveillance drone level
+const AGENT_SPEED: f32 = 10.5;        // m/s, calm scenic prop cruise
+const FRONTIER_SPEED: f32 = 14.0;     // m/s, majestic high-altitude jet cruise
+const DRONE_SPEED: f32 = 5.5;         // m/s, slow Reaper loiter
+const FIGHTER_SPEED: f32 = 36.0;      // m/s, wingman catch-up speed
+const HOLD_TURN_RADIUS: f32 = 78.0;   // m, wide calm holding orbit
+const HOLD_DRIFT_SPEED: f32 = 8.0;    // m/s along the holding orbit
 
 /// Home airport geometry (matches the client's island rendering).
 pub const RUNWAY_MID: [f32; 2] = [56.0, -10.0];
@@ -235,21 +237,37 @@ impl Aircraft {
         Self::with_model(callsign, kind, ModelClass::Local)
     }
 
+    /// Target cruise flight level based on airframe class (frontier jets fly higher,
+    /// with slight per-aircraft vertical RVSM separation).
+    pub fn cruise_altitude(&self) -> f32 {
+        match (self.kind, self.model_class) {
+            (Kind::Drone, _) => DRONE_ALTITUDE + (self.id % 2) as f32 * 4.0,
+            (Kind::Agent, ModelClass::Frontier) => {
+                FRONTIER_ALTITUDE + (self.id % 3) as f32 * 5.0
+            }
+            (Kind::Agent, ModelClass::Local) => LOCAL_ALTITUDE + (self.id % 3) as f32 * 4.0,
+            (Kind::Fighter, _) => FRONTIER_ALTITUDE,
+        }
+    }
+
     /// New aircraft with an explicit model class.
     pub fn with_model(callsign: &str, kind: Kind, model_class: ModelClass) -> Self {
         let mut rng = rand::thread_rng();
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let speed = match (kind, model_class) {
             (Kind::Fighter, _) => FIGHTER_SPEED,
             (Kind::Agent, ModelClass::Frontier) => FRONTIER_SPEED,
             (Kind::Agent, ModelClass::Local) => AGENT_SPEED,
             (Kind::Drone, _) => DRONE_SPEED,
         };
-        let alt = match kind {
-            Kind::Drone => 65.0,
-            _ => CRUISE_ALTITUDE,
+        let alt = match (kind, model_class) {
+            (Kind::Drone, _) => DRONE_ALTITUDE + (id % 2) as f32 * 4.0,
+            (Kind::Agent, ModelClass::Frontier) => FRONTIER_ALTITUDE + (id % 3) as f32 * 5.0,
+            (Kind::Agent, ModelClass::Local) => LOCAL_ALTITUDE + (id % 3) as f32 * 4.0,
+            (Kind::Fighter, _) => FRONTIER_ALTITUDE,
         };
         Aircraft {
-            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            id,
             callsign: callsign.to_string(),
             kind,
             model_class,
@@ -398,33 +416,105 @@ impl Aircraft {
                 self.heading = angle + std::f32::consts::FRAC_PI_2;
                 self.position[0] = wrap_centered(nx);
                 self.position[1] = wrap_centered(ny);
+                let hold_alt = self.cruise_altitude();
                 if self.altitude < 40.0 {
-                    self.altitude = CRUISE_ALTITUDE;
-                    self.position[2] = CRUISE_ALTITUDE;
+                    self.altitude = hold_alt;
+                    self.position[2] = hold_alt;
                 }
             }
             State::Cruising => {
-                let target_alt = if self.kind == Kind::Drone {
-                    65.0
-                } else {
-                    CRUISE_ALTITUDE
-                };
-                self.altitude = target_alt;
-                self.position[2] = target_alt;
+                let base_alt = self.cruise_altitude();
 
                 if let Some(topic) = &self.topic {
                     if let Some(sec) = sectors.iter().find(|s| s.name == *topic) {
-                        let r = (self.id as f32 * 21.3 % 20.0) + sec.radius * 0.46;
-                        let omega = self.speed / r;
-                        self.patrol_angle += omega * dt;
-                        let nx = sec.center[0] + self.patrol_angle.cos() * r;
-                        let ny = sec.center[1] + self.patrol_angle.sin() * r;
-                        self.heading = self.patrol_angle + std::f32::consts::FRAC_PI_2;
-                        self.position[0] = wrap_centered(nx);
-                        self.position[1] = wrap_centered(ny);
+                        // Sweeping, calm parametric flight paths instead of tight circles:
+                        // Frontier jets carve wide high-altitude figure-8s / arcs; props &
+                        // drones fly scenic ovals and lazy S-curves at constant true airspeed.
+                        let span = match (self.kind, self.model_class) {
+                            (Kind::Agent, ModelClass::Frontier) => sec.radius * 1.18,
+                            (Kind::Drone, _) => sec.radius * 0.78,
+                            _ => sec.radius * 0.88,
+                        };
+                        let rot = (self.id as f32 * 1.17) % std::f32::consts::TAU;
+                        let (cr, sr) = (rot.cos(), rot.sin());
+                        let pattern = if self.kind == Kind::Drone {
+                            1
+                        } else {
+                            self.id % 3
+                        };
+
+                        let t = self.patrol_angle;
+                        let (du, dv) = match pattern {
+                            // Pattern 0: wide figure-8 (Lissajous 1:2)
+                            0 => {
+                                let a = span * 1.12;
+                                let b = span * 0.56;
+                                (a * t.cos(), 2.0 * b * (2.0 * t).cos())
+                            }
+                            // Pattern 1: broad tilted scenic oval
+                            1 => {
+                                let a = span * 1.15;
+                                let b = span * 0.68;
+                                (-a * t.sin(), b * t.cos())
+                            }
+                            // Pattern 2: gentle three-lobe scenic S-loop
+                            _ => {
+                                let a = span * 0.88;
+                                (
+                                    a * (-t.sin() - 0.66 * (3.0 * t).sin()),
+                                    a * (t.cos() - 0.66 * (3.0 * t).cos()),
+                                )
+                            }
+                        };
+                        let ds_dt = du.hypot(dv).max(1.0);
+                        self.patrol_angle =
+                            (self.patrol_angle + (self.speed / ds_dt) * dt) % std::f32::consts::TAU;
+
+                        let t = self.patrol_angle;
+                        let (u, v, du, dv) = match pattern {
+                            0 => {
+                                let a = span * 1.12;
+                                let b = span * 0.56;
+                                (
+                                    a * t.sin(),
+                                    b * (2.0 * t).sin(),
+                                    a * t.cos(),
+                                    2.0 * b * (2.0 * t).cos(),
+                                )
+                            }
+                            1 => {
+                                let a = span * 1.15;
+                                let b = span * 0.68;
+                                (a * t.cos(), b * t.sin(), -a * t.sin(), b * t.cos())
+                            }
+                            _ => {
+                                let a = span * 0.88;
+                                (
+                                    a * (t.cos() + 0.22 * (3.0 * t).cos()),
+                                    a * (t.sin() - 0.22 * (3.0 * t).sin()),
+                                    a * (-t.sin() - 0.66 * (3.0 * t).sin()),
+                                    a * (t.cos() - 0.66 * (3.0 * t).cos()),
+                                )
+                            }
+                        };
+
+                        let ox = u * cr - v * sr;
+                        let oz = u * sr + v * cr;
+                        let vx = du * cr - dv * sr;
+                        let vz = du * sr + dv * cr;
+
+                        self.heading = vz.atan2(vx);
+                        self.position[0] = wrap_centered(sec.center[0] + ox);
+                        self.position[1] = wrap_centered(sec.center[1] + oz);
+                        // Gentle vertical breath while cruising.
+                        let wave = 2.5 * (2.0 * t).sin();
+                        self.altitude = base_alt + wave;
+                        self.position[2] = self.altitude;
                         return;
                     }
                 }
+                self.altitude = base_alt;
+                self.position[2] = base_alt;
                 let dx = self.heading.cos() * self.speed * dt;
                 let dy = self.heading.sin() * self.speed * dt;
                 self.position[0] = wrap_centered(self.position[0] + dx);
@@ -486,15 +576,16 @@ impl Aircraft {
                 }
             }
             State::Takeoff => {
+                let target_alt = self.cruise_altitude();
                 self.altitude += TAKEOFF_RATE * dt;
                 self.position[2] = self.altitude;
                 let dx = self.heading.cos() * self.speed * dt;
                 let dy = self.heading.sin() * self.speed * dt;
                 self.position[0] = wrap_centered(self.position[0] + dx);
                 self.position[1] = wrap_centered(self.position[1] + dy);
-                if self.altitude >= CRUISE_ALTITUDE {
-                    self.altitude = CRUISE_ALTITUDE;
-                    self.position[2] = CRUISE_ALTITUDE;
+                if self.altitude >= target_alt {
+                    self.altitude = target_alt;
+                    self.position[2] = target_alt;
                     self.state = State::Cruising;
                 }
             }
@@ -824,5 +915,14 @@ mod tests {
         }
         let sky10 = world.iter().find(|a| a.callsign == "SKY10").unwrap();
         assert_eq!(sky10.state, State::Landed, "must not park over an occupied gate");
+    }
+
+    #[test]
+    fn frontier_jets_cruise_higher_than_local_props_and_drones() {
+        let jet = Aircraft::with_model("JET1", Kind::Agent, ModelClass::Frontier);
+        let prop = Aircraft::with_model("PROP1", Kind::Agent, ModelClass::Local);
+        let drone = Aircraft::with_model("REAP1", Kind::Drone, ModelClass::Local);
+        assert!(jet.cruise_altitude() > prop.cruise_altitude() + 30.0);
+        assert!(prop.cruise_altitude() > drone.cruise_altitude() + 20.0);
     }
 }

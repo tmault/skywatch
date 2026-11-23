@@ -1154,6 +1154,218 @@ function makeHoldRing(scale) {
   return ring;
 }
 
+/* ----------------------------------------------------------- contrails */
+
+// Shared 2D vapor texture: soft Gaussian cross-section across V and smooth
+// dissipation fade along U (0 = fresh behind nozzle, 1 = dispersed tail).
+const contrailTexture = (() => {
+  const w = 128;
+  const h = 32;
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext('2d');
+  const img = ctx.createImageData(w, h);
+  for (let y = 0; y < h; y++) {
+    const v = (y + 0.5) / h;
+    const cross = Math.exp(-Math.pow((v - 0.5) / 0.23, 2));
+    for (let x = 0; x < w; x++) {
+      const u = x / (w - 1);
+      const fadeIn = Math.min(1, u / 0.045);
+      const fadeOut = Math.pow(1 - u, 1.55);
+      const alpha = Math.round(255 * cross * fadeIn * fadeOut);
+      const idx = (y * w + x) * 4;
+      img.data[idx] = 255;
+      img.data[idx + 1] = 255;
+      img.data[idx + 2] = 255;
+      img.data[idx + 3] = alpha;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  return tex;
+})();
+
+const _trailWorldPt = new THREE.Vector3();
+const _trailTan = new THREE.Vector3();
+const _trailToCam = new THREE.Vector3();
+const _trailSide = new THREE.Vector3();
+
+class ContrailRibbon {
+  constructor({ localOffset, maxPoints, sampleInterval, startWidth, endWidth, color, opacity }) {
+    this.localOffset = new THREE.Vector3(...localOffset);
+    this.maxPoints = maxPoints;
+    this.sampleInterval = sampleInterval;
+    this.startWidth = startWidth;
+    this.endWidth = endWidth;
+    this.points = [];
+    this.accum = 0;
+
+    const verts = new Float32Array(maxPoints * 2 * 3);
+    const uvs = new Float32Array(maxPoints * 2 * 2);
+    const indices = [];
+    for (let i = 0; i < maxPoints - 1; i++) {
+      const a = i * 2;
+      const b = a + 1;
+      const c = a + 2;
+      const d = a + 3;
+      indices.push(a, b, c, b, d, c);
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+    geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    geo.setIndex(indices);
+    geo.setDrawRange(0, 0);
+
+    const mat = new THREE.MeshBasicMaterial({
+      map: contrailTexture,
+      color,
+      transparent: true,
+      opacity,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+
+    this.mesh = new THREE.Mesh(geo, mat);
+    this.mesh.frustumCulled = false;
+    this.mesh.renderOrder = 2;
+    scene.add(this.mesh);
+  }
+
+  clear() {
+    this.points.length = 0;
+    this.mesh.geometry.setDrawRange(0, 0);
+  }
+
+  update(group, dt, emit) {
+    if (!emit) {
+      // Gently evaporate existing trail when on the ground.
+      this.accum += dt;
+      if (this.accum >= this.sampleInterval * 0.6 && this.points.length > 0) {
+        this.accum = 0;
+        this.points.pop();
+      }
+    } else {
+      group.updateMatrixWorld();
+      _trailWorldPt.copy(this.localOffset).applyMatrix4(group.matrixWorld);
+
+      if (this.points.length > 0 && this.points[0].distanceToSquared(_trailWorldPt) > 25000) {
+        this.clear(); // snapped across map wrap
+      }
+
+      if (this.points.length === 0) {
+        this.points.unshift(_trailWorldPt.clone());
+        this.accum = 0;
+      } else {
+        // Keep the head pinned live to the engine nozzle between samples.
+        this.points[0].copy(_trailWorldPt);
+        this.accum += dt;
+        if (this.accum >= this.sampleInterval) {
+          this.accum = 0;
+          this.points.unshift(_trailWorldPt.clone());
+          if (this.points.length > this.maxPoints) {
+            this.points.pop();
+          }
+        }
+      }
+    }
+
+    const n = this.points.length;
+    if (n < 2) {
+      this.mesh.geometry.setDrawRange(0, 0);
+      return;
+    }
+
+    const posAttr = this.mesh.geometry.attributes.position;
+    const uvAttr = this.mesh.geometry.attributes.uv;
+    for (let i = 0; i < n; i++) {
+      const p = this.points[i];
+      const u = i / (n - 1);
+      if (i === 0) _trailTan.subVectors(this.points[0], this.points[1]);
+      else if (i === n - 1) _trailTan.subVectors(this.points[n - 2], this.points[n - 1]);
+      else _trailTan.subVectors(this.points[i - 1], this.points[i + 1]);
+      if (_trailTan.lengthSq() < 1e-6) _trailTan.set(0, 0, 1);
+      else _trailTan.normalize();
+
+      _trailToCam.subVectors(camera.position, p);
+      if (_trailToCam.lengthSq() < 1e-6) _trailToCam.set(0, 1, 0);
+      else _trailToCam.normalize();
+
+      _trailSide.crossVectors(_trailTan, _trailToCam);
+      if (_trailSide.lengthSq() < 1e-6) _trailSide.set(1, 0, 0);
+      else _trailSide.normalize();
+
+      const halfW = 0.5 * (this.startWidth + (this.endWidth - this.startWidth) * Math.pow(u, 0.75));
+      const v0 = i * 2;
+      const v1 = v0 + 1;
+      posAttr.setXYZ(v0, p.x - _trailSide.x * halfW, p.y - _trailSide.y * halfW, p.z - _trailSide.z * halfW);
+      posAttr.setXYZ(v1, p.x + _trailSide.x * halfW, p.y + _trailSide.y * halfW, p.z + _trailSide.z * halfW);
+      uvAttr.setXY(v0, u, 0);
+      uvAttr.setXY(v1, u, 1);
+    }
+
+    posAttr.needsUpdate = true;
+    uvAttr.needsUpdate = true;
+    this.mesh.geometry.setDrawRange(0, (n - 1) * 6);
+  }
+
+  dispose() {
+    scene.remove(this.mesh);
+    this.mesh.geometry.dispose();
+    this.mesh.material.dispose();
+  }
+}
+
+function makeContrailsFor(a) {
+  if (a.kind === 'fighter') {
+    return [-0.62, 0.62].map((x) => new ContrailRibbon({
+      localOffset: [x, -0.05, -8.5],
+      maxPoints: 58,
+      sampleInterval: 0.08,
+      startWidth: 0.5,
+      endWidth: 2.3,
+      color: 0xdcf6ff,
+      opacity: 0.56,
+    }));
+  }
+  if (a.kind === 'drone') {
+    return [new ContrailRibbon({
+      localOffset: [0, 0, -10.2],
+      maxPoints: 38,
+      sampleInterval: 0.14,
+      startWidth: 0.35,
+      endWidth: 1.4,
+      color: 0xeef6ff,
+      opacity: 0.24,
+    })];
+  }
+  if (a.model_class === 'frontier') {
+    // High-altitude frontier jets stream twin rich white contrails from both engines!
+    return [-5.2, 5.2].map((x) => new ContrailRibbon({
+      localOffset: [x, -1.85, -1.8],
+      maxPoints: 120,
+      sampleInterval: 0.13,
+      startWidth: 0.85,
+      endWidth: 5.0,
+      color: 0xf7fbff,
+      opacity: 0.68,
+    }));
+  }
+  // Local prop: subtle wingtip wisps.
+  return [-7.9, 7.9].map((x) => new ContrailRibbon({
+    localOffset: [x, 2.0, -0.6],
+    maxPoints: 34,
+    sampleInterval: 0.12,
+    startWidth: 0.25,
+    endWidth: 1.15,
+    color: 0xffffff,
+    opacity: 0.22,
+  }));
+}
+
 function ensureMesh(a) {
   let entry = meshes.get(a.id);
   if (entry) return entry;
@@ -1166,6 +1378,7 @@ function ensureMesh(a) {
 
   const s = built.scale;
   built.group.scale.setScalar(s);
+  built.group.rotation.order = 'YXZ';
 
   const label = new THREE.Sprite(new THREE.SpriteMaterial({
     transparent: true, depthTest: false,
@@ -1191,10 +1404,13 @@ function ensureMesh(a) {
   built.target = built.group.position.clone();
   built.heading = a.heading;
   built.targetHeading = a.heading;
+  built.roll = 0;
   built.group.rotation.y = Math.PI / 2 - a.heading;
   built.state = a.state;
   built.kind = a.kind;
+  built.model_class = a.model_class;
   built.ring = ring;
+  built.contrails = makeContrailsFor(a);
 
   scene.add(built.group);
   meshes.set(a.id, entry = built);
@@ -1224,6 +1440,9 @@ function disposeMesh(id) {
     }
   });
   for (const m of entry.disposeMaterials) m.dispose();
+  if (entry.contrails) {
+    for (const c of entry.contrails) c.dispose();
+  }
   meshes.delete(id);
 }
 
@@ -1522,8 +1741,10 @@ function animate() {
 
   const now = performance.now() / 1000;
   for (const entry of meshes.values()) {
-    if (entry.group.position.distanceToSquared(entry.target) > 40000) {
+    const wrapped = entry.group.position.distanceToSquared(entry.target) > 40000;
+    if (wrapped) {
       entry.group.position.copy(entry.target);
+      if (entry.contrails) for (const c of entry.contrails) c.clear();
     } else {
       entry.group.position.lerp(entry.target, k);
     }
@@ -1531,8 +1752,27 @@ function animate() {
     let dh = entry.targetHeading - entry.heading;
     while (dh > Math.PI) dh -= 2 * Math.PI;
     while (dh < -Math.PI) dh += 2 * Math.PI;
-    entry.heading += dh * k;
+    const stepH = dh * k;
+    entry.heading += stepH;
     entry.group.rotation.y = Math.PI / 2 - entry.heading;
+
+    // Bank smoothly into turns when airborne; keep wings level on the ground.
+    const airborne = ['cruising', 'holding', 'takeoff', 'landing'].includes(entry.state);
+    const omega = dt > 0.001 ? stepH / dt : 0;
+    const maxBank = entry.kind === 'fighter' ? 0.52 : (entry.model_class === 'frontier' ? 0.32 : 0.4);
+    const targetRoll = airborne
+      ? Math.max(-maxBank, Math.min(maxBank, omega * 1.15))
+      : 0;
+    entry.roll += (targetRoll - entry.roll) * (1 - Math.exp(-5 * dt));
+    entry.group.rotation.z = entry.roll;
+
+    // Update contrail ribbons (emit only when airborne above ground).
+    if (entry.contrails) {
+      const emit = airborne && entry.group.position.y > 25;
+      for (const c of entry.contrails) {
+        c.update(entry.group, dt, emit);
+      }
+    }
 
     const prop = entry.group.getObjectByName('prop');
     if (prop && entry.state !== 'parked' && entry.state !== 'landed') {
