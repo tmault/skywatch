@@ -50,6 +50,12 @@ pub struct Aircraft {
     /// Human-readable subject (thread title for T3 aircraft).
     #[serde(default)]
     pub title: Option<String>,
+    /// Holding-orbit centre (derived on entry, not serialised).
+    #[serde(skip)]
+    orbit_center: Option<[f32; 2]>,
+    /// Patrol orbit angle for sector-bound aircraft.
+    #[serde(default)]
+    patrol_angle: f32,
     /// Ground speed in m/s (serde default keeps old snapshots deserialisable).
     #[serde(default = "default_speed")]
     pub speed: f32,
@@ -67,8 +73,8 @@ const AGENT_SPEED: f32 = 20.0; // m/s, local models
 const FRONTIER_SPEED: f32 = 32.0; // m/s, frontier jets are faster
 const DRONE_SPEED: f32 = 6.0; // m/s, drones always slow loiter
 const ORBIT_RADIUS: f32 = 40.0;
-const HOLD_TURN_RATE: f32 = 0.4; // rad/s turn rate while holding
-const HOLD_DRIFT_SPEED: f32 = ORBIT_RADIUS * 0.1; // m/s drift while holding
+const HOLD_TURN_RADIUS: f32 = 60.0; // m, holding orbit radius
+const HOLD_DRIFT_SPEED: f32 = 12.0; // m/s along the holding orbit
 
 /// Wrap a coordinate into [-AREA_SIZE/2, AREA_SIZE/2) so the world is
 /// centred on the origin (where the island sits).
@@ -83,23 +89,6 @@ pub const SECTORS: &[(&str, [f32; 2], f32)] = &[
     ("Refactor", [210.0, 110.0], 130.0),
     ("Monitor", [30.0, -250.0], 130.0),
 ];
-
-/// Turn at most this many rad/s toward the sector centre when leaving it.
-const PATROL_TURN_RATE: f32 = 0.5;
-
-/// Steer heading toward a target point (shortest arc, limited turn rate).
-fn steer_toward(heading: &mut f32, target: [f32; 2], pos: [f32; 2], dt: f32) {
-    let desired = (target[1] - pos[1]).atan2(target[0] - pos[0]);
-    let mut dh = desired - *heading;
-    while dh > std::f32::consts::PI {
-        dh -= std::f32::consts::TAU;
-    }
-    while dh < -std::f32::consts::PI {
-        dh += std::f32::consts::TAU;
-    }
-    let turn = PATROL_TURN_RATE * dt;
-    *heading += dh.clamp(-turn, turn);
-}
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -133,6 +122,8 @@ impl Aircraft {
             hold_reason: None,
             topic: None,
             title: None,
+            orbit_center: None,
+            patrol_angle: 0.0,
             speed,
         }
     }
@@ -144,12 +135,19 @@ impl Aircraft {
 
     /// Enter a holding pattern with a reason (e.g. "awaiting approval").
     pub fn hold(&mut self, reason: &str) {
+        if self.state != State::Holding {
+            self.orbit_center = None; // re-derive the orbit from current pos
+        }
         self.state = State::Holding;
         self.hold_reason = Some(reason.to_string());
     }
 
     /// Cleared for takeoff: climb until reaching cruise altitude.
     pub fn release(&mut self) {
+        if self.state != State::Cruising {
+            self.orbit_center = None;
+            self.patrol_angle = (self.position[1]).atan2(self.position[0]);
+        }
         self.state = State::Takeoff;
         self.hold_reason = None;
     }
@@ -159,35 +157,53 @@ impl Aircraft {
         self.state = State::Landed;
         self.altitude = 0.0;
         self.hold_reason = None;
+        self.orbit_center = None;
     }
 
     /// Advance the simulation by `dt` seconds.
     pub fn tick(&mut self, dt: f32) {
         match self.state {
             State::Holding => {
-                // Circle a small orbit: advance heading and drift along it.
-                self.heading = (self.heading + dt * HOLD_TURN_RATE) % std::f32::consts::TAU;
-                let dx = self.heading.cos() * HOLD_DRIFT_SPEED * dt;
-                let dy = self.heading.sin() * HOLD_DRIFT_SPEED * dt;
-                self.position[0] = wrap_centered(self.position[0] + dx);
-                self.position[1] = wrap_centered(self.position[1] + dy);
+                // Proper racetrack-free holding pattern: a clean circle.
+                // Position rides a fixed-radius orbit around a per-aircraft
+                // centre; heading is exactly the orbit tangent, so the
+                // aircraft never appears to pirouette in place.
+                if self.orbit_center.is_none() {
+                    // Enter the orbit 90° right of the current heading.
+                    let r = HOLD_TURN_RADIUS;
+                    let cx = self.position[0] + self.heading.cos() * r;
+                    let cy = self.position[1] + self.heading.sin() * r;
+                    self.orbit_center = Some([cx, cy]);
+                }
+                let [cx, cy] = self.orbit_center.unwrap();
+                let angle = (self.position[1] - cy).atan2(self.position[0] - cx);
+                let omega = HOLD_DRIFT_SPEED / HOLD_TURN_RADIUS; // rad/s
+                let angle = angle + omega * dt;
+                let nx = cx + angle.cos() * HOLD_TURN_RADIUS;
+                let ny = cy + angle.sin() * HOLD_TURN_RADIUS;
+                // Tangent (CCW): derivative of the circle.
+                self.heading = angle + std::f32::consts::FRAC_PI_2;
+                self.position[0] = wrap_centered(nx);
+                self.position[1] = wrap_centered(ny);
             }
             State::Cruising => {
-                // Patrol inside the topic sector: steer back when near its edge.
+                // Assigned aircraft fly a smooth circular patrol orbit inside
+                // their sector; unassigned aircraft transit straight and wrap.
                 if let Some(topic) = &self.topic {
                     if let Some((_, centre, radius)) =
                         SECTORS.iter().find(|(name, _, _)| name == topic)
                     {
-                        let dist =
-                            (self.position[0] - centre[0]).hypot(self.position[1] - centre[1]);
-                        if dist > radius * 0.6 {
-                            steer_toward(
-                                &mut self.heading,
-                                *centre,
-                                [self.position[0], self.position[1]],
-                                dt,
-                            );
-                        }
+                        // Per-aircraft patrol orbit: wide, gentle circuits.
+                        let r = (self.id as f32 * 37.7 % 30.0) + radius * 0.45;
+                        let omega = self.speed / r; // rad/s
+                        self.patrol_angle += omega * dt;
+                        let nx = centre[0] + self.patrol_angle.cos() * r;
+                        let ny = centre[1] + self.patrol_angle.sin() * r;
+                        // Tangent of the CCW orbit.
+                        self.heading = self.patrol_angle + std::f32::consts::FRAC_PI_2;
+                        self.position[0] = wrap_centered(nx);
+                        self.position[1] = wrap_centered(ny);
+                        return;
                     }
                 }
                 let dx = self.heading.cos() * self.speed * dt;

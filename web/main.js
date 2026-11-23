@@ -70,69 +70,144 @@ scene.add(sun);
   grid.position.y = 0.5;
   scene.add(grid);
 
-  // Island: irregular sand base with a grassy mound, near map centre.
+  // Island: irregular noise coastline, raised beach with cliffs, layered
+  // grass plateau, hill, tower, palms and a runway on the sand flat.
   const island = new THREE.Group();
 
-  const beach = new THREE.Mesh(
-    new THREE.CircleGeometry(110, 28),
-    new THREE.MeshLambertMaterial({ color: 0xc9b47a }),
-  );
-  beach.rotation.x = -Math.PI / 2;
-  beach.position.y = 0.6;
-  island.add(beach);
+  // Deterministic radial-noise coastline (smooth, no per-load variation).
+  const coastRadius = (angle, base, noise) => {
+    const a1 = Math.sin(angle * 3 + 1.7) * noise;
+    const a2 = Math.sin(angle * 5 + 4.2) * noise * 0.5;
+    const a3 = Math.sin(angle * 8 + 2.9) * noise * 0.25;
+    return base + a1 + a2 + a3;
+  };
 
-  // Two overlapping grass blobs give an irregular coastline.
-  for (const [dx, dz, r] of [[-25, -15, 78], [30, 25, 62]]) {
-    const grass = new THREE.Mesh(
-      new THREE.CircleGeometry(r, 22),
-      new THREE.MeshLambertMaterial({ color: 0x3f7a45 }),
-    );
-    grass.rotation.x = -Math.PI / 2;
-    grass.position.set(dx, 1.2, dz);
-    island.add(grass);
-  }
+  // Shape from a radial-noise outline; XY plane, extruded along +Z then
+  // rotated flat so the extrusion becomes vertical thickness (cliffs).
+  const coastShape = (base, noise) => {
+    const shape = new THREE.Shape();
+    const steps = 64;
+    for (let i = 0; i <= steps; i++) {
+      const a = (i / steps) * Math.PI * 2;
+      const r = coastRadius(a, base, noise);
+      const x = Math.cos(a) * r;
+      const y = Math.sin(a) * r;
+      if (i === 0) shape.moveTo(x, y);
+      else shape.lineTo(x, y);
+    }
+    shape.closePath();
+    return shape;
+  };
 
-  // Low hill under the tower.
+  const extrudeFlat = (shape, thickness, topY, mat) => {
+    const geo = new THREE.ExtrudeGeometry(shape, {
+      depth: thickness, bevelEnabled: false, curveSegments: 48,
+    });
+    geo.rotateX(-Math.PI / 2); // shape XY -> XZ; extrusion runs UP
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.y = topY - thickness; // top face lands exactly at topY
+    return mesh;
+  };
+
+  const sandMat = new THREE.MeshLambertMaterial({ color: 0xd6c084 });
+  const cliffMat = new THREE.MeshLambertMaterial({ color: 0xb59a63 });
+  const grassMat = new THREE.MeshLambertMaterial({ color: 0x3f7a45 });
+  const grassDarkMat = new THREE.MeshLambertMaterial({ color: 0x35683b });
+
+  // Beach plateau: top at y = 2, cliffs down to -8 under the sea.
+  island.add(extrudeFlat(coastShape(115, 22), 10, 2, sandMat));
+
+  // Grass plateau on top: slightly smaller, top at y = 3.4.
+  island.add(extrudeFlat(coastShape(82, 14), 4, 3.4, grassMat));
+
+  // A second, darker grass tier (the hill's base).
+  island.add(extrudeFlat(coastShape(52, 8), 3, 4.6, grassDarkMat));
+
+  // Rounded hill under the tower (smooth dome instead of a hard cone).
   const hill = new THREE.Mesh(
-    new THREE.ConeGeometry(46, 18, 18),
-    new THREE.MeshLambertMaterial({ color: 0x35683b }),
+    new THREE.SphereGeometry(42, 24, 12, 0, Math.PI * 2, 0, Math.PI / 2),
+    grassDarkMat,
   );
-  hill.position.set(0, 8.5, 0);
+  hill.scale.y = 0.35; // squash into a dome
+  hill.position.y = 6.1;
   island.add(hill);
 
   // The Tower itself: dark base, cabin disc, radar bar.
   const towerMat = new THREE.MeshLambertMaterial({ color: 0x25333d });
-  const base = new THREE.Mesh(new THREE.CylinderGeometry(4, 6, 26, 10), towerMat);
-  base.position.set(0, 30, 0);
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(4, 6, 26, 12), towerMat);
+  base.position.set(0, 28, 0);
   island.add(base);
 
   const cabin = new THREE.Mesh(
-    new THREE.CylinderGeometry(11, 8, 7, 10),
+    new THREE.CylinderGeometry(11, 8, 7, 12),
     new THREE.MeshLambertMaterial({ color: 0x8fb6c9 }),
   );
-  cabin.position.set(0, 46, 0);
+  cabin.position.set(0, 44, 0);
   island.add(cabin);
 
   const roof = new THREE.Mesh(
-    new THREE.ConeGeometry(12, 5, 10),
+    new THREE.ConeGeometry(12, 5, 12),
     new THREE.MeshLambertMaterial({ color: 0x1d2830 }),
   );
-  roof.position.set(0, 52, 0);
+  roof.position.set(0, 50, 0);
   island.add(roof);
 
   const radar = new THREE.Mesh(new THREE.BoxGeometry(9, 0.6, 1), towerMat);
-  radar.position.set(0, 56, 0);
+  radar.position.set(0, 54, 0);
   radar.name = 'radar';
   island.add(radar);
 
-  // Runway strip on the island for landed aircraft.
+  // Palms for scale: tilted trunk + a fan of leaf cones.
+  const trunkMat = new THREE.MeshLambertMaterial({ color: 0x6b4f2f });
+  const leafMat = new THREE.MeshLambertMaterial({ color: 0x2f8f4a });
+  const palmSpots = [[-58, 12], [-40, -46], [24, 52], [48, 38], [-8, 62], [64, -6]];
+  for (const [px, pz] of palmSpots) {
+    const palm = new THREE.Group();
+    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.9, 16, 6), trunkMat);
+    trunk.position.y = 8;
+    trunk.rotation.z = (Math.random() - 0.5) * 0.25;
+    palm.add(trunk);
+    for (let i = 0; i < 6; i++) {
+      const leaf = new THREE.Mesh(new THREE.ConeGeometry(1.1, 8, 4), leafMat);
+      const la = (i / 6) * Math.PI * 2;
+      leaf.position.set(Math.cos(la) * 3.4, 16, Math.sin(la) * 3.4);
+      leaf.rotation.z = Math.cos(la) * 1.25;
+      leaf.rotation.x = -Math.sin(la) * 1.25;
+      palm.add(leaf);
+    }
+    const grassTopY = 3.4;
+    palm.position.set(px, grassTopY, pz);
+    island.add(palm);
+  }
+
+  // Rocks on the cliffs for texture.
+  const rockMat = new THREE.MeshLambertMaterial({ color: 0x8c8f94 });
+  for (const [rx, rz, rs] of [[-98, 30, 4], [-88, -55, 3], [95, 55, 4.5], [70, 78, 2.6], [20, -100, 3.4]]) {
+    const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(rs, 0), rockMat);
+    rock.position.set(rx, 0.8, rz);
+    rock.rotation.set(rx, rz, rx * 0.5);
+    island.add(rock);
+  }
+
+  // Runway strip on the sand flat, east side (clear of the grass plateau).
   const runway = new THREE.Mesh(
     new THREE.PlaneGeometry(16, 95),
     new THREE.MeshLambertMaterial({ color: 0x2b2f36 }),
   );
   runway.rotation.x = -Math.PI / 2;
-  runway.position.set(55, 1.4, -20);
+  runway.position.set(88, 2.2, -28);
   island.add(runway);
+
+  // Centreline dashes.
+  for (let i = 0; i < 8; i++) {
+    const dash = new THREE.Mesh(
+      new THREE.PlaneGeometry(1.2, 6),
+      new THREE.MeshBasicMaterial({ color: 0xd8dcd0 }),
+    );
+    dash.rotation.x = -Math.PI / 2;
+    dash.position.set(88, 2.3, -62 + i * 10);
+    island.add(dash);
+  }
 
   island.position.set(0, 0, 0);
   scene.add(island);
@@ -506,7 +581,9 @@ function applySnapshot(snapshot) {
   for (const a of aircraft) {
     seen.add(a.id);
     const entry = ensureMesh(a);
-    entry.target.set(a.position[0], a.position[1], a.position[2]);
+    // Landed aircraft sit on the island sand (top ~2 units above the sea).
+    const groundLift = a.state === 'landed' ? 1.6 : 0;
+    entry.target.set(a.position[0], a.position[1] + groundLift, a.position[2]);
     entry.targetHeading = a.heading;
 
     if (lastStates.get(a.id) !== a.state) {
