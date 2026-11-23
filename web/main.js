@@ -1073,11 +1073,14 @@ function ensureMesh(a) {
   built.target = built.group.position.clone();
   built.heading = a.heading;
   built.targetHeading = a.heading;
+  built.snapX = a.position[0];
+  built.snapZ = a.position[1];
   built.altitude = a.position[2];
   built.speed = a.speed ?? 0;
   built.dustClock = 0;
   built.roll = 0;
   built.pitch = 0;
+  built.flightPitch = 0;
   built.group.rotation.y = Math.PI / 2 - a.heading;
   built.state = a.state;
   built.kind = a.kind;
@@ -1389,6 +1392,20 @@ function applySnapshot(snapshot) {
     entry.target.set(a.position[0], y, a.position[1]);
     entry.targetHeading = a.heading;
     detectRunwayEvent(a, entry, lastStates.get(a.id), entry.altitude);
+    const snapDx = a.position[0] - entry.snapX;
+    const snapDz = a.position[1] - entry.snapZ;
+    const snapDh = Math.hypot(snapDx, snapDz);
+    const snapDAlt = a.position[2] - entry.altitude;
+    const onGround = ['parked', 'ready', 'taxi', 'landed'].includes(a.state)
+      || ((a.state === 'takeoff' || a.state === 'departing') && a.position[2] <= 0);
+    if (onGround) {
+      entry.flightPitch = 0;
+    } else if (snapDh >= 0.05 && snapDh < 200 && Math.abs(snapDAlt) < 25) {
+      // Negative rotation.x pitches the +Z nose UP; positive pitches nose DOWN.
+      entry.flightPitch = -Math.atan2(snapDAlt, snapDh);
+    }
+    entry.snapX = a.position[0];
+    entry.snapZ = a.position[1];
     entry.altitude = a.position[2];
     entry.speed = a.speed ?? 0;
 
@@ -1590,8 +1607,11 @@ function animate() {
     entry.group.rotation.y = Math.PI / 2 - entry.heading;
 
     // Bank smoothly into turns when airborne; keep wings level on the ground.
-    const departingAirborne = entry.state === 'departing' && (entry.altitude || 0) > 0.4;
-    const airborne = ['cruising', 'holding', 'takeoff', 'landing'].includes(entry.state) || departingAirborne;
+    const alt = entry.altitude || 0;
+    const takeoffAirborne = entry.state === 'takeoff' && alt > 0;
+    const departingAirborne = entry.state === 'departing' && alt > 0;
+    const airborne = ['cruising', 'holding', 'landing'].includes(entry.state)
+      || takeoffAirborne || departingAirborne;
     const omega = dt > 0.001 ? stepH / dt : 0;
     const maxBank = entry.kind === 'fighter' ? 0.52 : (entry.model_class === 'frontier' ? 0.32 : 0.4);
     const targetRoll = airborne
@@ -1603,17 +1623,29 @@ function animate() {
     const totalRoll = entry.roll + (stunt ? stunt.roll : 0);
     entry.group.rotation.z = totalRoll;
 
-    // Pitch nose up smoothly during takeoff rotation and climb-out (negative X pitches +Z nose up).
+    // Pitch along the actual climb/descent flight path (negative X pitches +Z nose up,
+    // positive X pitches nose down), with pre-liftoff rotation and a short touchdown flare.
+    const maxClimb = entry.kind === 'fighter' ? 0.5 : (entry.model_class === 'frontier' ? 0.38 : 0.42);
+    const maxDescent = entry.kind === 'fighter' ? 0.44 : (entry.model_class === 'frontier' ? 0.34 : 0.36);
     let targetPitch = 0;
-    const alt = entry.altitude || 0;
-    if (departingAirborne) {
-      targetPitch = alt < 480 ? -0.24 : -0.08;
-    } else if (entry.state === 'takeoff' && alt > 0) {
-      targetPitch = -0.22; // rotate at liftoff, not during the roll
-    } else if (entry.state === 'landing') {
-      targetPitch = alt < 10 ? -0.12 : -0.04; // flare just before touchdown
+    if (airborne) {
+      targetPitch = THREE.MathUtils.clamp((entry.flightPitch || 0) * 1.15, -maxClimb, maxDescent);
+      if (entry.state === 'landing' && alt < 6 && targetPitch > 0) {
+        // Flare gently out of the nose-down glideslope over the threshold so main gear touches first.
+        const f = Math.max(0, alt / 6);
+        targetPitch = -0.05 * (1 - f) + targetPitch * f;
+      }
+    } else if ((entry.state === 'takeoff' || entry.state === 'departing') && alt <= 0) {
+      // Begin rotating nose up at the end of the takeoff roll just before liftoff.
+      const rotateSpeed = (entry.model_class === 'frontier' ? 34 : 25) * 0.82;
+      if (entry.speed >= rotateSpeed) {
+        targetPitch = entry.kind === 'drone' ? -0.06 : -0.11;
+      }
     }
-    entry.pitch = (entry.pitch || 0) + (targetPitch - (entry.pitch || 0)) * (1 - Math.exp(-3.5 * dt));
+    const pitchRate = (entry.state === 'takeoff' || entry.state === 'departing' || entry.state === 'landing' || entry.state === 'landed')
+      ? 5.5
+      : 4.0;
+    entry.pitch = (entry.pitch || 0) + (targetPitch - (entry.pitch || 0)) * (1 - Math.exp(-pitchRate * dt));
     entry.group.rotation.x = entry.pitch + (stunt ? stunt.pitch : 0);
 
     // Keep floating label hovering upright above the fuselage during barrel rolls.
