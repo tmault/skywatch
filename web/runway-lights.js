@@ -82,6 +82,11 @@ export function addRunwayLights(parent, opts) {
     spacing = 8, approachLength = 24,
   } = opts;
   const lampY = y + 0.15;
+  // Everything lives in one group so callers can tag or hide it as a unit.
+  const group = new THREE.Group();
+  group.name = 'runway-lights';
+  parent.add(group);
+  parent = group;
 
   // Edge lights down both sides.
   const edge = [];
@@ -160,5 +165,5 @@ export function addRunwayLights(parent, opts) {
   };
 
   setOnline(true);
-  return { setOnline, update };
+  return { group, setOnline, update };
 }

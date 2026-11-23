@@ -311,6 +311,8 @@ function buildTerrainMesh(field, extent, cell) {
     vertexColors: true, flatShading: true, roughness: 0.95, metalness: 0,
   }));
   terrain.name = 'terrain';
+  terrain.castShadow = true; // peaks shade their own meadows
+  terrain.receiveShadow = true;
 
   // Shallows + foam: translucent overlay floating just above the lake.
   const sp = [];
@@ -486,6 +488,7 @@ export function makeSwissFlag(size = 6, poleHeight = 14) {
     new THREE.MeshStandardMaterial({ color: 0xf2f2f2, roughness: 0.4, metalness: 0.4 }),
   );
   pole.position.y = poleHeight / 2;
+  pole.castShadow = true;
   group.add(pole);
   const knob = new THREE.Mesh(
     new THREE.SphereGeometry(0.35, 8, 6),
@@ -500,13 +503,17 @@ export function makeSwissFlag(size = 6, poleHeight = 14) {
     map: swissFlagTexture(), side: THREE.DoubleSide, roughness: 0.8,
   }));
   cloth.position.set(0.2, poleHeight - size / 2 - 0.2, 0);
+  cloth.castShadow = true;
   group.add(cloth);
   flags.push({ cloth, base: Float32Array.from(geo.attributes.position.array), size, phase: flags.length * 1.7 });
   return group;
 }
 
-/** Wave every Swiss flag; call once per frame with seconds. */
+/** Wave every Swiss flag and drift the lake ripples; call once per frame. */
 export function updateAlpine(now) {
+  if (lakeNormals) {
+    lakeNormals.offset.set(now * 0.0035, now * 0.0021);
+  }
   for (const f of flags) {
     const pos = f.cloth.geometry.attributes.position;
     for (let i = 0; i < pos.count; i++) {
@@ -608,6 +615,8 @@ export function buildAlpineIsland(group, spec) {
 
   const scenery = buf.build();
   scenery.name = 'scenery';
+  scenery.castShadow = true;
+  scenery.receiveShadow = true;
   group.add(scenery);
 
   return { heightAt: field.height };
@@ -711,4 +720,90 @@ export function buildAlpineBackdrop(scene, inner = 600, outer = 1500) {
   mesh.name = 'alps';
   scene.add(mesh);
   return mesh;
+}
+
+/* ------------------------------------------------------------- lake */
+
+let lakeNormals = null;
+
+// Tileable ripple normal map from periodic value noise (no external assets).
+function makeRippleNormalMap(size = 256, period = 16) {
+  const h = new Float32Array(size * size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      let v = 0;
+      let amp = 1;
+      let p = period;
+      for (let o = 0; o < 4; o++) {
+        const fx = (x / size) * p;
+        const fy = (y / size) * p;
+        const ix = Math.floor(fx);
+        const iy = Math.floor(fy);
+        const tx = fx - ix;
+        const ty = fy - iy;
+        const ux = tx * tx * (3 - 2 * tx);
+        const uy = ty * ty * (3 - 2 * ty);
+        const g = (i, j) => hash2(((i % p) + p) % p, ((j % p) + p) % p, 9 + o);
+        const a = g(ix, iy);
+        const b = g(ix + 1, iy);
+        const c = g(ix, iy + 1);
+        const d = g(ix + 1, iy + 1);
+        v += (a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy) * amp;
+        amp *= 0.5;
+        p *= 2;
+      }
+      h[y * size + x] = v;
+    }
+  }
+  const data = new Uint8Array(size * size * 4);
+  const strength = 2.2;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const at = (i, j) => h[((j + size) % size) * size + ((i + size) % size)];
+      const dx = (at(x + 1, y) - at(x - 1, y)) * strength;
+      const dy = (at(x, y + 1) - at(x, y - 1)) * strength;
+      const len = Math.hypot(dx, dy, 1);
+      const k = (y * size + x) * 4;
+      data[k] = ((-dx / len) * 0.5 + 0.5) * 255;
+      data[k + 1] = ((-dy / len) * 0.5 + 0.5) * 255;
+      data[k + 2] = ((1 / len) * 0.5 + 0.5) * 255;
+      data[k + 3] = 255;
+    }
+  }
+  const tex = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true;
+  tex.anisotropy = 8;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/** Alpine lake surface: deep blue-green with drifting ripples that catch the sun. */
+export function makeLakeMaterial() {
+  lakeNormals = makeRippleNormalMap();
+  lakeNormals.repeat.set(90, 90);
+  return new THREE.MeshStandardMaterial({
+    color: 0x1f6f8c,
+    roughness: 0.3,
+    metalness: 0.1,
+    normalMap: lakeNormals,
+    normalScale: new THREE.Vector2(0.26, 0.26),
+  });
+}
+
+/** Opt every lit, opaque mesh under `root` into casting and receiving shadows. */
+export function enableShadows(root, { receive = true } = {}) {
+  root.traverse((o) => {
+    if (!o.isMesh || o.isInstancedMesh) return;
+    const mats = Array.isArray(o.material) ? o.material : [o.material];
+    const lit = mats.every((m) => m && !m.isMeshBasicMaterial && !m.transparent);
+    if (!lit) return;
+    // Painted decals (polygon-offset markings) only receive: casting from a
+    // plane hovering 0.08 above the deck would just add acne.
+    o.castShadow = !mats.some((m) => m.polygonOffset);
+    o.receiveShadow = receive;
+  });
 }

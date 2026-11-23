@@ -10,6 +10,7 @@ import {
 } from './radio.js';
 import {
   buildAlpineIsland, buildAlpineBackdrop, makeSwissFlag, updateAlpine, SWISS_RED,
+  makeLakeMaterial, enableShadows,
 } from './alpine.js';
 import { addRunwayLights } from './runway-lights.js';
 import { makeAgentMesh, makeJetMesh, makeFighterMesh, makeDroneMesh } from './aircraft.js';
@@ -26,6 +27,8 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.08;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
 // Sky gradient background.
@@ -63,10 +66,26 @@ controls.minDistance = 18;
 controls.maxDistance = 900;
 
 // Alpine daylight: cool sky fill, meadow-green bounce, warm low sun.
-scene.add(new THREE.HemisphereLight(0xcfe6ff, 0x3f5a34, 0.9));
-scene.add(new THREE.AmbientLight(0x8094a8, 0.3));
-const sun = new THREE.DirectionalLight(0xfff1dc, 1.75);
-sun.position.set(280, 480, 220);
+scene.add(new THREE.HemisphereLight(0xcfe6ff, 0x3f5a34, 0.78));
+scene.add(new THREE.AmbientLight(0x8094a8, 0.2));
+// Mid-afternoon sun (~37° up) so peaks, trees and terminals throw long,
+// readable shadows; aircraft shadows on the lake show their altitude.
+const sun = new THREE.DirectionalLight(0xfff0d8, 1.85);
+sun.position.set(360, 330, 240);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+{
+  const cam = sun.shadow.camera; // covers the whole archipelago (±480)
+  cam.left = -480;
+  cam.right = 480;
+  cam.top = 480;
+  cam.bottom = -480;
+  cam.near = 1;
+  cam.far = 1200;
+}
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.45;
+sun.shadow.radius = 3;
 scene.add(sun);
 const rim = new THREE.DirectionalLight(0x9cc8f0, 0.4);
 rim.position.set(-260, 180, -240);
@@ -76,8 +95,9 @@ scene.add(rim);
 {
   const lake = new THREE.Mesh(
     new THREE.CircleGeometry(1300, 96),
-    new THREE.MeshStandardMaterial({ color: 0x1f6f8c, roughness: 0.32, metalness: 0.18 }),
+    makeLakeMaterial(),
   );
+  lake.receiveShadow = true;
   lake.rotation.x = -Math.PI / 2;
   lake.position.y = 0;
   scene.add(lake);
@@ -123,13 +143,13 @@ function buildHomeAirport(ap) {
   const pierWallMat = new THREE.MeshStandardMaterial({ color: 0x626b75, roughness: 0.85 });
   const terminalMat = new THREE.MeshStandardMaterial({ color: 0x4c6070, roughness: 0.6, metalness: 0.2 });
   const glassMat = new THREE.MeshStandardMaterial({ color: 0x7fd4f0, roughness: 0.2, metalness: 0.45 });
-  const lineMat = new THREE.MeshBasicMaterial({
+  const lineMat = new THREE.MeshLambertMaterial({
     color: 0xe6eae0, polygonOffset: true, polygonOffsetFactor: -2,
   });
-  const yellowLineMat = new THREE.MeshBasicMaterial({
+  const yellowLineMat = new THREE.MeshLambertMaterial({
     color: 0xffc857, polygonOffset: true, polygonOffsetFactor: -2,
   });
-  const redBoxMat = new THREE.MeshBasicMaterial({
+  const redBoxMat = new THREE.MeshLambertMaterial({
     color: 0xd93829, polygonOffset: true, polygonOffsetFactor: -2,
   });
 
@@ -314,11 +334,11 @@ function buildHomeAirport(ap) {
   }
 
   // Airport name banner above the tower.
-  const label = makeBannerLabel(ap.name.toUpperCase(), 0xffffff, SWISS_RED);
+  const label = makeBannerLabel(ap.name.toUpperCase(), 0xffffff, SWISS_RED, 10);
   label.position.set(towerSpot.x, 63, towerSpot.z);
-  label.scale.set(42, 10.5, 1);
   island.add(label);
 
+  enableShadows(island);
   scene.add(island);
   return { group: island, beacon, lights, online: ap.online };
 }
@@ -332,10 +352,10 @@ function buildSatelliteAirport(ap, idx) {
   const apronMat = new THREE.MeshStandardMaterial({ color: 0x394049, roughness: 0.85 });
   const terminalMat = new THREE.MeshStandardMaterial({ color: 0x4c6070, roughness: 0.6, metalness: 0.2 });
   const glassMat = new THREE.MeshStandardMaterial({ color: 0x7fd4f0, roughness: 0.2, metalness: 0.45 });
-  const lineMat = new THREE.MeshBasicMaterial({
+  const lineMat = new THREE.MeshLambertMaterial({
     color: 0xe6eae0, polygonOffset: true, polygonOffsetFactor: -2,
   });
-  const yellowLineMat = new THREE.MeshBasicMaterial({
+  const yellowLineMat = new THREE.MeshLambertMaterial({
     color: 0xffc857, polygonOffset: true, polygonOffsetFactor: -2,
   });
 
@@ -431,9 +451,9 @@ function buildSatelliteAirport(ap, idx) {
     ap.online ? ap.name.toUpperCase() : `${ap.name.toUpperCase()} (OFF)`,
     ap.online ? 0xffffff : 0xcbd2d9,
     ap.online ? SWISS_RED : 0x4b525a,
+    11,
   );
   label.position.set(0, 38, 0);
-  label.scale.set(44, 11, 1);
   label.userData.isAirportLabel = true;
   island.add(label);
 
@@ -444,6 +464,7 @@ function buildSatelliteAirport(ap, idx) {
   }
 
   island.position.set(cx, 0, cz);
+  enableShadows(island);
   scene.add(island);
   const entry = {
     group: island,
@@ -496,9 +517,11 @@ function applySatelliteOnlineState(entry, online) {
       online ? entry.name.toUpperCase() : `${entry.name.toUpperCase()} (OFF)`,
       online ? 0xffffff : 0xcbd2d9,
       online ? SWISS_RED : 0x4b525a,
+      entry.label.scale.y,
     );
     if (entry.label.material.map) entry.label.material.map.dispose();
     entry.label.material.map = fresh.material.map;
+    entry.label.scale.copy(fresh.scale); // "(OFF)" changes the width
     entry.label.material.needsUpdate = true;
     fresh.material.dispose();
   }
@@ -585,9 +608,8 @@ function buildSectorGroup(s) {
   group.add(fill);
 
   const tag = isProject ? `PROJECT · ${s.name.toUpperCase()}` : s.name.toUpperCase();
-  const label = makeBannerLabel(tag, color);
+  const label = makeBannerLabel(tag, color, null, 7.5);
   label.position.set(s.center[0], 20, s.center[1]);
-  label.scale.set(isProject ? 44 : 38, isProject ? 8.5 : 8.5, 1);
   group.add(label);
 
   scene.add(group);
@@ -631,25 +653,40 @@ const meshes = new Map();
 
 // Clean banner sprite for airport and sector names. Airports pass a solid
 // `fill` (Swiss red); sectors keep the translucent charcoal plate.
-function makeBannerLabel(text, tint = 0xe8ffff, fill = null) {
+// The canvas is sized to the measured text and the sprite keeps that exact
+// aspect ratio (`height` in world units), so letters are never stretched.
+const BANNER_FONT = '700 64px "Helvetica Neue", Helvetica, "Nimbus Sans", Arial, sans-serif';
+const BANNER_TRACKING = 4; // px of letter-spacing at 64px — airy Swiss caps
+
+function makeBannerLabel(text, tint = 0xe8ffff, fill = null, height = 7) {
   const c = document.createElement('canvas');
-  c.width = 384;
-  c.height = 72;
   const ctx = c.getContext('2d');
+  ctx.font = BANNER_FONT;
+  ctx.letterSpacing = `${BANNER_TRACKING}px`;
+  const textW = ctx.measureText(text).width;
+  const padX = 40;
+  c.width = Math.ceil(textW + padX * 2);
+  c.height = 112;
+  // Resizing the canvas resets context state, so set it again.
   ctx.fillStyle = fill === null
     ? 'rgba(20, 22, 24, 0.66)'
     : '#' + new THREE.Color(fill).getHexString();
   ctx.fillRect(0, 0, c.width, c.height);
-  ctx.font = 'bold 34px "Helvetica Neue", Helvetica, Arial, sans-serif';
+  ctx.font = BANNER_FONT;
+  ctx.letterSpacing = `${BANNER_TRACKING}px`;
   ctx.fillStyle = '#' + new THREE.Color(tint).getHexString();
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(text, c.width / 2, c.height / 2 + 1);
+  // letterSpacing adds trailing space after the last glyph; nudge to centre.
+  ctx.fillText(text, c.width / 2 + BANNER_TRACKING / 2, c.height / 2 + 3);
+  // sRGB canvas + no tone mapping so Swiss red renders as #da291c, not pink.
+  const map = new THREE.CanvasTexture(c);
+  map.colorSpace = THREE.SRGBColorSpace;
+  map.anisotropy = 4;
   const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
-    map: new THREE.CanvasTexture(c), transparent: true, depthTest: false,
-    toneMapped: false, // keep Swiss red true instead of filmic-washed pink
+    map, transparent: true, depthTest: false, toneMapped: false,
   }));
-  sprite.scale.set(36, 7, 1);
+  sprite.scale.set(height * (c.width / c.height), height, 1);
   sprite.renderOrder = 10;
   return sprite;
 }
@@ -1015,6 +1052,7 @@ function ensureMesh(a) {
   built.prop = built.group.getObjectByName('prop');
   built.gear = built.group.getObjectByName('gear');
 
+  enableShadows(built.group, { receive: false });
   scene.add(built.group);
   meshes.set(a.id, entry = built);
   return entry;
