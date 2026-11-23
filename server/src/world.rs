@@ -46,6 +46,8 @@ const CRUISE_ALTITUDE: f32 = 120.0;
 const AGENT_SPEED: f32 = 20.0; // m/s
 const DRONE_SPEED: f32 = 6.0; // m/s, drones always slow loiter
 const ORBIT_RADIUS: f32 = 40.0;
+const HOLD_TURN_RATE: f32 = 0.4; // rad/s turn rate while holding
+const HOLD_DRIFT_SPEED: f32 = ORBIT_RADIUS * 0.1; // m/s drift while holding
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -98,9 +100,9 @@ impl Aircraft {
         match self.state {
             State::Holding => {
                 // Circle a small orbit: advance heading and drift along it.
-                self.heading = (self.heading + dt * 0.4) % std::f32::consts::TAU;
-                let dx = self.heading.cos() * ORBIT_RADIUS * dt * 0.1;
-                let dy = self.heading.sin() * ORBIT_RADIUS * dt * 0.1;
+                self.heading = (self.heading + dt * HOLD_TURN_RATE) % std::f32::consts::TAU;
+                let dx = self.heading.cos() * HOLD_DRIFT_SPEED * dt;
+                let dy = self.heading.sin() * HOLD_DRIFT_SPEED * dt;
                 self.position[0] = (self.position[0] + dx).rem_euclid(AREA_SIZE);
                 self.position[1] = (self.position[1] + dy).rem_euclid(AREA_SIZE);
             }
@@ -114,6 +116,8 @@ impl Aircraft {
                 self.altitude += TAKEOFF_RATE * dt;
                 self.position[2] = self.altitude;
                 if self.altitude >= CRUISE_ALTITUDE {
+                    self.altitude = self.altitude.min(CRUISE_ALTITUDE);
+                    self.position[2] = self.altitude;
                     self.state = State::Cruising;
                 }
             }
