@@ -114,6 +114,9 @@ pub const SECTORS: &[(&str, [f32; 2], f32)] = &[
     ("Monitor", [30.0, -250.0], 130.0),
 ];
 
+/// The graveyard apron: where stale threads are queued, parked and faded.
+pub const GRAVEYARD_CENTER: [f32; 2] = [150.0, -70.0];
+
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Aircraft {
@@ -349,6 +352,13 @@ impl Aircraft {
 pub struct WorldSnapshot {
     pub aircraft: Vec<Aircraft>,
     pub sectors: Vec<Sector>,
+    pub graveyard: Option<GraveyardInfo>,
+}
+
+/// Where the client draws the boneyard apron for retired threads.
+#[derive(Clone, Debug, Serialize)]
+pub struct GraveyardInfo {
+    pub center: [f32; 2],
 }
 
 /// A topic sector, serialised for the client to render.
@@ -404,6 +414,9 @@ impl World {
                     radius: *radius,
                 })
                 .collect(),
+            graveyard: Some(GraveyardInfo {
+                center: GRAVEYARD_CENTER,
+            }),
         }
     }
 }

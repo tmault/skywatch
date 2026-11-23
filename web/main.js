@@ -263,6 +263,65 @@ function ensureSectors(sectors) {
   }
 }
 
+/* ------------------------------------------------------------- graveyard */
+
+// The boneyard apron where retired (stale) threads are queued, parked and
+// faded. Drawn once from the first snapshot that carries graveyard info.
+let graveyardBuilt = false;
+
+function ensureGraveyard(info) {
+  if (graveyardBuilt || !info) return;
+  graveyardBuilt = true;
+  const [cx, cz] = info.center;
+  // Queue grid is 3 wide x 2 deep at 26-unit spacing; centre the slab on it.
+  const gx = cx + 26;
+  const gz = cz + 13;
+
+  // Worn asphalt apron.
+  const apron = new THREE.Mesh(
+    new THREE.PlaneGeometry(104, 78),
+    new THREE.MeshLambertMaterial({ color: 0x33383f }),
+  );
+  apron.rotation.x = -Math.PI / 2;
+  apron.position.set(gx, 0.9, gz);
+  scene.add(apron);
+
+  // Faded dashed perimeter (a broken fence line around the boneyard).
+  const perim = new THREE.Mesh(
+    new THREE.RingGeometry(58, 60, 4, 1),
+    new THREE.MeshBasicMaterial({
+      color: 0x6b757d, transparent: true, opacity: 0.3, side: THREE.DoubleSide,
+    }),
+  );
+  perim.rotation.x = -Math.PI / 2;
+  perim.rotation.z = Math.PI / 4;
+  perim.scale.set(1.0, 0.72, 1);
+  perim.position.set(gx, 1.0, gz);
+  scene.add(perim);
+
+  // Parking slot outlines for the 6-stand queue.
+  for (let i = 0; i < 6; i++) {
+    const sx = cx + (i % 3) * 26;
+    const sz = cz + Math.floor(i / 3) * 26;
+    const slot = new THREE.Mesh(
+      new THREE.RingGeometry(9, 10, 4, 1),
+      new THREE.MeshBasicMaterial({
+        color: 0x565e66, transparent: true, opacity: 0.4, side: THREE.DoubleSide,
+      }),
+    );
+    slot.rotation.x = -Math.PI / 2;
+    slot.rotation.z = Math.PI / 4;
+    slot.position.set(sx, 1.05, sz);
+    scene.add(slot);
+  }
+
+  // Weathered BONEYARD sign.
+  const sign = makeLabel('BONEYARD', 0x6b757d);
+  sign.position.set(gx, 24, gz - 44);
+  sign.scale.set(46, 11.5, 1);
+  scene.add(sign);
+}
+
 /* ------------------------------------------------------ aircraft meshes */
 
 // Group per aircraft: mesh + (optionally) hold ring. Meshes are created on
@@ -512,7 +571,10 @@ function ensureMesh(a) {
     ? makeDroneMesh()
     : (a.model_class === 'frontier' ? makeJetMesh() : makeAgentMesh());
   built.group.scale.setScalar(5); // aircraft are visible from the tower view
-  const label = makeLabel(a.callsign, a.topic ? topicColor(a.topic) : 0xe8ffff);
+  // Retired (GY) aircraft get faded callsign labels.
+  const retired = a.callsign.startsWith('GY');
+  const labelTint = retired ? 0x6b757d : (a.topic ? topicColor(a.topic) : 0xe8ffff);
+  const label = makeLabel(a.callsign, labelTint);
   built.group.add(label);
   const ring = makeHoldRing();
   ring.visible = false;
@@ -634,12 +696,16 @@ function applySnapshot(snapshot) {
   const seen = new Set();
 
   ensureSectors(snapshot.sectors || []);
+  ensureGraveyard(snapshot.graveyard);
 
   for (const a of aircraft) {
     seen.add(a.id);
     const entry = ensureMesh(a);
-    // Landed aircraft sit on the island sand (top ~2 units above the sea).
-    const groundLift = a.state === 'landed' ? 1.6 : 0;
+    // Ground aircraft sit on their surface: island sand/runway (~2 units up)
+    // or the boneyard apron (~1 unit up) for retired GY aircraft.
+    const retired = a.callsign.startsWith('GY');
+    const onGround = ['landed', 'taxi', 'ready', 'parked'].includes(a.state);
+    const groundLift = onGround ? (retired ? 1.0 : 2.0) : 0;
     entry.target.set(a.position[0], a.position[1] + groundLift, a.position[2]);
     entry.targetHeading = a.heading;
 
