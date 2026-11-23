@@ -40,9 +40,11 @@ scene.fog = new THREE.Fog(0x123a5c, 400, 1400);
 const camera = new THREE.PerspectiveCamera(
   55, window.innerWidth / window.innerHeight, 1, 3000,
 );
-camera.position.set(0, 220, 340);
+camera.position.set(0, 480, 260);
+camera.lookAt(0, 0, 0);
 
 const controls = new OrbitControls(camera, canvas);
+controls.target.set(0, 60, 0);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.maxPolarAngle = Math.PI / 2 - 0.05;
@@ -127,8 +129,29 @@ function makeDroneMesh() {
   return { group, materials: [mat, rotorMat] };
 }
 
-function makeHoldRing() {
-  const ring = new THREE.Mesh(
+// Canvas-sprite callsign label that stays screen-facing and constant-ish size.
+function makeLabel(callsign) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 64;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = 'rgba(0, 20, 20, 0.55)';
+  ctx.fillRect(0, 0, 256, 64);
+  ctx.font = 'bold 34px monospace';
+  ctx.fillStyle = '#e8ffff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(callsign, 128, 34);
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: new THREE.CanvasTexture(canvas), transparent: true, depthTest: false,
+  }));
+  sprite.scale.set(24, 6, 1);
+  sprite.position.y = 14;
+  sprite.renderOrder = 10;
+  return sprite;
+}
+
+function makeHoldRing() {  const ring = new THREE.Mesh(
     new THREE.RingGeometry(7, 9, 32),
     new THREE.MeshBasicMaterial({
       color: 0xffb020, transparent: true, opacity: 0.8, side: THREE.DoubleSide,
@@ -142,6 +165,9 @@ function ensureMesh(a) {
   let entry = meshes.get(a.id);
   if (entry) return entry;
   const built = a.kind === 'drone' ? makeDroneMesh() : makeAgentMesh();
+  built.group.scale.setScalar(5); // aircraft are visible from the tower view
+  const label = makeLabel(a.callsign);
+  built.group.add(label);
   const ring = makeHoldRing();
   ring.visible = false;
   built.group.add(ring);
