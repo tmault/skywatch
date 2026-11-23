@@ -1985,6 +1985,65 @@ mod tests {
     }
 
     #[test]
+    fn takeoff_climbs_continuously_into_assigned_sector_without_snap() {
+        // Full lifecycle: taxi out, hold short, roll, rotate, climb out, then join
+        // the assigned sector continuously — no position/heading/altitude snap anywhere.
+        let sectors = default_sectors();
+        let sector = &sectors[0];
+        let mut world = World::new();
+        let mut a = Aircraft::with_model("CONT-TAKEOFF", Kind::Agent, ModelClass::Frontier);
+        a.state = State::Parked;
+        a.position = [HOME_GATES[1][0], HOME_GATES[1][1], 0.0];
+        a.altitude = 0.0;
+        a.heading = GATE_HEADING;
+        a.assign(&sector.name);
+        world.add(a);
+        world.get_mut("CONT-TAKEOFF").unwrap().release();
+
+        let mut saw_airborne = false;
+        let mut saw_join = false;
+        for i in 0..4000 {
+            let (old, old_alt, old_hdg) = world
+                .iter()
+                .find(|p| p.callsign == "CONT-TAKEOFF")
+                .map(|p| (p.position, p.altitude, p.heading))
+                .unwrap();
+            world.tick(0.1);
+            let p = world.iter().find(|p| p.callsign == "CONT-TAKEOFF").unwrap();
+            let dist = wrap_centered(p.position[0] - old[0]).hypot(wrap_centered(p.position[1] - old[1]));
+            let ground = p.altitude <= 0.0;
+            // Physical speed caps: taxi 6 m/s, ground roll to liftoff 34 m/s,
+            // air up to liftoff+15% climb speed (39 m/s). dt is 0.1s.
+            let max_pos = if ground && !matches!(p.state, State::Takeoff | State::Departing) {
+                0.7
+            } else {
+                5.0
+            };
+            assert!(dist < max_pos, "position jumped {dist} at tick {i} ({:?})", p.state);
+            if ground {
+                continue;
+            }
+            saw_airborne = true;
+            let dh = (p.heading - old_hdg + std::f32::consts::PI)
+                .rem_euclid(std::f32::consts::TAU)
+                - std::f32::consts::PI;
+            assert!(dh.abs() < 0.2, "heading jumped {dh} at tick {i} ({:?})", p.state);
+            assert!((p.altitude - old_alt).abs() < 2.0, "altitude jumped at tick {i}");
+            if p.state == State::Cruising && p.joining {
+                saw_join = true;
+            }
+            if saw_join && p.state == State::Cruising && !p.joining {
+                let d = wrap_centered(p.position[0] - sector.center[0])
+                    .hypot(wrap_centered(p.position[1] - sector.center[1]));
+                assert!(d < sector.radius * 1.6, "drifted out of assigned sector: {d}");
+                break;
+            }
+        }
+        assert!(saw_airborne, "aircraft never left the ground");
+        assert!(saw_join, "climb-out never handed over to the continuous sector join");
+    }
+
+    #[test]
     fn hold_then_approval_climbs_to_cruise() {
         let mut a = Aircraft::new("SKY1", Kind::Agent);
         a.hold("awaiting approval");
