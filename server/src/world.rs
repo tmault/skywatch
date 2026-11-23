@@ -44,6 +44,9 @@ pub struct Aircraft {
     pub heading: f32,
     pub altitude: f32,
     pub hold_reason: Option<String>,
+    /// Topic sector this aircraft works in (None = unassigned).
+    #[serde(default)]
+    pub topic: Option<String>,
     /// Ground speed in m/s (serde default keeps old snapshots deserialisable).
     #[serde(default = "default_speed")]
     pub speed: f32,
@@ -68,6 +71,31 @@ const HOLD_DRIFT_SPEED: f32 = ORBIT_RADIUS * 0.1; // m/s drift while holding
 /// centred on the origin (where the island sits).
 fn wrap_centered(v: f32) -> f32 {
     (v + AREA_SIZE / 2.0).rem_euclid(AREA_SIZE) - AREA_SIZE / 2.0
+}
+
+/// Topic sectors: (name, centre [x, z], radius). Client renders these from
+/// the snapshot; cruising aircraft patrol inside their sector.
+pub const SECTORS: &[(&str, [f32; 2], f32)] = &[
+    ("Deploy", [-240.0, 60.0], 130.0),
+    ("Refactor", [210.0, 110.0], 130.0),
+    ("Monitor", [30.0, -250.0], 130.0),
+];
+
+/// Turn at most this many rad/s toward the sector centre when leaving it.
+const PATROL_TURN_RATE: f32 = 0.5;
+
+/// Steer heading toward a target point (shortest arc, limited turn rate).
+fn steer_toward(heading: &mut f32, target: [f32; 2], pos: [f32; 2], dt: f32) {
+    let desired = (target[1] - pos[1]).atan2(target[0] - pos[0]);
+    let mut dh = desired - *heading;
+    while dh > std::f32::consts::PI {
+        dh -= std::f32::consts::TAU;
+    }
+    while dh < -std::f32::consts::PI {
+        dh += std::f32::consts::TAU;
+    }
+    let turn = PATROL_TURN_RATE * dt;
+    *heading += dh.clamp(-turn, turn);
 }
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -100,8 +128,14 @@ impl Aircraft {
             heading: rng.gen_range(0.0..std::f32::consts::TAU),
             altitude: CRUISE_ALTITUDE,
             hold_reason: None,
+            topic: None,
             speed,
         }
+    }
+
+    /// Assign this aircraft to a topic sector.
+    pub fn assign(&mut self, topic: &str) {
+        self.topic = Some(topic.to_string());
     }
 
     /// Enter a holding pattern with a reason (e.g. "awaiting approval").
@@ -135,6 +169,23 @@ impl Aircraft {
                 self.position[1] = wrap_centered(self.position[1] + dy);
             }
             State::Cruising => {
+                // Patrol inside the topic sector: steer back when near its edge.
+                if let Some(topic) = &self.topic {
+                    if let Some((_, centre, radius)) =
+                        SECTORS.iter().find(|(name, _, _)| name == topic)
+                    {
+                        let dist = (self.position[0] - centre[0])
+                            .hypot(self.position[1] - centre[1]);
+                        if dist > radius * 0.6 {
+                            steer_toward(
+                                &mut self.heading,
+                                *centre,
+                                [self.position[0], self.position[1]],
+                                dt,
+                            );
+                        }
+                    }
+                }
                 let dx = self.heading.cos() * self.speed * dt;
                 let dy = self.heading.sin() * self.speed * dt;
                 self.position[0] = wrap_centered(self.position[0] + dx);
@@ -166,9 +217,18 @@ impl Aircraft {
 }
 
 /// Snapshot of the whole world, ready to serialise over the wire.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct WorldSnapshot {
     pub aircraft: Vec<Aircraft>,
+    pub sectors: Vec<Sector>,
+}
+
+/// A topic sector, serialised for the client to render.
+#[derive(Clone, Debug, Serialize)]
+pub struct Sector {
+    pub name: String,
+    pub center: [f32; 2],
+    pub radius: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -203,6 +263,14 @@ impl World {
     pub fn snapshot(&self) -> WorldSnapshot {
         WorldSnapshot {
             aircraft: self.aircraft.clone(),
+            sectors: SECTORS
+                .iter()
+                .map(|(name, centre, radius)| Sector {
+                    name: name.to_string(),
+                    center: *centre,
+                    radius: *radius,
+                })
+                .collect(),
         }
     }
 }

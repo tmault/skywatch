@@ -138,6 +138,56 @@ scene.add(sun);
   scene.add(island);
 }
 
+/* ------------------------------------------------------------- sectors */
+
+// Sector rings + labels on the water, built once from the first snapshot.
+const TOPIC_COLORS = {
+  Deploy: 0x35c4d6,
+  Refactor: 0x7fd635,
+  Monitor: 0xb07fd6,
+};
+let sectorsBuilt = false;
+
+function topicColor(name) {
+  return TOPIC_COLORS[name] || 0x88aacc;
+}
+
+function ensureSectors(sectors) {
+  if (sectorsBuilt || sectors.length === 0) return;
+  sectorsBuilt = true;
+  for (const s of sectors) {
+    const color = topicColor(s.name);
+
+    // Thin boundary ring on the water.
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(s.radius - 1.5, s.radius, 48),
+      new THREE.MeshBasicMaterial({
+        color, transparent: true, opacity: 0.35, side: THREE.DoubleSide,
+      }),
+    );
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.set(s.center[0], 0.8, s.center[1]);
+    scene.add(ring);
+
+    // Faint filled disc so the sector reads as area, not just line.
+    const fill = new THREE.Mesh(
+      new THREE.CircleGeometry(s.radius, 48),
+      new THREE.MeshBasicMaterial({
+        color, transparent: true, opacity: 0.05, side: THREE.DoubleSide,
+      }),
+    );
+    fill.rotation.x = -Math.PI / 2;
+    fill.position.set(s.center[0], 0.7, s.center[1]);
+    scene.add(fill);
+
+    // Sector name label.
+    const label = makeLabel(s.name.toUpperCase(), color);
+    label.position.set(s.center[0], 26, s.center[1]);
+    label.scale.set(42, 10.5, 1);
+    scene.add(label);
+  }
+}
+
 /* ------------------------------------------------------ aircraft meshes */
 
 // Group per aircraft: mesh + (optionally) hold ring. Meshes are created on
@@ -292,7 +342,7 @@ function makeDroneMesh() {
 }
 
 // Canvas-sprite callsign label that stays screen-facing and constant-ish size.
-function makeLabel(callsign) {
+function makeLabel(callsign, tint = 0xe8ffff) {
   const canvas = document.createElement('canvas');
   canvas.width = 256;
   canvas.height = 64;
@@ -300,7 +350,7 @@ function makeLabel(callsign) {
   ctx.fillStyle = 'rgba(0, 20, 20, 0.55)';
   ctx.fillRect(0, 0, 256, 64);
   ctx.font = 'bold 34px monospace';
-  ctx.fillStyle = '#e8ffff';
+  ctx.fillStyle = '#' + new THREE.Color(tint).getHexString();
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText(callsign, 128, 34);
@@ -330,7 +380,7 @@ function ensureMesh(a) {
     ? makeDroneMesh()
     : (a.model_class === 'frontier' ? makeJetMesh() : makeAgentMesh());
   built.group.scale.setScalar(5); // aircraft are visible from the tower view
-  const label = makeLabel(a.callsign);
+  const label = makeLabel(a.callsign, a.topic ? topicColor(a.topic) : 0xe8ffff);
   built.group.add(label);
   const ring = makeHoldRing();
   ring.visible = false;
@@ -450,6 +500,8 @@ function applySnapshot(snapshot) {
   for (const a of snapshot.aircraft || []) currentSnapshot.set(a.id, a);
   const aircraft = snapshot.aircraft || [];
   const seen = new Set();
+
+  ensureSectors(snapshot.sectors || []);
 
   for (const a of aircraft) {
     seen.add(a.id);

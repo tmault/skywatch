@@ -19,15 +19,15 @@
 
 use std::time::Duration;
 
-use crate::world::{Aircraft, Kind, State, World};
+use crate::world::{Aircraft, Kind, ModelClass, State, World};
 
 /// Positions spread across the 1000x1000 map so aircraft don't overlap.
 const POSITIONS: [[f32; 3]; 5] = [
-    [-260.0, 180.0, 120.0],
-    [140.0, -60.0, 120.0],
+    [-240.0, 60.0, 120.0],
+    [210.0, 110.0, 120.0],
     [55.0, -20.0, 0.5],
-    [-180.0, -220.0, 80.0],
-    [220.0, 140.0, 80.0],
+    [30.0, -250.0, 80.0],
+    [120.0, -220.0, 80.0],
 ];
 
 const HEADINGS: [f32; 5] = [0.8, 2.4, 0.0, 3.9, 5.5];
@@ -36,18 +36,24 @@ const ALTITUDES: [f32; 5] = [120.0, 120.0, 0.0, 40.0, 40.0];
 /// Populate a fresh world with the demo cast.
 pub fn seed(world: &mut World) {
     let callsigns = [
-        ("SKY1", Kind::Agent),
-        ("SKY2", Kind::Agent),
-        ("SKY3", Kind::Agent),
-        ("REAP1", Kind::Drone),
-        ("REAP2", Kind::Drone),
+        ("SKY1", Kind::Agent, ModelClass::Frontier),
+        ("SKY2", Kind::Agent, ModelClass::Local),
+        ("SKY3", Kind::Agent, ModelClass::Local),
+        ("REAP1", Kind::Drone, ModelClass::Local),
+        ("REAP2", Kind::Drone, ModelClass::Local),
     ];
 
-    for (i, (callsign, kind)) in callsigns.iter().enumerate() {
-        let mut a = Aircraft::new(callsign, *kind);
+    for (i, (callsign, kind, model_class)) in callsigns.iter().enumerate() {
+        let mut a = Aircraft::with_model(callsign, *kind, *model_class);
         a.position = POSITIONS[i];
         a.heading = HEADINGS[i];
         a.altitude = ALTITUDES[i];
+        match *callsign {
+            "SKY1" => a.assign("Deploy"),
+            "SKY2" | "SKY3" => a.assign("Refactor"),
+            "REAP1" | "REAP2" => a.assign("Monitor"),
+            _ => {}
+        }
         match *callsign {
             "SKY2" => a.hold("awaiting approval of refactor plan"),
             "SKY3" => a.land(),
