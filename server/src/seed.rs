@@ -189,8 +189,8 @@ fn apply_step(world: &mut World, step: &Step) {
         }
         Action::Land => {
             if a.state == State::Cruising || a.state == State::Takeoff {
-                tracing::info!(callsign = step.callsign, "script: landing");
-                a.land();
+                tracing::info!(callsign = step.callsign, "script: on approach");
+                a.begin_approach(None);
             }
         }
     }
@@ -263,20 +263,26 @@ mod tests {
         run_cycle(&mut world, 3);
         let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
         assert_eq!(a.state, State::Taxi);
-        world.tick(12.0);
-        let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
-        assert_eq!(a.state, State::Ready);
-        world.tick(5.0);
-        world.tick(30.0);
-        let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
-        assert_eq!(a.state, State::Cruising);
+        let state_of = |w: &World| w.iter().find(|a| a.callsign == "SKY3").unwrap().state;
+        let run_until = |w: &mut World, want: State, secs: f32| {
+            for _ in 0..(secs / 0.05) as usize {
+                w.tick(0.05);
+                if state_of(w) == want {
+                    return;
+                }
+            }
+        };
+        run_until(&mut world, State::Takeoff, 60.0);
+        assert_eq!(state_of(&world), State::Takeoff);
+        run_until(&mut world, State::Cruising, 60.0);
+        assert_eq!(state_of(&world), State::Cruising);
         run_cycle(&mut world, 5);
-        let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
-        assert_eq!(a.state, State::Landed);
-        world.tick(6.0);
-        let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
-        assert_eq!(a.state, State::Taxi);
-        world.tick(40.0);
+        assert_eq!(state_of(&world), State::Landing);
+        run_until(&mut world, State::Landed, 180.0);
+        assert_eq!(state_of(&world), State::Landed);
+        run_until(&mut world, State::Taxi, 30.0);
+        assert_eq!(state_of(&world), State::Taxi);
+        run_until(&mut world, State::Parked, 120.0);
         let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
         assert_eq!(a.state, State::Parked);
     }

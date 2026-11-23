@@ -67,7 +67,7 @@ function makeGroup(parent, points, color, glowSize) {
   const glow = new THREE.Points(geo, glowMat);
   glow.renderOrder = 2;
   parent.add(glow);
-  return { lampMat, glow, glowMat, color };
+  return { lampMat, glow, glowMat, color, baseSize: glowSize };
 }
 
 /**
@@ -151,7 +151,7 @@ export function addRunwayLights(parent, opts) {
   // Sequenced flash: each strobe fires in turn towards the threshold.
   const update = (now) => {
     if (!online) return;
-    const cycle = 1.6;
+    const cycle = boost > 0.05 ? 0.7 : 1.6; // the rabbit runs faster for traffic
     const t = (now % cycle) / cycle;
     strobes.forEach((s, i) => {
       const phase = t * (strobeCount + 3) - i;
@@ -161,9 +161,16 @@ export function addRunwayLights(parent, opts) {
     });
     // Gentle shimmer on the steady lights.
     const shimmer = 0.92 + 0.08 * Math.sin(now * 7.3);
-    for (const g of groups) g.glowMat.opacity = shimmer;
+    for (const g of groups) g.glowMat.opacity = Math.min(1, shimmer + 0.3 * boost);
+  };
+
+  // Runway in use (takeoff / landing): steady lights swell and brighten.
+  let boost = 0;
+  const setBoost = (b) => {
+    boost = b;
+    for (const g of groups) g.glowMat.size = g.baseSize * (1 + 0.9 * boost);
   };
 
   setOnline(true);
-  return { group, setOnline, update };
+  return { group, setOnline, update, setBoost };
 }

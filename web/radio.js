@@ -89,7 +89,9 @@ function render(a) {
     ? 'at gate'
     : a.state === 'ready'
       ? 'taxiway queue'
-      : a.state;
+      : a.state === 'departing'
+        ? 'departing (done)'
+        : a.state;
   stateEl.style.color = stateColor(a.state);
 
   if (a.state === 'holding' && a.hold_reason) {
@@ -102,6 +104,9 @@ function render(a) {
     holdReasonEl.hidden = false;
   } else if (a.state === 'parked') {
     holdReasonEl.textContent = 'AT GATE: untouched >24h — send a message to wake & push back';
+    holdReasonEl.hidden = false;
+  } else if (a.state === 'departing') {
+    holdReasonEl.textContent = 'DONE / ARCHIVED: departing into the horizon — bon voyage';
     holdReasonEl.hidden = false;
   } else {
     holdReasonEl.hidden = true;
@@ -169,6 +174,7 @@ export function stateColor(state) {
     case 'ready': return '#ff8c42';
     case 'takeoff':
     case 'landing': return '#35d6e8';
+    case 'departing': return '#4dff9e';
     default: return '#ffffff';
   }
 }

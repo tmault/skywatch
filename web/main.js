@@ -13,6 +13,7 @@ import {
   makeLakeMaterial, enableShadows,
 } from './alpine.js';
 import { addRunwayLights } from './runway-lights.js';
+import { addLandingLights, createRunwayEvents } from './runway-events.js';
 import { makeAgentMesh, makeJetMesh, makeFighterMesh, makeDroneMesh } from './aircraft.js';
 
 const WORLD_SIZE = 820;
@@ -111,6 +112,16 @@ scene.add(rim);
 
   buildAlpineBackdrop(scene, 620, 1500);
 }
+
+/* ----------------------------------------------------- runway events */
+
+// Home Runway 36 (mirrors the server's RUNWAY_THRESHOLD / FINAL_APPROACH_FIX /
+// TOUCHDOWN_Z); takeoffs and landings light it up so they draw the eye.
+let homeRunwayLights = null;
+const runwayEvents = createRunwayEvents(scene, {
+  x: 56, zMin: -76, zMax: 56, halfWidth: 10.6, deckY: TARMAC_TOP_Y,
+  glideFrom: [276, 42], touchdownZ: 34,
+});
 
 /* ----------------------------------------------------------- airports */
 
@@ -236,6 +247,7 @@ function buildHomeAirport(ap) {
     groundY: 1.8, spacing: 8, approachLength: 24,
   });
   lights.setOnline(ap.online);
+  homeRunwayLights = lights;
 
   // Runway edge lines, centreline dashes & threshold piano keys.
   const markY = TARMAC_TOP_Y + 0.08;
@@ -744,9 +756,11 @@ function buildAircraftLabelTexture(a, accentHex) {
     ? 'AT GATE · >24H'
     : a.state === 'ready'
       ? 'TAXIWAY · WAITING'
-      : a.kind === 'fighter'
-        ? 'WINGMAN'
-        : a.state.toUpperCase();
+      : a.state === 'departing'
+        ? 'DEPARTING · DONE'
+        : a.kind === 'fighter'
+          ? 'WINGMAN'
+          : a.state.toUpperCase();
   const sub = `${a.callsign} · ${stateLabel}`;
   ctx.font = 'bold 21px "IBM Plex Mono", ui-monospace, monospace';
   ctx.fillStyle = accent;
@@ -758,6 +772,7 @@ function buildAircraftLabelTexture(a, accentHex) {
 }
 
 function labelAccentFor(a) {
+  if (a.state === 'departing') return 0x4dff9e;
   if (a.state === 'holding') return 0xffb020;
   if (a.state === 'ready') return 0xff943b;
   if (a.kind === 'fighter') return 0x7ce8ff;
@@ -1002,6 +1017,19 @@ function makeContrailsFor(a) {
   }));
 }
 
+function worldYForAircraft(a, wheelDrop) {
+  const groundOffset = TARMAC_TOP_Y + wheelDrop;
+  if (['landed', 'taxi', 'ready', 'parked'].includes(a.state)) {
+    return a.position[2] + groundOffset;
+  }
+  if (a.state === 'departing' || a.state === 'takeoff' || a.state === 'landing') {
+    // Seamlessly blend wheel contact on the elevated runway deck into world altitude during climb-out.
+    const liftBlend = Math.min(1, Math.max(0, a.position[2] / 15));
+    return a.position[2] + groundOffset * (1 - liftBlend);
+  }
+  return a.position[2];
+}
+
 function ensureMesh(a) {
   let entry = meshes.get(a.id);
   if (entry) return entry;
@@ -1017,6 +1045,7 @@ function ensureMesh(a) {
   const s = built.scale;
   built.group.scale.setScalar(s);
   built.group.rotation.order = 'YXZ';
+  if (a.kind !== 'fighter') built.landingLights = addLandingLights(built);
 
   const label = new THREE.Sprite(new THREE.SpriteMaterial({
     transparent: true, depthTest: false,
@@ -1036,13 +1065,16 @@ function ensureMesh(a) {
   built.group.add(ring);
 
   // Server position is [x, z, altitude]; Three.js is (x, y=altitude, z).
-  const onGround = ['landed', 'taxi', 'ready', 'parked'].includes(a.state);
-  const groundY = onGround ? TARMAC_TOP_Y + built.wheelDrop : 0;
-  built.group.position.set(a.position[0], a.position[2] + groundY, a.position[1]);
+  const y = worldYForAircraft(a, built.wheelDrop);
+  built.group.position.set(a.position[0], y, a.position[1]);
   built.target = built.group.position.clone();
   built.heading = a.heading;
   built.targetHeading = a.heading;
+  built.altitude = a.position[2];
+  built.speed = a.speed ?? 0;
+  built.dustClock = 0;
   built.roll = 0;
+  built.pitch = 0;
   built.group.rotation.y = Math.PI / 2 - a.heading;
   built.state = a.state;
   built.kind = a.kind;
@@ -1093,9 +1125,9 @@ function disposeMesh(id) {
 const tickerEl = document.getElementById('ticker-lines');
 const pinnedHold = new Map();
 
-function addTickerLine(text, holding = false, aircraftId = null) {
+function addTickerLine(text, holding = false, aircraftId = null, kind = '') {
   const line = document.createElement('div');
-  line.className = 'tick-line' + (holding ? ' hold' : '');
+  line.className = 'tick-line' + (holding ? ' hold' : '') + (kind ? ` ${kind}` : '');
   line.textContent = text;
   line._aircraftId = aircraftId;
   tickerEl.appendChild(line);
@@ -1194,31 +1226,6 @@ followEl.addEventListener('click', () => {
   closeRadio();
 });
 
-window.addEventListener('keydown', (ev) => {
-  if (ev.key === 'Escape' && followId !== null) {
-    stopFollow(true);
-    closeRadio();
-  }
-});
-
-let ws = null;
-const lastStates = new Map();
-
-function sendJson(obj) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(obj));
-  }
-}
-
-setupRadio({
-  send: (id, text) => sendJson({ type: 'message', aircraft_id: id, text }),
-  approve: (id) => sendJson({ type: 'approve', aircraft_id: id }),
-  close: () => stopFollow(true),
-});
-
-function connect() {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${proto}//${location.host}/ws`);
 /* ------------------------------------------------------ keyboard camera */
 // Arrows orbit around the current target (the followed aircraft when in
 // follow cam), +/- or PageUp/PageDown zoom, WASD pans the overview, Home
@@ -1237,12 +1244,12 @@ function isTypingTarget(el) {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
 }
 
-
-  ws.addEventListener('open', () => {
-    statusEl.textContent = 'connected';
-    statusEl.classList.remove('error');
+window.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape' && followId !== null) {
+    stopFollow(true);
+    closeRadio();
     return;
-  });
+  }
   if (isTypingTarget(ev.target) || ev.ctrlKey || ev.metaKey || ev.altKey) return;
   if (ev.key === 'Home') {
     ev.preventDefault();
@@ -1257,8 +1264,8 @@ function isTypingTarget(el) {
   // Manual input takes over from automatic swoop/return glides.
   followSwoop = false;
   returnOverview = false;
-  ws.addEventListener('close', () => {
-    statusEl.textContent = 'disconnected — reconnecting…';
+});
+
 window.addEventListener('keyup', (ev) => {
   const key = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
   heldKeys.delete(key);
@@ -1314,6 +1321,31 @@ function applyKeyboardCamera(dt) {
   }
 }
 
+let ws = null;
+const lastStates = new Map();
+
+function sendJson(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+  }
+}
+
+setupRadio({
+  send: (id, text) => sendJson({ type: 'message', aircraft_id: id, text }),
+  approve: (id) => sendJson({ type: 'approve', aircraft_id: id }),
+  close: () => stopFollow(true),
+});
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+  ws.addEventListener('open', () => {
+    statusEl.textContent = 'connected';
+    statusEl.classList.remove('error');
+  });
+  ws.addEventListener('close', () => {
+    statusEl.textContent = 'disconnected — reconnecting…';
     statusEl.classList.add('error');
     setTimeout(connect, 1500);
   });
@@ -1341,10 +1373,12 @@ function applySnapshot(snapshot) {
     // Repaint when the thread switches model (new livery).
     if (meshes.has(a.id) && meshes.get(a.id).model !== (a.model ?? null)) disposeMesh(a.id);
     const entry = ensureMesh(a);
-    const onGround = ['landed', 'taxi', 'ready', 'parked'].includes(a.state);
-    const groundY = onGround ? TARMAC_TOP_Y + entry.wheelDrop : 0;
-    entry.target.set(a.position[0], a.position[2] + groundY, a.position[1]);
+    const y = worldYForAircraft(a, entry.wheelDrop);
+    entry.target.set(a.position[0], y, a.position[1]);
     entry.targetHeading = a.heading;
+    detectRunwayEvent(a, entry, lastStates.get(a.id), entry.altitude);
+    entry.altitude = a.position[2];
+    entry.speed = a.speed ?? 0;
 
     if (lastStates.get(a.id) !== a.state) {
       handleStateChange(a, lastStates.get(a.id), a.state);
@@ -1386,6 +1420,55 @@ function applySnapshot(snapshot) {
   }
 }
 
+/* ------------------------------------------------- takeoff / landing */
+
+const eventBanner = document.getElementById('event-banner');
+let eventBannerTimer = null;
+
+function showEventBanner(a, kind, verb) {
+  eventBanner.className = kind;
+  eventBanner.querySelector('.event-kind').textContent = verb;
+  eventBanner.querySelector('.event-callsign').textContent = a.callsign;
+  eventBanner.querySelector('.event-title').textContent = a.title ? formatTaskTitle(a) : '';
+  eventBanner.dataset.aircraftId = String(a.id);
+  eventBanner.hidden = false;
+  // Restart the entrance animation for back-to-back events.
+  void eventBanner.offsetWidth;
+  eventBanner.classList.add('show');
+  clearTimeout(eventBannerTimer);
+  eventBannerTimer = setTimeout(() => eventBanner.classList.remove('show'), 5200);
+}
+
+eventBanner.addEventListener('click', () => {
+  const a = currentSnapshot.get(Number(eventBanner.dataset.aircraftId));
+  if (!a) return;
+  openRadio(a);
+  startFollow(a.id);
+});
+
+// Fire one-shot effects on takeoff roll, liftoff, approach and touchdown.
+// `from` is undefined the first time an aircraft is seen (no event then).
+function detectRunwayEvent(a, entry, from, prevAlt) {
+  if (from === undefined || a.kind === 'fighter') return;
+  const [x, z, alt] = a.position;
+  const rolling = a.state === 'takeoff' || a.state === 'departing';
+
+  if (rolling && from !== a.state && from !== 'takeoff' && alt <= 0) {
+    runwayEvents.takeoffRoll(x, z);
+    showEventBanner(a, 'takeoff', a.state === 'departing' ? 'Final departure' : 'Departure');
+  }
+  if (rolling && prevAlt <= 0 && alt > 0) {
+    runwayEvents.liftoff(x, z, entry.group.position.y);
+  }
+  if (a.state === 'landing' && from !== 'landing') {
+    showEventBanner(a, 'landing', 'Arrival · on approach');
+  }
+  if (from === 'landing' && a.state === 'landed') {
+    runwayEvents.touchdown(x, z);
+    showEventBanner(a, 'landing', 'Touchdown');
+  }
+}
+
 function handleStateChange(a, from, to) {
   const tag = a.title ? `${a.callsign} (${formatTaskTitle(a)})` : a.callsign;
   if (a.kind === 'fighter' && from === undefined) {
@@ -1396,9 +1479,10 @@ function handleStateChange(a, from, to) {
     addTickerLine(`${tag}: entering hold — awaiting approval`, true, a.id);
   } else {
     unpinHold(a.id);
-    if (to === 'takeoff') addTickerLine(`${tag}: departing.`);
-    else if (to === 'landing') addTickerLine(`${tag}: on approach.`);
-    else if (to === 'landed') addTickerLine(`${tag}: landed, off frequency.`);
+    if (to === 'takeoff') addTickerLine(`${tag}: rolling, Runway 36.`, false, a.id, 'takeoff');
+    else if (to === 'departing') addTickerLine(`${tag}: thread done — departing into the horizon.`, false, a.id, 'takeoff');
+    else if (to === 'landing') addTickerLine(`${tag}: on approach, Runway 36.`, false, a.id, 'landing');
+    else if (to === 'landed') addTickerLine(`${tag}: touchdown.`, false, a.id, 'landing');
     else if (to === 'taxi') addTickerLine(`${tag}: taxiing.`);
     else if (to === 'parked') addTickerLine(`${tag}: parked at the gate.`);
     else if (to === 'ready') addTickerLine(`${tag}: lined up, ready for takeoff.`, true, a.id);
@@ -1408,6 +1492,7 @@ function handleStateChange(a, from, to) {
     const note = {
       holding: 'entering hold',
       takeoff: 'taking off',
+      departing: 'departing into the horizon',
       landing: 'landing',
       landed: 'landed',
       taxi: 'taxiing',
@@ -1473,7 +1558,7 @@ function animate() {
 
   const now = performance.now() / 1000;
   for (const entry of meshes.values()) {
-    const wrapped = entry.group.position.distanceToSquared(entry.target) > 40000;
+    const wrapped = entry.state !== 'departing' && entry.group.position.distanceToSquared(entry.target) > 40000;
     if (wrapped) {
       entry.group.position.copy(entry.target);
       if (entry.contrails) for (const c of entry.contrails) c.clear();
@@ -1489,7 +1574,8 @@ function animate() {
     entry.group.rotation.y = Math.PI / 2 - entry.heading;
 
     // Bank smoothly into turns when airborne; keep wings level on the ground.
-    const airborne = ['cruising', 'holding', 'takeoff', 'landing'].includes(entry.state);
+    const departingAirborne = entry.state === 'departing' && (entry.altitude || 0) > 0.4;
+    const airborne = ['cruising', 'holding', 'takeoff', 'landing'].includes(entry.state) || departingAirborne;
     const omega = dt > 0.001 ? stepH / dt : 0;
     const maxBank = entry.kind === 'fighter' ? 0.52 : (entry.model_class === 'frontier' ? 0.32 : 0.4);
     const targetRoll = airborne
@@ -1497,6 +1583,47 @@ function animate() {
       : 0;
     entry.roll += (targetRoll - entry.roll) * (1 - Math.exp(-5 * dt));
     entry.group.rotation.z = entry.roll;
+
+    // Pitch nose up smoothly during takeoff rotation and climb-out (negative X pitches +Z nose up).
+    let targetPitch = 0;
+    const alt = entry.altitude || 0;
+    if (departingAirborne) {
+      targetPitch = alt < 480 ? -0.24 : -0.08;
+    } else if (entry.state === 'takeoff' && alt > 0) {
+      targetPitch = -0.22; // rotate at liftoff, not during the roll
+    } else if (entry.state === 'landing') {
+      targetPitch = alt < 10 ? -0.12 : -0.04; // flare just before touchdown
+    }
+    entry.pitch = (entry.pitch || 0) + (targetPitch - (entry.pitch || 0)) * (1 - Math.exp(-3.5 * dt));
+    entry.group.rotation.x = entry.pitch;
+
+    // Fade the floating label smoothly as a departing aircraft vanishes into the distant haze.
+    if (entry.state === 'departing') {
+      const dist = Math.hypot(entry.group.position.x, entry.group.position.z);
+      entry.label.material.opacity = Math.max(0, Math.min(1, 1 - (dist - 850) / 650));
+    } else if (entry.label.material.opacity !== 1) {
+      entry.label.material.opacity = 1;
+    }
+
+    // Landing lights on while rolling, climbing out, or on approach.
+    if (entry.landingLights) {
+      const st = entry.state;
+      const lit = st === 'takeoff' || st === 'landing'
+        || (st === 'departing' && alt < 160)
+        || (st === 'landed' && entry.speed > 0.5);
+      entry.landingLights.setLevel(lit ? 1 : 0, dt, now);
+    }
+    // Dust and spray thrown up behind a fast ground roll or rollout.
+    const groundRoll = ((entry.state === 'takeoff' || entry.state === 'departing') && alt <= 0)
+      || entry.state === 'landed';
+    if (groundRoll && entry.speed > 6) {
+      entry.dustClock += dt;
+      if (entry.dustClock > 0.06) {
+        entry.dustClock = 0;
+        const p = entry.group.position;
+        runwayEvents.rollDust(p.x, p.z, entry.heading);
+      }
+    }
 
     // Update contrail ribbons (emit only when airborne above ground).
     if (entry.contrails) {
@@ -1510,9 +1637,13 @@ function animate() {
       entry.prop.rotation.z = now * 30;
     }
 
-    // Retract landing gear while en route.
+    // Retract landing gear while en route or climbing away after takeoff.
     if (entry.gear) {
-      entry.gear.visible = entry.state !== 'cruising' && entry.state !== 'holding';
+      entry.gear.visible =
+        entry.state !== 'cruising'
+        && entry.state !== 'holding'
+        && !((entry.state === 'departing' || entry.state === 'takeoff') && alt > 18)
+        && !(entry.state === 'landing' && alt > 70);
     }
 
     if (entry.kind === 'fighter') {
@@ -1535,6 +1666,13 @@ function animate() {
       entry.ring.material.opacity = 0.5 + 0.35 * Math.sin(now * 4);
     }
   }
+
+  let approachActive = false;
+  for (const entry of meshes.values()) {
+    if (entry.state === 'landing') { approachActive = true; break; }
+  }
+  const runwayBusy = runwayEvents.update(dt, now, { approachActive });
+  if (homeRunwayLights) homeRunwayLights.setBoost(Math.max(runwayBusy, approachActive ? 0.35 : 0));
 
   for (const radar of radars) {
     radar.rotation.y = now * 0.8;
@@ -1580,6 +1718,7 @@ function animate() {
     }
   }
 
+  applyKeyboardCamera(dt);
   controls.update();
   renderer.render(scene, camera);
 }
@@ -1592,4 +1731,3 @@ window.addEventListener('resize', () => {
 
 connect();
 animate();
-  applyKeyboardCamera(dt);
