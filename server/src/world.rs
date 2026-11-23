@@ -713,24 +713,15 @@ impl Aircraft {
         let dx = wrap_centered(target[0] - self.position[0]);
         let dz = wrap_centered(target[1] - self.position[1]);
         let dist = dx.hypot(dz);
-        let transit = self.cruise_speed() * 2.4;
+        // Follow the moving route with bounded physical motion, never copy its coordinates.
+        let cruise = self.cruise_speed();
+        let transit = cruise * (1.0 + (dist / 180.0).clamp(0.0, 0.65));
         self.speed += (transit - self.speed).clamp(-5.0 * dt, 5.0 * dt);
         self.altitude += (target_alt - self.altitude).clamp(-10.0 * dt, 10.0 * dt);
-        if dist > 40.0 {
-            self.turn_toward(dz.atan2(dx), (0.55 + 30.0 / dist) * dt);
-            self.advance(dt);
-        } else {
-            // Close in: ease onto the path and match its heading.
-            let k = (2.0 * dt).min(1.0);
-            self.position[0] = wrap_centered(self.position[0] + dx * k);
-            self.position[1] = wrap_centered(self.position[1] + dz * k);
-            self.turn_toward(path_heading, 1.2 * dt);
-            if dist < 2.0 && (target_alt - self.altitude).abs() < 2.0 {
-                self.joining = false;
-                self.speed = self.cruise_speed();
-                return false;
-            }
-        }
+        let heading = if dist > 4.0 { dz.atan2(dx) } else { path_heading };
+        self.turn_toward(heading, 0.65 * dt);
+        self.advance(dt);
+        self.joining = dist > 20.0 || (target_alt - self.altitude).abs() > 2.0;
         self.position[2] = self.altitude;
         true
     }
@@ -838,7 +829,7 @@ impl Aircraft {
                 self.state = State::Cruising;
                 self.joining = true;
             }
-            // Airborne hold: climb straight out.
+            // Airborne hold: climb straight out, then join continuously.
             _ => self.state = State::Takeoff,
         }
     }
@@ -1012,8 +1003,8 @@ impl Aircraft {
             State::Holding => {
                 if self.orbit_center.is_none() {
                     let r = HOLD_TURN_RADIUS;
-                    let cx = self.position[0] + self.heading.cos() * r;
-                    let cy = self.position[1] + self.heading.sin() * r;
+                    let cx = self.position[0] - self.heading.sin() * r;
+                    let cy = self.position[1] + self.heading.cos() * r;
                     self.orbit_center = Some([cx, cy]);
                 }
                 let [cx, cy] = self.orbit_center.unwrap();
@@ -1026,10 +1017,8 @@ impl Aircraft {
                 self.position[0] = wrap_centered(nx);
                 self.position[1] = wrap_centered(ny);
                 let hold_alt = self.cruise_altitude();
-                if self.altitude < 40.0 {
-                    self.altitude = hold_alt;
-                    self.position[2] = hold_alt;
-                }
+                self.altitude += (hold_alt-self.altitude).clamp(-10.0*dt,10.0*dt);
+                self.position[2] = self.altitude;
             }
             State::Cruising => {
                 let base_alt = self.cruise_altitude();
@@ -1120,14 +1109,7 @@ impl Aircraft {
                         // Gentle vertical breath while cruising + TCAS altitude offset.
                         let wave = 2.5 * (2.0 * t).sin();
                         let target_alt = (base_alt + wave + self.sep_offset[2]).max(30.0);
-                        if self.joining && self.join_path(target, target_alt, path_heading, dt) {
-                            return;
-                        }
-                        self.heading = path_heading;
-                        self.position[0] = wrap_centered(target[0]);
-                        self.position[1] = wrap_centered(target[1]);
-                        self.altitude = target_alt;
-                        self.position[2] = self.altitude;
+                        self.join_path(target, target_alt, path_heading, dt);
                         return;
                     }
                 }
@@ -1982,6 +1964,25 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sector_changes_and_hold_release_preserve_bounded_motion() {
+        let mut a = Aircraft::with_model("CONTINUOUS", Kind::Agent, ModelClass::Frontier);
+        a.position = [0.0, 0.0, 130.0]; a.altitude=130.0; a.heading=0.0;
+        let sectors=default_sectors(); a.assign(&sectors[0].name);
+        for i in 0..300 {
+            if i==100 { a.assign(&sectors[1].name); }
+            if i==150 { a.hold("test"); }
+            if i==200 { a.release(); }
+            let old=a.position; let heading=a.heading;
+            a.tick_with_sectors(0.05,&sectors);
+            let distance=wrap_centered(a.position[0]-old[0]).hypot(wrap_centered(a.position[1]-old[1]));
+            assert!(distance < 6.0, "position jumped {distance} at {i}");
+            let delta=(a.heading-heading+std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)-std::f32::consts::PI;
+            assert!(delta.abs()<0.15,"heading jumped {delta} at {i}");
+            assert!((a.altitude-old[2]).abs()<1.5,"altitude jumped");
+        }
+    }
 
     #[test]
     fn hold_then_approval_climbs_to_cruise() {
