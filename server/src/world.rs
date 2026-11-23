@@ -130,6 +130,10 @@ pub struct Aircraft {
     /// Where taxiing leads next (Ready at the runway, Parked at the gate).
     #[serde(skip)]
     taxi_next: Option<State>,
+    /// True only after `release()` clears this aircraft to roll onto the runway
+    /// and take off; taxiway-queued planes sit in `State::Ready` with this false.
+    #[serde(skip)]
+    cleared_for_takeoff: bool,
     /// Ground timer: auto-taxi after landing, hold-short before takeoff.
     #[serde(skip)]
     ground_timer: f32,
@@ -154,19 +158,34 @@ const HOLD_TURN_RADIUS: f32 = 55.0; // m, holding orbit radius
 const HOLD_DRIFT_SPEED: f32 = 12.0; // m/s along the holding orbit
 
 /// Home airport geometry (matches the client's island rendering).
-pub const RUNWAY_MID: [f32; 2] = [66.0, -10.0];
-pub const RUNWAY_THRESHOLD: [f32; 2] = [66.0, 36.0];
+pub const RUNWAY_MID: [f32; 2] = [56.0, -10.0];
+pub const RUNWAY_THRESHOLD: [f32; 2] = [56.0, 46.0];
 pub const RUNWAY_HEADING: f32 = -std::f32::consts::FRAC_PI_2; // rolling north (-Z)
-/// Yellow taxiway spine between the runway (x=66) and terminal gates (x=98).
-pub const TAXIWAY_X: f32 = 81.0;
-/// Six terminal gates along the eastern apron of the home island.
-pub const HOME_GATES: [[f32; 2]; 6] = [
-    [98.0, -55.0],
-    [98.0, -35.0],
-    [98.0, -15.0],
-    [98.0, 5.0],
-    [98.0, 25.0],
-    [98.0, 45.0],
+/// Dedicated parallel Taxiway Alpha between Runway 36 (x=56) and the gate concourse.
+pub const TAXIWAY_X: f32 = 84.0;
+/// Six departure-queue slots along Taxiway Alpha & the south holding bay:
+/// `(position [x, z], heading)`. Slot 0 holds short at the runway entrance;
+/// slots 1-5 queue nose-to-tail heading south along Taxiway Alpha.
+pub const TAXIWAY_QUEUE: [([f32; 2], f32); 6] = [
+    ([78.0, 46.0], std::f32::consts::PI),           // holding bay, facing runway
+    ([84.0, 22.0], std::f32::consts::FRAC_PI_2),    // Taxiway Alpha #2
+    ([84.0, 0.0], std::f32::consts::FRAC_PI_2),     // Taxiway Alpha #3
+    ([84.0, -22.0], std::f32::consts::FRAC_PI_2),   // Taxiway Alpha #4
+    ([84.0, -44.0], std::f32::consts::FRAC_PI_2),   // Taxiway Alpha #5
+    ([84.0, -66.0], std::f32::consts::FRAC_PI_2),   // Taxiway Alpha #6
+];
+/// Ten terminal gates along the extended eastern concourse pier (for >24h idle threads).
+pub const HOME_GATES: [[f32; 2]; 10] = [
+    [120.0, -85.5],
+    [120.0, -66.5],
+    [120.0, -47.5],
+    [120.0, -28.5],
+    [120.0, -9.5],
+    [120.0, 9.5],
+    [120.0, 28.5],
+    [120.0, 47.5],
+    [120.0, 66.5],
+    [120.0, 85.5],
 ];
 /// Heading when nose-in at the home terminal (facing east, +X).
 pub const GATE_HEADING: f32 = 0.0;
@@ -252,6 +271,7 @@ impl Aircraft {
             patrol_angle: rng.gen_range(0.0..std::f32::consts::TAU),
             taxi_waypoints: Vec::new(),
             taxi_next: None,
+            cleared_for_takeoff: false,
             ground_timer: 0.0,
             speed,
         }
@@ -313,15 +333,23 @@ impl Aircraft {
     pub fn release(&mut self) {
         self.orbit_center = None;
         self.hold_reason = None;
+        self.cleared_for_takeoff = true;
         match self.state {
             // On the ground: taxi to the runway threshold first.
             State::Parked | State::Landed | State::Taxi => {
                 self.taxi_to(RUNWAY_THRESHOLD, State::Ready);
             }
-            // Already lined up: roll now.
+            // Already lined up or holding on taxiway: if already at threshold roll now,
+            // otherwise taxi onto the runway threshold first.
             State::Ready => {
-                self.state = State::Takeoff;
-                self.heading = RUNWAY_HEADING;
+                let d = (self.position[0] - RUNWAY_THRESHOLD[0])
+                    .hypot(self.position[1] - RUNWAY_THRESHOLD[1]);
+                if d < 6.0 {
+                    self.state = State::Takeoff;
+                    self.heading = RUNWAY_HEADING;
+                } else {
+                    self.taxi_to(RUNWAY_THRESHOLD, State::Ready);
+                }
             }
             // Airborne hold: climb straight out.
             _ => self.state = State::Takeoff,
@@ -335,6 +363,7 @@ impl Aircraft {
         self.position[2] = 0.0;
         self.hold_reason = None;
         self.orbit_center = None;
+        self.cleared_for_takeoff = false;
         self.taxi_waypoints.clear();
         self.taxi_next = None;
         // Touch down mid-runway, rolling north.
@@ -446,9 +475,14 @@ impl Aircraft {
             State::Ready => {
                 self.altitude = 0.0;
                 self.position[2] = 0.0;
-                self.ground_timer += dt;
-                if self.ground_timer >= HOLD_SHORT_TIME {
-                    self.state = State::Takeoff;
+                // Only roll onto takeoff when explicitly cleared via `release()`;
+                // planes queued on the taxiway wait here until awakened.
+                if self.cleared_for_takeoff {
+                    self.ground_timer += dt;
+                    if self.ground_timer >= HOLD_SHORT_TIME {
+                        self.cleared_for_takeoff = false;
+                        self.state = State::Takeoff;
+                    }
                 }
             }
             State::Takeoff => {
@@ -757,8 +791,9 @@ mod tests {
     #[test]
     fn landed_aircraft_never_parks_on_occupied_gate() {
         let mut world = World::new();
-        // Fill the first 5 gates with parked aircraft.
-        for i in 0..5 {
+        // Fill all gates except the last one with parked aircraft.
+        let last = HOME_GATES.len() - 1;
+        for i in 0..last {
             let mut p = Aircraft::new(&format!("GT{}", i + 1), Kind::Agent);
             p.state = State::Parked;
             p.position = [HOME_GATES[i][0], HOME_GATES[i][1], 0.0];
@@ -766,20 +801,21 @@ mod tests {
             world.add(p);
         }
 
-        // Land a plane — it must claim the only free gate (HOME_GATES[5]).
+        // Land a plane — it must claim the only free gate (HOME_GATES[last]).
         let mut arriving = Aircraft::new("SKY9", Kind::Agent);
         arriving.land();
         world.add(arriving);
 
-        for _ in 0..400 {
+        for _ in 0..600 {
             world.tick(0.1);
         }
         let sky9 = world.iter().find(|a| a.callsign == "SKY9").unwrap();
         assert_eq!(sky9.state, State::Parked);
-        let d = (sky9.position[0] - HOME_GATES[5][0]).hypot(sky9.position[1] - HOME_GATES[5][1]);
+        let d = (sky9.position[0] - HOME_GATES[last][0])
+            .hypot(sky9.position[1] - HOME_GATES[last][1]);
         assert!(d < 1.0, "SKY9 should park at the only free gate, got {:?}", sky9.position);
 
-        // Land another plane when ALL 6 gates are full — must stay Landed, never overlap!
+        // Land another plane when ALL gates are full — must stay Landed, never overlap!
         let mut overflow = Aircraft::new("SKY10", Kind::Agent);
         overflow.land();
         world.add(overflow);

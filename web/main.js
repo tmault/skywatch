@@ -11,6 +11,7 @@ import {
 import {
   buildAlpineIsland, buildAlpineBackdrop, makeSwissFlag, updateAlpine, SWISS_RED,
 } from './alpine.js';
+import { addRunwayLights } from './runway-lights.js';
 
 const WORLD_SIZE = 820;
 const INTERP_RATE = 10; // exponential smoothing constant (per second)
@@ -114,8 +115,11 @@ const radars = [];
 function buildHomeAirport(ap) {
   const island = new THREE.Group();
   const shoulderMat = new THREE.MeshStandardMaterial({ color: 0x565d65, roughness: 0.9 });
-  const asphaltMat = new THREE.MeshStandardMaterial({ color: 0x262b32, roughness: 0.85 });
-  const apronMat = new THREE.MeshStandardMaterial({ color: 0x394049, roughness: 0.85 });
+  const medianMat = new THREE.MeshStandardMaterial({ color: 0x4c823b, roughness: 0.95 });
+  const asphaltMat = new THREE.MeshStandardMaterial({ color: 0x242930, roughness: 0.85 });
+  const taxiMat = new THREE.MeshStandardMaterial({ color: 0x2c323b, roughness: 0.85 });
+  const apronMat = new THREE.MeshStandardMaterial({ color: 0x3a414b, roughness: 0.85 });
+  const pierWallMat = new THREE.MeshStandardMaterial({ color: 0x626b75, roughness: 0.85 });
   const terminalMat = new THREE.MeshStandardMaterial({ color: 0x4c6070, roughness: 0.6, metalness: 0.2 });
   const glassMat = new THREE.MeshStandardMaterial({ color: 0x7fd4f0, roughness: 0.2, metalness: 0.45 });
   const lineMat = new THREE.MeshBasicMaterial({
@@ -124,23 +128,29 @@ function buildHomeAirport(ap) {
   const yellowLineMat = new THREE.MeshBasicMaterial({
     color: 0xffc857, polygonOffset: true, polygonOffsetFactor: -2,
   });
+  const redBoxMat = new THREE.MeshBasicMaterial({
+    color: 0xd93829, polygonOffset: true, polygonOffsetFactor: -2,
+  });
 
   // Alpine island: pebble shore, meadows and fir forest, the Tower on a
-  // flat-topped summit (west), a snowy horn behind it, and the airfield
-  // footprint (runway + apron foundation) flattened to y = 2.0 in the east.
-  const towerSpot = { x: -38, z: -4 };
-  const flagSpot = { x: -27, z: 7 };
+  // flat-topped summit (west), snowy peaks behind it, and flattened airfield
+  // pads under Runway 36, parallel Taxiway Alpha, holding bay, and gate pier.
+  const towerSpot = { x: -46, z: -4 };
+  const flagSpot = { x: -34, z: 7 };
   const terrain = buildAlpineIsland(island, {
     seed: 1.3,
-    center: [10, -6],
-    radius: 128,
+    center: [14, -4],
+    radius: 138,
     hilliness: 4.5,
     snowLine: 17,
-    pads: [{ x: 84, z: -7, hw: 37, hl: 67 }],
+    pads: [
+      { x: 70, z: -8, hw: 30, hl: 75 },  // Runway 36 + grass median + Taxiway Alpha
+      { x: 123, z: 0, hw: 26, hl: 102 }, // Extended 10-gate concourse pier
+    ],
     peaks: [
-      { ...towerSpot, h: 15, r: 46, flat: 7, crag: 0.25 },
-      { x: -84, z: 50, h: 32, r: 36, crag: 0.55 },
-      { x: -72, z: -62, h: 19, r: 30, crag: 0.45 },
+      { ...towerSpot, h: 15, r: 44, flat: 7, crag: 0.25 },
+      { x: -90, z: 50, h: 32, r: 36, crag: 0.55 },
+      { x: -78, z: -62, h: 19, r: 30, crag: 0.45 },
     ],
     keepClear: [{ ...towerSpot, r: 11 }, { ...flagSpot, r: 3 }],
     trees: 280,
@@ -152,102 +162,164 @@ function buildHomeAirport(ap) {
   flag.position.set(flagSpot.x, terrain.heightAt(flagSpot.x, flagSpot.z) - 0.3, flagSpot.z);
   island.add(flag);
   const apronFlag = makeSwissFlag(5, 12);
-  apronFlag.position.set(118, 3.0, -68);
+  apronFlag.position.set(140, TARMAC_TOP_Y, -95);
   island.add(apronFlag);
 
   // Control Tower on the hill.
   const towerMat = new THREE.MeshStandardMaterial({ color: 0x25333d, roughness: 0.6, metalness: 0.25 });
   const base = new THREE.Mesh(new THREE.CylinderGeometry(3.8, 5.5, 24, 12), towerMat);
-  base.position.set(-38, 26, -4);
+  base.position.set(towerSpot.x, 26, towerSpot.z);
   island.add(base);
 
   const cabin = new THREE.Mesh(new THREE.CylinderGeometry(10, 7.5, 6.5, 12), glassMat);
-  cabin.position.set(-38, 40.5, -4);
+  cabin.position.set(towerSpot.x, 40.5, towerSpot.z);
   island.add(cabin);
 
   const roof = new THREE.Mesh(
     new THREE.ConeGeometry(11, 4.5, 12),
     new THREE.MeshStandardMaterial({ color: 0x1d2830, roughness: 0.7 }),
   );
-  roof.position.set(-38, 46, -4);
+  roof.position.set(towerSpot.x, 46, towerSpot.z);
   island.add(roof);
 
   const radar = new THREE.Mesh(new THREE.BoxGeometry(8.5, 0.6, 1), towerMat);
-  radar.position.set(-38, 49.5, -4);
+  radar.position.set(towerSpot.x, 49.5, towerSpot.z);
   island.add(radar);
   radars.push(radar);
 
   const beaconMat = new THREE.MeshBasicMaterial({ color: 0x4dff9e });
   const beacon = new THREE.Mesh(new THREE.SphereGeometry(1.4, 10, 10), beaconMat);
-  beacon.position.set(-38, 51.5, -4);
+  beacon.position.set(towerSpot.x, 51.5, towerSpot.z);
   island.add(beacon);
 
-  // Raised concrete foundation pad under runway + taxiways + apron (y top = 3.0).
-  const foundation = makeDeckSlab(74, 134, 3.0, 1.4, shoulderMat);
-  foundation.position.x = 84;
-  foundation.position.z = -7;
-  island.add(foundation);
+  // --- Runway 36/18 + Parallel Taxiway Alpha + South Departure Holding Bay ---
+  const airfieldPad = makeDeckSlab(60, 148, 3.0, 2.2, shoulderMat);
+  airfieldPad.position.x = 70;
+  airfieldPad.position.z = -8;
+  island.add(airfieldPad);
 
-  // Elevated runway deck: 20 wide x 112 long at [66, -10], top at TARMAC_TOP_Y (3.2).
-  const runway = makeDeckSlab(20, 112, TARMAC_TOP_Y, 0.4, asphaltMat);
-  runway.position.x = 66;
+  // Mown grass safety median between Runway 36 (x=56) and Taxiway Alpha (x=84).
+  const median = makeDeckSlab(11, 126, 3.08, 0.2, medianMat);
+  median.position.x = 71.5;
+  median.position.z = -10;
+  island.add(median);
+
+  // Elevated Runway 36/18: 20 wide x 134 long at [56, -10], top at TARMAC_TOP_Y (3.2).
+  const runway = makeDeckSlab(20, 134, TARMAC_TOP_Y, 0.4, asphaltMat);
+  runway.position.x = 56;
   runway.position.z = -10;
   island.add(runway);
+
+  const lights = addRunwayLights(island, {
+    x: 56, zMin: -76, zMax: 56, halfWidth: 10.6, y: TARMAC_TOP_Y,
+    groundY: 1.8, spacing: 8, approachLength: 24,
+  });
+  lights.setOnline(ap.online);
 
   // Runway edge lines, centreline dashes & threshold piano keys.
   const markY = TARMAC_TOP_Y + 0.08;
   for (const side of [-9.0, 9.0]) {
-    island.add(makeMarking(0.65, 108, 66 + side, -10, markY, lineMat));
+    island.add(makeMarking(0.65, 130, 56 + side, -10, markY, lineMat));
   }
-  for (let i = 0; i < 9; i++) {
-    island.add(makeMarking(1.1, 5.8, 66, -50 + i * 10, markY, lineMat));
+  for (let i = 0; i < 11; i++) {
+    island.add(makeMarking(1.1, 6.0, 56, -58 + i * 10, markY, lineMat));
   }
-  for (const endZ of [-60, 40]) {
+  for (const endZ of [-70, 50]) {
     for (let k = -2; k <= 2; k++) {
       if (k === 0) continue;
-      island.add(makeMarking(1.3, 5.0, 66 + k * 3.0, endZ, markY, lineMat));
+      island.add(makeMarking(1.3, 5.4, 56 + k * 3.0, endZ, markY, lineMat));
     }
   }
 
-  // Elevated terminal apron deck, top at TARMAC_TOP_Y - 0.05 (3.15).
-  const apron = makeDeckSlab(38, 126, TARMAC_TOP_Y - 0.05, 0.35, apronMat);
-  apron.position.x = 97;
-  apron.position.z = -5;
-  island.add(apron);
+  // Dedicated Parallel Taxiway Alpha: 14 wide x 134 long at [84, -8].
+  const taxiway = makeDeckSlab(14, 134, TARMAC_TOP_Y, 0.4, taxiMat);
+  taxiway.position.x = 84;
+  taxiway.position.z = -8;
+  island.add(taxiway);
 
-  // Taxiway lead-in yellow stripe between runway and gates.
-  island.add(makeMarking(0.8, 112, 81, -5, markY, yellowLineMat));
-  for (const tz of [-50, 36]) {
-    island.add(makeMarking(15, 0.8, 73.5, tz, markY, yellowLineMat));
+  // Taxiway Alpha continuous yellow centerline + blue taxiway edge lights.
+  island.add(makeMarking(0.85, 126, 84, -10, markY, yellowLineMat));
+  const blueLightMat = new THREE.MeshBasicMaterial({ color: 0x38a6ff });
+  const amberLightMat = new THREE.MeshBasicMaterial({ color: 0xffb830 });
+  for (let tz = -68; tz <= 52; tz += 15) {
+    for (const side of [-7.3, 7.3]) {
+      const bL = new THREE.Mesh(new THREE.SphereGeometry(0.32, 6, 6), blueLightMat);
+      bL.position.set(84 + side, markY + 0.3, tz);
+      island.add(bL);
+    }
   }
 
-  // Terminal building along the east edge of the apron.
-  const terminal = new THREE.Mesh(new THREE.BoxGeometry(10, 6.8, 112), terminalMat);
-  terminal.position.set(114, TARMAC_TOP_Y + 3.4, -5);
+  // Three paved taxiway connectors linking Taxiway Alpha <-> Runway 36:
+  // North exit (z=-66), Midfield (z=-10), and wide South Departure Holding Bay (z=46).
+  for (const cz of [-66, -10]) {
+    const conn = makeDeckSlab(16, 12, TARMAC_TOP_Y, 0.4, taxiMat);
+    conn.position.set(71.5, conn.position.y, cz);
+    island.add(conn);
+    island.add(makeMarking(20, 0.8, 72, cz, markY, yellowLineMat));
+  }
+
+  // Wide South Departure Holding Bay at [74, 46] with hold-short bars & guard lights.
+  const holdBay = makeDeckSlab(24, 22, TARMAC_TOP_Y, 0.4, taxiMat);
+  holdBay.position.set(74, holdBay.position.y, 46);
+  island.add(holdBay);
+  island.add(makeMarking(24, 0.85, 72, 46, markY, yellowLineMat));
+  island.add(makeMarking(0.65, 18, 68.2, 46, markY, yellowLineMat));
+  island.add(makeMarking(0.65, 18, 69.3, 46, markY, yellowLineMat));
+  island.add(makeMarking(3.6, 5.0, 72.5, 53.5, markY, redBoxMat));
+  for (const gz of [37.5, 54.5]) {
+    const guard = new THREE.Mesh(new THREE.SphereGeometry(0.55, 8, 8), amberLightMat);
+    guard.position.set(68.8, markY + 0.55, gz);
+    island.add(guard);
+  }
+
+  // --- Long Extending Gate Concourse Pier (10 gates for >24h idle threads) ---
+  const pierWall = makeDeckSlab(50, 200, 3.0, 5.2, pierWallMat);
+  pierWall.position.set(123, pierWall.position.y, 0);
+  island.add(pierWall);
+
+  const apron = makeDeckSlab(46, 196, TARMAC_TOP_Y - 0.04, 0.35, apronMat);
+  apron.position.set(122, apron.position.y, 0);
+  island.add(apron);
+
+  // Apron taxi connectors linking the gate concourse to Taxiway Alpha.
+  for (const cz of [-66, -10, 46]) {
+    const bridgePad = makeDeckSlab(16, 12, TARMAC_TOP_Y - 0.02, 0.4, taxiMat);
+    bridgePad.position.set(95, bridgePad.position.y, cz);
+    island.add(bridgePad);
+    island.add(makeMarking(18, 0.75, 93, cz, markY, yellowLineMat));
+  }
+  island.add(makeMarking(0.75, 178, 103, 0, markY, yellowLineMat));
+
+  // Extended Terminal Concourse + central glass atrium along x = 139.
+  const terminal = new THREE.Mesh(new THREE.BoxGeometry(10, 6.4, 186), terminalMat);
+  terminal.position.set(139, TARMAC_TOP_Y + 3.2, 0);
   island.add(terminal);
-  const terminalGlass = new THREE.Mesh(new THREE.BoxGeometry(0.6, 2.8, 106), glassMat);
-  terminalGlass.position.set(108.8, TARMAC_TOP_Y + 4.1, -5);
+  const atrium = new THREE.Mesh(new THREE.BoxGeometry(13, 9.2, 34), terminalMat);
+  atrium.position.set(140, TARMAC_TOP_Y + 4.6, 0);
+  island.add(atrium);
+  const terminalGlass = new THREE.Mesh(new THREE.BoxGeometry(0.6, 2.8, 180), glassMat);
+  terminalGlass.position.set(133.8, TARMAC_TOP_Y + 3.8, 0);
   island.add(terminalGlass);
 
-  // Gate stand markings + jetbridges for each gate.
+  // Gate stand markings + jetbridges for all 10 gates.
   const bridgeMat = new THREE.MeshStandardMaterial({ color: 0x9aa9b5, roughness: 0.5, metalness: 0.3 });
   for (const [gx, gz] of ap.gates) {
-    island.add(makeMarking(15, 0.8, gx, gz, markY, yellowLineMat));
-    island.add(makeMarking(0.8, 8, gx + 5, gz, markY, yellowLineMat));
+    island.add(makeMarking(16, 0.75, gx, gz, markY, yellowLineMat));
+    island.add(makeMarking(0.75, 8, gx + 5.5, gz, markY, yellowLineMat));
 
-    const bridge = new THREE.Mesh(new THREE.BoxGeometry(7.5, 1.5, 1.8), bridgeMat);
-    bridge.position.set(gx + 9.5, TARMAC_TOP_Y + 2.8, gz - 3.5);
+    const bridge = new THREE.Mesh(new THREE.BoxGeometry(9.0, 1.5, 1.8), bridgeMat);
+    bridge.position.set(gx + 10.5, TARMAC_TOP_Y + 2.8, gz - 3.2);
     island.add(bridge);
   }
 
   // Airport name banner above the tower.
   const label = makeBannerLabel(ap.name.toUpperCase(), 0xffffff, SWISS_RED);
-  label.position.set(-38, 63, -4);
+  label.position.set(towerSpot.x, 63, towerSpot.z);
   label.scale.set(42, 10.5, 1);
   island.add(label);
 
   scene.add(island);
-  return { group: island, beacon, online: ap.online };
+  return { group: island, beacon, lights, online: ap.online };
 }
 
 function buildSatelliteAirport(ap, idx) {
@@ -318,6 +390,12 @@ function buildSatelliteAirport(ap, idx) {
   runway.position.x = 4;
   island.add(runway);
 
+  const lights = addRunwayLights(island, {
+    x: 4, zMin: -36.5, zMax: 36.5, halfWidth: 8.1, y: TARMAC_TOP_Y,
+    groundY: 2.0, spacing: 7.3, approachLength: 13,
+  });
+  lights.setOnline(ap.online);
+
   const markY = TARMAC_TOP_Y + 0.08;
   for (const side of [-6.7, 6.7]) {
     island.add(makeMarking(0.5, 70, 4 + side, 0, markY, lineMat));
@@ -358,7 +436,7 @@ function buildSatelliteAirport(ap, idx) {
 
   island.position.set(cx, 0, cz);
   scene.add(island);
-  return { group: island, beacon, online: ap.online };
+  return { group: island, beacon, lights, online: ap.online };
 }
 
 function ensureAirports(airports) {
@@ -370,6 +448,7 @@ function ensureAirports(airports) {
       if (existing.online !== ap.online) {
         existing.online = ap.online;
         existing.beacon.material.color.setHex(ap.online ? 0x4dff9e : 0xff5a5a);
+        existing.lights.setOnline(ap.online); // offline airports go dark
       }
       continue;
     }
@@ -970,6 +1049,7 @@ function makeBannerLabel(text, tint = 0xe8ffff, fill = null) {
   ctx.fillText(text, c.width / 2, c.height / 2 + 1);
   const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
     map: new THREE.CanvasTexture(c), transparent: true, depthTest: false,
+    toneMapped: false, // keep Swiss red true instead of filmic-washed pink
   }));
   sprite.scale.set(36, 7, 1);
   sprite.renderOrder = 10;
@@ -1026,10 +1106,12 @@ function buildAircraftLabelTexture(a, accentHex) {
 
   // Secondary line: callsign + role/state.
   const stateLabel = a.state === 'parked'
-    ? 'AT GATE'
-    : a.kind === 'fighter'
-      ? 'WINGMAN'
-      : a.state.toUpperCase();
+    ? 'AT GATE · >24H'
+    : a.state === 'ready'
+      ? 'TAXIWAY · WAITING'
+      : a.kind === 'fighter'
+        ? 'WINGMAN'
+        : a.state.toUpperCase();
   const sub = `${a.callsign} · ${stateLabel}`;
   ctx.font = 'bold 21px "IBM Plex Mono", ui-monospace, monospace';
   ctx.fillStyle = accent;
@@ -1042,6 +1124,7 @@ function buildAircraftLabelTexture(a, accentHex) {
 
 function labelAccentFor(a) {
   if (a.state === 'holding') return 0xffb020;
+  if (a.state === 'ready') return 0xff943b;
   if (a.kind === 'fighter') return 0x7ce8ff;
   if (a.state === 'parked' || a.callsign.startsWith('GT')) return 0x8f9ba6;
   if (a.state === 'landed') return 0xff7b6b;
@@ -1485,6 +1568,7 @@ function animate() {
   for (const ap of airportGroups.values()) {
     const pulse = ap.online ? 0.85 + 0.3 * Math.sin(now * 3) : 0.7;
     ap.beacon.scale.setScalar(pulse);
+    ap.lights.update(now);
   }
 
   // Follow camera: track the selected aircraft while keeping OrbitControls active.

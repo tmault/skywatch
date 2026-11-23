@@ -10,6 +10,7 @@
 use crate::world::{
     default_sectors, formation_position, Aircraft, Airport, Kind, ModelClass, Sector, State, World,
     GATE_HEADING, HOME_GATES, PROJECT_SECTOR_RADIUS, PROJECT_SECTOR_SLOTS, SATELLITE_SLOTS,
+    TAXIWAY_QUEUE,
 };
 use crate::ws::{ClientFrame, SharedWorld};
 use serde::Deserialize;
@@ -21,12 +22,14 @@ use tokio::sync::mpsc;
 
 /// Poll interval for the thread list & subagents.
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
-/// How many active threads (<24h) to fly concurrently.
+/// How many actively working threads to fly concurrently.
 const MAX_AIRCRAFT: usize = 6;
-/// Threads untouched for longer than this park at a terminal gate.
+/// How many recent (<24h) idle/waiting threads to queue along Taxiway Alpha.
+const MAX_TAXIWAY_QUEUE: usize = TAXIWAY_QUEUE.len();
+/// Threads untouched for longer than this park at the extended terminal gates.
 const STALE_AFTER_SECS: i64 = 24 * 3600;
-/// How many gate-parked stale threads to show at the home airport.
-const MAX_GATE_PARKED: usize = 6;
+/// How many stale (>24h) threads to park along the extended gate concourse.
+const MAX_GATE_PARKED: usize = HOME_GATES.len();
 /// How many fighter wingmen to escort any single parent aircraft.
 const MAX_WINGMEN_PER_PARENT: usize = 4;
 /// Recently finished sub-agents linger on the wing briefly before peeling off.
@@ -98,7 +101,25 @@ impl Callsigns {
     }
 }
 
-/// Stable callsign allocation for gate-parked (>24h idle) threads: GTn.
+/// Stable callsign allocation for taxiway departure queue (<24h idle/waiting): TXn.
+#[derive(Default)]
+struct TaxiwayCallsigns {
+    by_thread: HashMap<String, String>,
+    next: usize,
+}
+
+impl TaxiwayCallsigns {
+    fn get(&mut self, thread_id: &str) -> String {
+        self.by_thread.get(thread_id).cloned().unwrap_or_else(|| {
+            self.next += 1;
+            let cs = format!("TX{}", self.next);
+            self.by_thread.insert(thread_id.to_string(), cs.clone());
+            cs
+        })
+    }
+}
+
+/// Stable callsign allocation for gate-parked (>24h untouched) threads: GTn.
 #[derive(Default)]
 struct GateCallsigns {
     by_thread: HashMap<String, String>,
@@ -288,10 +309,6 @@ fn is_working_status(status: &str) -> bool {
     )
 }
 
-fn is_blocked_status(status: &str) -> bool {
-    matches!(status, "failed" | "interrupted" | "cancelled")
-}
-
 fn flight_state(status: &str, pending_requests: i64) -> (State, Option<String>) {
     match status {
         "waiting" => (State::Holding, Some("awaiting your input".to_string())),
@@ -299,11 +316,11 @@ fn flight_state(status: &str, pending_requests: i64) -> (State, Option<String>) 
             (State::Holding, Some("awaiting your input".to_string()))
         }
         "running" | "starting" | "preparing" | "queued" => (State::Cruising, None),
-        "failed" => (State::Landed, Some("run failed".to_string())),
-        "interrupted" => (State::Landed, Some("interrupted".to_string())),
-        "cancelled" => (State::Landed, Some("cancelled".to_string())),
-        // Completed / idle threads stay parked at a terminal gate — only working planes fly.
-        _ => (State::Parked, None),
+        "failed" => (State::Ready, Some("run failed — waiting on taxiway".to_string())),
+        "interrupted" => (State::Ready, Some("interrupted — waiting on taxiway".to_string())),
+        "cancelled" => (State::Ready, Some("cancelled — waiting on taxiway".to_string())),
+        // Non-working threads never fly; <24h queue on Taxiway Alpha, >24h park at gates.
+        _ => (State::Ready, None),
     }
 }
 
@@ -441,7 +458,7 @@ fn poll_threads() -> Option<Vec<ThreadListEntry>> {
                WHERE t.deleted_at IS NULL AND t.archived_at IS NULL \
                  AND (json_extract(t.payload_json, '$.lineage.relationshipToParent') IS NULL \
                       OR json_extract(t.payload_json, '$.lineage.relationshipToParent') != 'subagent') \
-               ORDER BY t.updated_at DESC LIMIT 40;";
+               ORDER BY t.updated_at DESC LIMIT 60;";
     if let Some(raw) = run_sqlite_json(sql) {
         if let Ok(entries) = serde_json::from_str::<Vec<ThreadListEntry>>(&raw) {
             if !entries.is_empty() {
@@ -472,7 +489,11 @@ fn poll_threads() -> Option<Vec<ThreadListEntry>> {
 /// 20 Hz simulation tick or WebSocket connections.
 struct PollData {
     airports: Vec<Airport>,
-    recent: Vec<(ThreadListEntry, i64)>,
+    /// Actively working threads (flying or holding).
+    flying: Vec<(ThreadListEntry, i64)>,
+    /// Recent (<24h) non-running threads queued on Taxiway Alpha waiting for takeoff.
+    taxiway: Vec<ThreadListEntry>,
+    /// Stale (>24h untouched) threads parked at the extended terminal gates.
     stale: Vec<ThreadListEntry>,
     subagents: Vec<SubagentRow>,
     now: i64,
@@ -488,29 +509,31 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>) -> Opt
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let mut recent = Vec::new();
+    let mut flying = Vec::new();
+    let mut taxiway = Vec::new();
     let mut stale = Vec::new();
     for e in entries {
-        // Working or recently blocked (<24h) threads belong to the active fleet.
-        // Completed / idle threads (and anything >24h old) park at the terminal gates.
-        let active_or_blocked = is_working_status(&e.status)
-            || (!is_stale(&e.updated_at, now) && is_blocked_status(&e.status));
-        if active_or_blocked {
-            if recent.len() < MAX_AIRCRAFT {
+        if is_working_status(&e.status) {
+            if flying.len() < MAX_AIRCRAFT {
                 let pending = e.pending;
-                recent.push((e, pending));
+                flying.push((e, pending));
             }
-        } else if stale.len() < MAX_GATE_PARKED {
-            stale.push(e);
+        } else if is_stale(&e.updated_at, now) {
+            if stale.len() < MAX_GATE_PARKED {
+                stale.push(e);
+            }
+        } else if taxiway.len() < MAX_TAXIWAY_QUEUE {
+            taxiway.push(e);
         }
     }
 
-    let recent_ids: HashSet<String> = recent.iter().map(|(e, _)| e.thread_id.clone()).collect();
-    let subagents = poll_subagents(&recent_ids, now);
+    let flying_ids: HashSet<String> = flying.iter().map(|(e, _)| e.thread_id.clone()).collect();
+    let subagents = poll_subagents(&flying_ids, now);
 
     Some(PollData {
         airports,
-        recent,
+        flying,
+        taxiway,
         stale,
         subagents,
         now,
@@ -523,6 +546,7 @@ fn apply_poll(
     home_name: &str,
     data: PollData,
     callsigns: &mut Callsigns,
+    taxiway_cs: &mut TaxiwayCallsigns,
     gates: &mut GateCallsigns,
     wingmen: &mut Wingmen,
 ) -> Vec<(String, String)> {
@@ -534,7 +558,7 @@ fn apply_poll(
     let mut new_threads: Vec<(String, String, ModelClass)> = Vec::new();
     let mut active_projects: Vec<String> = Vec::new();
 
-    for (entry, pending) in &data.recent {
+    for (entry, pending) in &data.flying {
         let (state, reason) = flight_state(&entry.status, *pending);
         let (zone, is_project) = classify_zone(entry.project.as_deref(), &entry.title);
         if is_project && !active_projects.contains(&zone) {
@@ -576,7 +600,7 @@ fn apply_poll(
     }
     world.sectors = sectors;
 
-    // Remove aircraft whose threads dropped out of the recent set.
+    // Remove airborne SKY aircraft whose threads stopped running (they'll appear in taxiway).
     let drop: Vec<String> = callsigns
         .by_thread
         .keys()
@@ -599,39 +623,17 @@ fn apply_poll(
         };
         let cs = callsigns.get(thread_id);
         if let Some(a) = world.get_mut(&cs) {
-            let was_on_ground = matches!(a.state, State::Landed | State::Taxi | State::Parked | State::Ready);
-            // If an aircraft is already on the ground for a blocked/failed run,
-            // let it finish taxiing off the runway instead of stomping back to Landed.
-            let target_state = if *state == State::Landed
-                && matches!(a.state, State::Landed | State::Taxi | State::Parked)
-            {
-                a.state
-            } else if *state == State::Cruising && was_on_ground {
-                // Woke up from the ground: taxi & take off instead of teleporting into the sky!
-                if matches!(a.state, State::Landed | State::Parked) {
-                    a.release();
-                }
-                a.state
-            } else {
-                *state
-            };
-            if a.state != target_state {
+            if a.state != *state {
                 radio_events.push((
                     cs.clone(),
-                    match target_state {
+                    match state {
                         State::Holding => "entering hold".to_string(),
-                        State::Landed => "landing — blocked".to_string(),
                         State::Cruising => "cruising".to_string(),
-                        State::Parked => "parked at gate".to_string(),
                         _ => "updating".to_string(),
                     },
                 ));
             }
-            if target_state == State::Landed && a.state != State::Landed {
-                a.land();
-            } else {
-                a.state = target_state;
-            }
+            a.state = *state;
             a.hold_reason = reason.clone();
             a.title = title.clone();
             a.topic = Some(zone.clone());
@@ -646,34 +648,56 @@ fn apply_poll(
                 a.assign(zone);
             }
             a.state = *state;
-            if a.state == State::Landed {
-                a.land();
-                // Stagger initial runway position slightly if multiple threads start landed.
-                let offset = (callsigns.next as f32 % 4.0) * 14.0 - 14.0;
-                a.position[1] = (a.position[1] + offset).clamp(-45.0, 28.0);
-            }
             world.add(a);
         }
     }
 
-    // --- Terminal Gates: idle/completed threads fill only remaining open gates ---
-    // Reserve gate capacity for any grounded/blocked active aircraft so arriving
-    // SKY planes always have an open gate to taxi into and never park over GT planes.
-    let grounded_sky = world
-        .iter()
-        .filter(|a| {
-            !a.callsign.starts_with("GT")
-                && a.parent_id.is_none()
-                && matches!(
-                    a.state,
-                    State::Landed | State::Taxi | State::Parked | State::Ready
-                )
-        })
-        .count();
-    let max_gt = HOME_GATES.len().saturating_sub(grounded_sky);
-    let stale_slice = &data.stale[..data.stale.len().min(max_gt)];
-    let stale_ids: HashSet<String> = stale_slice.iter().map(|e| e.thread_id.clone()).collect();
+    // --- Taxiway Alpha Departure Queue: recent (<24h) non-working threads waiting for takeoff ---
+    let taxi_ids: HashSet<String> = data.taxiway.iter().map(|e| e.thread_id.clone()).collect();
+    let taxi_drop: Vec<String> = taxiway_cs
+        .by_thread
+        .keys()
+        .filter(|id| !taxi_ids.contains(*id))
+        .cloned()
+        .collect();
+    for id in taxi_drop {
+        if let Some(cs) = taxiway_cs.by_thread.remove(&id) {
+            world.remove_by_callsign(&cs);
+            radio_events.push((cs, "cleared for departure".to_string()));
+        }
+    }
 
+    for (i, entry) in data.taxiway.iter().enumerate() {
+        let cs = taxiway_cs.get(&entry.thread_id);
+        let (slot_pos, slot_hdg) = TAXIWAY_QUEUE[i % TAXIWAY_QUEUE.len()];
+        let (_, reason) = flight_state(&entry.status, entry.pending);
+        let (zone, _) = classify_zone(entry.project.as_deref(), &entry.title);
+        if let Some(a) = world.get_mut(&cs) {
+            a.title = Some(entry.title.clone());
+            a.hold_reason = reason;
+            a.topic = Some(zone);
+            a.state = State::Ready;
+            a.position = [slot_pos[0], slot_pos[1], 0.0];
+            a.altitude = 0.0;
+            a.heading = slot_hdg;
+            a.device = Some(home_name.to_string());
+        } else {
+            let mut a = Aircraft::with_model(&cs, Kind::Agent, model_class(&entry.model));
+            a.title = Some(entry.title.clone());
+            a.hold_reason = reason;
+            a.topic = Some(zone);
+            a.state = State::Ready;
+            a.position = [slot_pos[0], slot_pos[1], 0.0];
+            a.altitude = 0.0;
+            a.heading = slot_hdg;
+            a.device = Some(home_name.to_string());
+            world.add(a);
+            radio_events.push((cs, format!("queued on Taxiway Alpha #{}", i + 1)));
+        }
+    }
+
+    // --- Extended Terminal Gates: STRICTLY threads untouched for >24 hours ---
+    let stale_ids: HashSet<String> = data.stale.iter().map(|e| e.thread_id.clone()).collect();
     let gate_drop: Vec<String> = gates
         .by_thread
         .keys()
@@ -683,19 +707,21 @@ fn apply_poll(
     for id in gate_drop {
         if let Some(cs) = gates.by_thread.remove(&id) {
             world.remove_by_callsign(&cs);
-            radio_events.push((cs, "vacating gate".to_string()));
+            radio_events.push((cs, "pushing back from gate".to_string()));
         }
     }
 
-    for (i, entry) in stale_slice.iter().enumerate() {
+    for (i, entry) in data.stale.iter().enumerate() {
         let cs = gates.get(&entry.thread_id);
+        let slot = HOME_GATES[i % HOME_GATES.len()];
         if let Some(a) = world.get_mut(&cs) {
             a.title = Some(entry.title.clone());
-            a.position[2] = 0.0;
+            a.state = State::Parked;
+            a.position = [slot[0], slot[1], 0.0];
             a.altitude = 0.0;
             a.heading = GATE_HEADING;
             a.device = Some(home_name.to_string());
-        } else if let Some(slot) = world.find_free_gate(None, i) {
+        } else {
             let mut a = Aircraft::with_model(&cs, Kind::Agent, model_class(&entry.model));
             a.title = Some(entry.title.clone());
             a.state = State::Parked;
@@ -786,6 +812,7 @@ fn apply_poll(
 pub async fn run(world: SharedWorld, mut rx: mpsc::Receiver<ClientFrame>) {
     let home_name = local_device_name();
     let mut callsigns = Callsigns::default();
+    let mut taxiway_cs = TaxiwayCallsigns::default();
     let mut gates = GateCallsigns::default();
     let mut wingmen = Wingmen::default();
 
@@ -839,7 +866,15 @@ pub async fn run(world: SharedWorld, mut rx: mpsc::Receiver<ClientFrame>) {
         tokio::select! {
             Some(data) = poll_rx.recv() => {
                 let mut w = world.lock().await;
-                let events = apply_poll(&mut w, &home_name, data, &mut callsigns, &mut gates, &mut wingmen);
+                let events = apply_poll(
+                    &mut w,
+                    &home_name,
+                    data,
+                    &mut callsigns,
+                    &mut taxiway_cs,
+                    &mut gates,
+                    &mut wingmen,
+                );
                 for (cs, what) in &events {
                     tracing::info!(callsign = cs, what, "t3 aircraft update");
                 }
@@ -861,12 +896,19 @@ pub async fn run(world: SharedWorld, mut rx: mpsc::Receiver<ClientFrame>) {
                     tracing::warn!(aircraft_id, "unknown aircraft; dropping message");
                     continue;
                 };
-                // Active fleet -> gate-parked threads -> fighter wingmen.
+                // Active fleet -> taxiway queue -> gate-parked threads -> fighter wingmen.
                 let thread_id = callsigns
                     .by_thread
                     .iter()
                     .find(|(_, cs)| **cs == callsign)
                     .map(|(id, _)| id.clone())
+                    .or_else(|| {
+                        taxiway_cs
+                            .by_thread
+                            .iter()
+                            .find(|(_, cs)| **cs == callsign)
+                            .map(|(id, _)| id.clone())
+                    })
                     .or_else(|| {
                         gates
                             .by_thread
@@ -953,7 +995,8 @@ mod tests {
         let g0 = home_gate_slot(0);
         let g1 = home_gate_slot(1);
         assert_eq!(g0[0], g1[0]);
-        assert_eq!(g1[1] - g0[1], 20.0);
+        assert!((g1[1] - g0[1] - 19.0).abs() < 1e-3);
+        assert_eq!(HOME_GATES.len(), 10);
     }
 
     #[test]
@@ -962,10 +1005,10 @@ mod tests {
         assert_eq!(flight_state("starting", 0).0, State::Cruising);
         assert_eq!(flight_state("running", 1).0, State::Holding);
         assert_eq!(flight_state("waiting", 0).0, State::Holding);
-        assert_eq!(flight_state("failed", 0).0, State::Landed);
-        assert_eq!(flight_state("interrupted", 0).0, State::Landed);
-        assert_eq!(flight_state("completed", 0).0, State::Parked);
-        assert_eq!(flight_state("idle", 0).0, State::Parked);
+        assert_eq!(flight_state("failed", 0).0, State::Ready);
+        assert_eq!(flight_state("interrupted", 0).0, State::Ready);
+        assert_eq!(flight_state("completed", 0).0, State::Ready);
+        assert_eq!(flight_state("idle", 0).0, State::Ready);
     }
 
     #[test]

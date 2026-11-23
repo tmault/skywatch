@@ -77,14 +77,23 @@ function render(a) {
   if (a.topic) parts.push(a.topic.toUpperCase());
   kindEl.textContent = parts.join(' · ');
 
-  stateEl.textContent = a.state === 'parked' ? 'at gate' : a.state;
+  stateEl.textContent = a.state === 'parked'
+    ? 'at gate'
+    : a.state === 'ready'
+      ? 'taxiway queue'
+      : a.state;
   stateEl.style.color = stateColor(a.state);
 
   if (a.state === 'holding' && a.hold_reason) {
     holdReasonEl.textContent = `HOLD: ${a.hold_reason}`;
     holdReasonEl.hidden = false;
+  } else if (a.state === 'ready') {
+    holdReasonEl.textContent = a.hold_reason
+      ? `TAXIWAY: ${a.hold_reason} — message to clear for takeoff`
+      : 'TAXIWAY QUEUE: waiting for takeoff — send a message to depart';
+    holdReasonEl.hidden = false;
   } else if (a.state === 'parked') {
-    holdReasonEl.textContent = 'AT GATE: idle — send a message to wake & take off';
+    holdReasonEl.textContent = 'AT GATE: untouched >24h — send a message to wake & push back';
     holdReasonEl.hidden = false;
   } else {
     holdReasonEl.hidden = true;
