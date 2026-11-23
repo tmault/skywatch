@@ -113,14 +113,19 @@ async fn main() {
             let serve_dir = serve_dir.clone();
             let index_bytes = index_bytes.clone();
             async move {
-                let res = serve_dir.oneshot(req).await.unwrap();
+                let mut res = serve_dir.oneshot(req).await.unwrap();
                 if res.status() == StatusCode::NOT_FOUND {
                     Response::builder()
                         .status(StatusCode::OK)
                         .header("content-type", "text/html")
+                        .header("cache-control", "no-cache")
                         .body(Body::from(index_bytes))
                         .unwrap()
                 } else {
+                    res.headers_mut().insert(
+                        axum::http::header::CACHE_CONTROL,
+                        axum::http::HeaderValue::from_static("no-cache"),
+                    );
                     res.map(Body::new)
                 }
             }

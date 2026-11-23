@@ -74,7 +74,8 @@ scene.add(new THREE.AmbientLight(0x8094a8, 0.2));
 const sun = new THREE.DirectionalLight(0xfff0d8, 1.85);
 sun.position.set(360, 330, 240);
 sun.castShadow = true;
-sun.shadow.mapSize.set(4096, 4096);
+const shadowRes = Math.min(4096, renderer.capabilities.maxTextureSize || 2048);
+sun.shadow.mapSize.set(shadowRes, shadowRes);
 {
   const cam = sun.shadow.camera; // covers the whole archipelago (±480)
   cam.left = -480;
@@ -1426,6 +1427,7 @@ const eventBanner = document.getElementById('event-banner');
 let eventBannerTimer = null;
 
 function showEventBanner(a, kind, verb) {
+  if (!eventBanner) return;
   eventBanner.className = kind;
   eventBanner.querySelector('.event-kind').textContent = verb;
   eventBanner.querySelector('.event-callsign').textContent = a.callsign;
@@ -1439,12 +1441,14 @@ function showEventBanner(a, kind, verb) {
   eventBannerTimer = setTimeout(() => eventBanner.classList.remove('show'), 5200);
 }
 
-eventBanner.addEventListener('click', () => {
-  const a = currentSnapshot.get(Number(eventBanner.dataset.aircraftId));
-  if (!a) return;
-  openRadio(a);
-  startFollow(a.id);
-});
+if (eventBanner) {
+  eventBanner.addEventListener('click', () => {
+    const a = currentSnapshot.get(Number(eventBanner.dataset.aircraftId));
+    if (!a) return;
+    openRadio(a);
+    startFollow(a.id);
+  });
+}
 
 // Fire one-shot effects on takeoff roll, liftoff, approach and touchdown.
 // `from` is undefined the first time an aircraft is seen (no event then).
