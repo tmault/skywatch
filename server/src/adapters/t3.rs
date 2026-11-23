@@ -177,16 +177,29 @@ fn model_class(model: &Option<String>) -> ModelClass {
     }
 }
 
+fn is_working_status(status: &str) -> bool {
+    matches!(
+        status,
+        "running" | "starting" | "preparing" | "queued" | "waiting"
+    )
+}
+
+fn is_blocked_status(status: &str) -> bool {
+    matches!(status, "failed" | "interrupted" | "cancelled")
+}
+
 fn flight_state(status: &str, pending_requests: i64) -> (State, Option<String>) {
     match status {
-        "running" if pending_requests > 0 => {
+        "waiting" => (State::Holding, Some("awaiting your input".to_string())),
+        "running" | "starting" | "preparing" | "queued" if pending_requests > 0 => {
             (State::Holding, Some("awaiting your input".to_string()))
         }
-        "running" => (State::Cruising, None),
+        "running" | "starting" | "preparing" | "queued" => (State::Cruising, None),
         "failed" => (State::Landed, Some("run failed".to_string())),
         "interrupted" => (State::Landed, Some("interrupted".to_string())),
         "cancelled" => (State::Landed, Some("cancelled".to_string())),
-        _ => (State::Cruising, None),
+        // Completed / idle threads stay parked at a terminal gate — only working planes fly.
+        _ => (State::Parked, None),
     }
 }
 
@@ -372,13 +385,17 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>) -> Opt
     let mut recent = Vec::new();
     let mut stale = Vec::new();
     for e in entries {
-        if is_stale(&e.updated_at, now) {
-            if stale.len() < MAX_GATE_PARKED {
-                stale.push(e);
+        // Working or recently blocked (<24h) threads belong to the active fleet.
+        // Completed / idle threads (and anything >24h old) park at the terminal gates.
+        let active_or_blocked = is_working_status(&e.status)
+            || (!is_stale(&e.updated_at, now) && is_blocked_status(&e.status));
+        if active_or_blocked {
+            if recent.len() < MAX_AIRCRAFT {
+                let pending = e.pending;
+                recent.push((e, pending));
             }
-        } else if recent.len() < MAX_AIRCRAFT {
-            let pending = e.pending;
-            recent.push((e, pending));
+        } else if stale.len() < MAX_GATE_PARKED {
+            stale.push(e);
         }
     }
 
@@ -454,12 +471,18 @@ fn apply_poll(
         };
         let cs = callsigns.get(thread_id);
         if let Some(a) = world.get_mut(&cs) {
+            let was_on_ground = matches!(a.state, State::Landed | State::Taxi | State::Parked | State::Ready);
             // If an aircraft is already on the ground for a blocked/failed run,
-            // let it finish taxiing off the runway to a gate instead of stomping
-            // its state back to Landed on every poll.
+            // let it finish taxiing off the runway instead of stomping back to Landed.
             let target_state = if *state == State::Landed
                 && matches!(a.state, State::Landed | State::Taxi | State::Parked)
             {
+                a.state
+            } else if *state == State::Cruising && was_on_ground {
+                // Woke up from the ground: taxi & take off instead of teleporting into the sky!
+                if matches!(a.state, State::Landed | State::Parked) {
+                    a.release();
+                }
                 a.state
             } else {
                 *state
@@ -471,6 +494,7 @@ fn apply_poll(
                         State::Holding => "entering hold".to_string(),
                         State::Landed => "landing — blocked".to_string(),
                         State::Cruising => "cruising".to_string(),
+                        State::Parked => "parked at gate".to_string(),
                         _ => "updating".to_string(),
                     },
                 ));
@@ -790,5 +814,17 @@ mod tests {
         let g1 = home_gate_slot(1);
         assert_eq!(g0[0], g1[0]);
         assert_eq!(g1[1] - g0[1], 20.0);
+    }
+
+    #[test]
+    fn only_working_threads_fly() {
+        assert_eq!(flight_state("running", 0).0, State::Cruising);
+        assert_eq!(flight_state("starting", 0).0, State::Cruising);
+        assert_eq!(flight_state("running", 1).0, State::Holding);
+        assert_eq!(flight_state("waiting", 0).0, State::Holding);
+        assert_eq!(flight_state("failed", 0).0, State::Landed);
+        assert_eq!(flight_state("interrupted", 0).0, State::Landed);
+        assert_eq!(flight_state("completed", 0).0, State::Parked);
+        assert_eq!(flight_state("idle", 0).0, State::Parked);
     }
 }

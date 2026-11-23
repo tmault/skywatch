@@ -84,7 +84,7 @@ function render(a) {
     holdReasonEl.textContent = `HOLD: ${a.hold_reason}`;
     holdReasonEl.hidden = false;
   } else if (a.state === 'parked') {
-    holdReasonEl.textContent = 'AT GATE: idle >24h — send a message to wake';
+    holdReasonEl.textContent = 'AT GATE: idle — send a message to wake & take off';
     holdReasonEl.hidden = false;
   } else {
     holdReasonEl.hidden = true;
