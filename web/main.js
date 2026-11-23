@@ -100,33 +100,52 @@ function makeAgentMesh() {
   return { group, materials: [mat] };
 }
 
+// MQ-9-style drone: long fuselage, wide straight wings, inverted V-tail,
+// pusher prop at the rear, sensor turret under the nose. Points along +Z.
 function makeDroneMesh() {
   const group = new THREE.Group();
   const mat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+  const darkMat = new THREE.MeshLambertMaterial({ color: 0x222831 });
   const rotorMat = new THREE.MeshLambertMaterial({
-    color: 0x222831, transparent: true, opacity: 0.6, side: THREE.DoubleSide,
+    color: 0x222831, transparent: true, opacity: 0.35, side: THREE.DoubleSide,
   });
 
-  const body = new THREE.Mesh(new THREE.BoxGeometry(4, 1.6, 4), mat);
+  // Fuselage: tapered nose cone + long body.
+  const nose = new THREE.Mesh(new THREE.ConeGeometry(1.4, 5, 8), mat);
+  nose.rotation.x = Math.PI / 2; // point along +Z
+  nose.position.z = 9;
+  group.add(nose);
+
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(1.4, 1.1, 16, 8), mat);
+  body.rotation.x = Math.PI / 2; // along Z
+  body.position.z = -0.5;
   group.add(body);
 
-  const arms = new THREE.Mesh(new THREE.BoxGeometry(10, 0.5, 0.8), mat);
-  arms.rotation.y = Math.PI / 4;
-  group.add(arms);
+  // Sensor turret under the nose.
+  const turret = new THREE.Mesh(new THREE.SphereGeometry(1.1, 12, 12), darkMat);
+  turret.position.set(0, -1.3, 6.5);
+  group.add(turret);
 
-  const arms2 = arms.clone();
-  arms2.rotation.y = -Math.PI / 4;
-  group.add(arms2);
+  // Wide straight wings.
+  const wings = new THREE.Mesh(new THREE.BoxGeometry(24, 0.4, 2.6), mat);
+  wings.position.set(0, 0.6, 1);
+  group.add(wings);
 
-  const rotorGeo = new THREE.CircleGeometry(2.6, 16);
-  rotorGeo.rotateX(-Math.PI / 2);
-  for (const [x, z] of [[4, 4], [-4, 4], [4, -4], [-4, -4]]) {
-    const rotor = new THREE.Mesh(rotorGeo, rotorMat);
-    rotor.position.set(x, 1, z);
-    group.add(rotor);
+  // Inverted V-tail at the rear.
+  for (const side of [1, -1]) {
+    const fin = new THREE.Mesh(new THREE.BoxGeometry(0.4, 5, 2.2), mat);
+    fin.position.set(side * 1.6, 1.6, -7);
+    fin.rotation.z = side * -0.6; // lean outward → inverted V
+    group.add(fin);
   }
 
-  return { group, materials: [mat, rotorMat] };
+  // Pusher propeller at the rear (spinning disc).
+  const prop = new THREE.Mesh(new THREE.CircleGeometry(2.6, 16), rotorMat);
+  prop.position.set(0, 0.4, -8.8);
+  group.add(prop);
+  prop.name = 'prop';
+
+  return { group, materials: [mat, darkMat, rotorMat] };
 }
 
 // Canvas-sprite callsign label that stays screen-facing and constant-ish size.
@@ -398,6 +417,10 @@ function animate() {
     while (dh < -Math.PI) dh += 2 * Math.PI;
     entry.heading += dh * k;
     entry.group.rotation.y = -entry.heading; // heading: radians, CCW in world
+
+    // Spin the pusher prop on drones.
+    const prop = entry.group.getObjectByName('prop');
+    if (prop) prop.rotation.y = now * 30;
 
     if (entry.ring.visible) {
       const pulse = 1 + 0.25 * Math.sin(now * 4);
