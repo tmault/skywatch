@@ -1036,9 +1036,7 @@ function ensureMesh(a) {
   built.group.add(ring);
 
   // Server position is [x, z, altitude]; Three.js is (x, y=altitude, z).
-  const onGround = ['landed', 'taxi', 'ready', 'parked'].includes(a.state);
-  const groundY = onGround ? TARMAC_TOP_Y + built.wheelDrop : 0;
-  built.group.position.set(a.position[0], a.position[2] + groundY, a.position[1]);
+  built.group.position.set(a.position[0], a.position[2] + deckLift(a, built.wheelDrop), a.position[1]);
   built.target = built.group.position.clone();
   built.heading = a.heading;
   built.targetHeading = a.heading;
@@ -1327,6 +1325,15 @@ function applyKeyboardCamera(dt) {
   });
 }
 
+// Height of the runway deck under the wheels. Ground states sit fully on
+// it; approaches and climb-outs blend it in over the last 40 units of
+// altitude so touchdown and rotation meet the deck without a hop.
+function deckLift(a, wheelDrop) {
+  const onGround = ['landed', 'taxi', 'ready', 'parked'].includes(a.state);
+  const blend = onGround ? 1 : Math.max(0, 1 - a.position[2] / 40);
+  return (TARMAC_TOP_Y + wheelDrop) * blend;
+}
+
 function applySnapshot(snapshot) {
   currentSnapshot.clear();
   for (const a of snapshot.aircraft || []) currentSnapshot.set(a.id, a);
@@ -1341,9 +1348,7 @@ function applySnapshot(snapshot) {
     // Repaint when the thread switches model (new livery).
     if (meshes.has(a.id) && meshes.get(a.id).model !== (a.model ?? null)) disposeMesh(a.id);
     const entry = ensureMesh(a);
-    const onGround = ['landed', 'taxi', 'ready', 'parked'].includes(a.state);
-    const groundY = onGround ? TARMAC_TOP_Y + entry.wheelDrop : 0;
-    entry.target.set(a.position[0], a.position[2] + groundY, a.position[1]);
+    entry.target.set(a.position[0], a.position[2] + deckLift(a, entry.wheelDrop), a.position[1]);
     entry.targetHeading = a.heading;
 
     if (lastStates.get(a.id) !== a.state) {
@@ -1398,6 +1403,7 @@ function handleStateChange(a, from, to) {
     unpinHold(a.id);
     if (to === 'takeoff') addTickerLine(`${tag}: departing.`);
     else if (to === 'landing') addTickerLine(`${tag}: on approach.`);
+    else if (to === 'outbound') addTickerLine(`${tag}: thread done — outbound, leaving the airspace.`);
     else if (to === 'landed') addTickerLine(`${tag}: landed, off frequency.`);
     else if (to === 'taxi') addTickerLine(`${tag}: taxiing.`);
     else if (to === 'parked') addTickerLine(`${tag}: parked at the gate.`);
@@ -1409,6 +1415,7 @@ function handleStateChange(a, from, to) {
       holding: 'entering hold',
       takeoff: 'taking off',
       landing: 'landing',
+      outbound: 'outbound — thread done',
       landed: 'landed',
       taxi: 'taxiing',
       parked: 'parked at the gate',
@@ -1489,7 +1496,7 @@ function animate() {
     entry.group.rotation.y = Math.PI / 2 - entry.heading;
 
     // Bank smoothly into turns when airborne; keep wings level on the ground.
-    const airborne = ['cruising', 'holding', 'takeoff', 'landing'].includes(entry.state);
+    const airborne = ['cruising', 'holding', 'takeoff', 'landing', 'outbound'].includes(entry.state);
     const omega = dt > 0.001 ? stepH / dt : 0;
     const maxBank = entry.kind === 'fighter' ? 0.52 : (entry.model_class === 'frontier' ? 0.32 : 0.4);
     const targetRoll = airborne

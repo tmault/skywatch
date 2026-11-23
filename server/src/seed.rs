@@ -72,7 +72,7 @@ pub fn seed(world: &mut World) {
             }
             "SKY3" => {
                 a.title = Some("Fix flaky integration test".to_string());
-                a.land();
+                a.touch_down();
             }
             "REAP1" => a.title = Some("Tower health monitor".to_string()),
             "REAP2" => a.title = Some("Nightly backup cron".to_string()),
@@ -266,11 +266,20 @@ mod tests {
         world.tick(12.0);
         let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
         assert_eq!(a.state, State::Ready);
-        world.tick(5.0);
-        world.tick(30.0);
+        for _ in 0..200 {
+            world.tick(0.1);
+        }
         let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
         assert_eq!(a.state, State::Cruising);
         run_cycle(&mut world, 5);
+        let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
+        assert_eq!(a.state, State::Landing);
+        for _ in 0..3000 {
+            world.tick(0.1);
+            if world.iter().any(|a| a.callsign == "SKY3" && a.state == State::Landed) {
+                break;
+            }
+        }
         let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
         assert_eq!(a.state, State::Landed);
         world.tick(6.0);

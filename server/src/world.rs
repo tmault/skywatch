@@ -26,6 +26,8 @@ pub enum State {
     Ready,
     Takeoff,
     Landing,
+    /// Thread done: climbing away off the edge of the map, then removed.
+    Outbound,
 }
 
 /// The class of model powering an agent: local props vs frontier jets.
@@ -145,6 +147,24 @@ pub struct Aircraft {
     /// flight paths and decayed gently once clear of traffic.
     #[serde(skip)]
     sep_offset: [f32; 3],
+    /// Active guidance (zone rejoin or approach intercept), not serialised.
+    #[serde(skip)]
+    leg: Option<Steer>,
+    /// Current approach phase while `State::Landing`.
+    #[serde(skip)]
+    approach: Option<Approach>,
+    /// Where to taxi after rolling out (None: wait for a free gate).
+    #[serde(skip)]
+    after_landing: Option<GroundSpot>,
+    /// Heading to settle on when the current taxi route ends.
+    #[serde(skip)]
+    taxi_heading: Option<f32>,
+    /// Current speed on the takeoff roll / landing rollout / outbound climb.
+    #[serde(skip)]
+    ground_speed: f32,
+    /// Leave the airspace after takeoff instead of rejoining the zone.
+    #[serde(skip)]
+    leaving: bool,
     /// Ground speed in m/s (serde default keeps old snapshots deserialisable).
     #[serde(default = "default_speed")]
     pub speed: f32,
@@ -207,6 +227,28 @@ pub const HOME_GATES: [[f32; 2]; 10] = [
 pub const GATE_HEADING: f32 = 0.0;
 
 const TAXI_SPEED: f32 = 6.0; // m/s on the ground
+const TAKEOFF_ACCEL: f32 = 2.0; // m/s² down the runway before rotating
+const DEPARTURE_ALTITUDE: f32 = 24.0; // climb straight out to here, then turn
+const ROLLOUT_DECEL: f32 = 1.5; // m/s² braking after touchdown
+const FINAL_SPEED_FACTOR: f32 = 0.8; // slow down on final
+const TURN_RATE: f32 = 0.35; // rad/s, standard-rate-ish banking turns
+const STEER_LOOKAHEAD: f32 = 40.0; // carrot distance along the intercept line
+const DESCENT_RATE: f32 = 6.0; // m/s max descent on the inbound leg
+const FINAL_DESCENT_MAX: f32 = 10.0; // m/s max descent to regain the glideslope
+const INBOUND_GRADIENT: f32 = 0.3; // target height gained per unit from the FAF
+const APPROACH_LEAD: f32 = 160.0; // intercept the localizer this far out
+const REJOIN_LEAD: f32 = 90.0;
+const OUTBOUND_SPEED_FACTOR: f32 = 1.6; // speed up once heading out
+const OUTBOUND_CLIMB: f32 = 40.0; // climb above cruise level on the way out
+/// Outbound aircraft are removed once this far past the map edge.
+const OUTBOUND_EXIT: f32 = AREA_SIZE / 2.0 + 40.0;
+/// Off-pattern distance beyond which cruising aircraft fly a rejoin leg.
+const REJOIN_THRESHOLD: f32 = 6.0;
+/// Final approach fix on the extended Runway 36 centreline, south of the island.
+pub const FINAL_APPROACH_FIX: [f32; 2] = [56.0, 166.0];
+pub const FAF_ALTITUDE: f32 = 32.0;
+/// Touchdown point just past the threshold; rollout continues north.
+pub const TOUCHDOWN: [f32; 2] = [56.0, 38.0];
 const TAXI_DELAY_AFTER_LANDING: f32 = 5.0; // s rolled out on runway, then taxi
 const HOLD_SHORT_TIME: f32 = 4.0; // s lined up before rolling
 
@@ -223,6 +265,63 @@ pub const SATELLITE_SLOTS: [[f32; 2]; 5] = [
 /// centred on the origin (where the home island sits).
 fn wrap_centered(v: f32) -> f32 {
     (v + AREA_SIZE / 2.0).rem_euclid(AREA_SIZE) - AREA_SIZE / 2.0
+}
+
+/// Shortest signed difference along one wrapped axis.
+fn wrap_delta(d: f32) -> f32 {
+    wrap_centered(d)
+}
+
+/// Normalise an angle to (-PI, PI].
+fn wrap_angle(a: f32) -> f32 {
+    let tau = std::f32::consts::TAU;
+    let r = (a + std::f32::consts::PI).rem_euclid(tau) - std::f32::consts::PI;
+    if r <= -std::f32::consts::PI { r + tau } else { r }
+}
+
+fn ease_toward(v: f32, target: f32, max_step: f32) -> f32 {
+    v + (target - v).clamp(-max_step, max_step)
+}
+
+/// A parking spot on the ground: where to stop, which way to face, and the
+/// state to settle into (Ready on the taxiway queue, Parked at a gate).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GroundSpot {
+    pub pos: [f32; 2],
+    pub heading: f32,
+    pub state: State,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Approach {
+    /// Curving from the current track onto the final approach fix.
+    Inbound,
+    /// Straight-in glideslope down the extended runway centreline.
+    Final,
+    /// Braking along the runway after touchdown.
+    Rollout,
+}
+
+/// Turn-rate-limited guidance onto a line through `target` along `heading`,
+/// the way an aircraft intercepts a localizer: fly to a gate well behind the
+/// target, then chase a carrot along the line. Heading is always continuous,
+/// so there are no cusps, reversals or jumps whatever the starting pose.
+#[derive(Clone, Debug)]
+struct Steer {
+    target: [f32; 2],
+    heading: f32,
+    /// How far behind the target the intercept begins.
+    lead: f32,
+    /// Max cross-track error accepted when crossing the target.
+    capture: f32,
+    /// True once established far enough behind the target to intercept.
+    intercept: bool,
+}
+
+impl Steer {
+    fn new(target: [f32; 2], heading: f32, lead: f32, capture: f32) -> Self {
+        Steer { target, heading, lead, capture, intercept: false }
+    }
 }
 
 /// Base domain sectors always present on the map: (name, centre [x, z], radius).
@@ -307,6 +406,12 @@ impl Aircraft {
             cleared_for_takeoff: false,
             ground_timer: 0.0,
             sep_offset: [0.0, 0.0, 0.0],
+            leg: None,
+            approach: None,
+            after_landing: None,
+            taxi_heading: None,
+            ground_speed: 0.0,
+            leaving: false,
             speed,
         }
     }
@@ -327,11 +432,21 @@ impl Aircraft {
         self.topic = Some(topic.to_string());
     }
 
+    fn on_ground(&self) -> bool {
+        matches!(
+            self.state,
+            State::Parked | State::Landed | State::Taxi | State::Ready
+        )
+    }
+
     /// Enter a holding pattern with a reason (e.g. "awaiting approval").
     pub fn hold(&mut self, reason: &str) {
         if self.state != State::Holding {
             self.orbit_center = None; // re-derive the orbit from current pos
         }
+        self.leg = None;
+        self.approach = None;
+        self.after_landing = None;
         self.state = State::Holding;
         self.hold_reason = Some(reason.to_string());
     }
@@ -341,6 +456,7 @@ impl Aircraft {
     pub fn taxi_to(&mut self, dest: [f32; 2], next_state: State) {
         self.state = State::Taxi;
         self.taxi_next = Some(next_state);
+        self.taxi_heading = None;
         self.ground_timer = 0.0;
         self.taxi_waypoints.clear();
 
@@ -358,6 +474,12 @@ impl Aircraft {
         self.taxi_waypoints.push(dest);
     }
 
+    /// Taxi to `spot`, then settle into its state facing its heading.
+    fn taxi_to_spot(&mut self, spot: GroundSpot) {
+        self.taxi_to(spot.pos, spot.state);
+        self.taxi_heading = Some(spot.heading);
+    }
+
     /// The final destination of any in-progress taxi, if taxiing.
     pub fn taxi_destination(&self) -> Option<[f32; 2]> {
         self.taxi_waypoints.last().copied()
@@ -368,6 +490,7 @@ impl Aircraft {
         self.orbit_center = None;
         self.hold_reason = None;
         self.cleared_for_takeoff = true;
+        self.after_landing = None;
         match self.state {
             // On the ground: taxi to the runway threshold first.
             State::Parked | State::Landed | State::Taxi => {
@@ -381,17 +504,101 @@ impl Aircraft {
                 if d < 6.0 {
                     self.state = State::Takeoff;
                     self.heading = RUNWAY_HEADING;
+                    self.ground_speed = 0.0;
                 } else {
                     self.taxi_to(RUNWAY_THRESHOLD, State::Ready);
                 }
             }
-            // Airborne hold: climb straight out.
-            _ => self.state = State::Takeoff,
+            // On approach: go around and rejoin the zone pattern.
+            State::Landing => self.go_around(),
+            // Airborne hold: climb out, then rejoin the zone pattern.
+            _ => {
+                self.leg = None;
+                self.state = State::Takeoff;
+            }
         }
     }
 
-    /// Touch down: roll out, then wait for World::tick to assign a free gate.
+    /// Abandon an approach: a touch-and-go on the runway, otherwise climb
+    /// back out on a curved leg to the zone pattern.
+    fn go_around(&mut self) {
+        let rolling = self.approach == Some(Approach::Rollout);
+        self.approach = None;
+        self.after_landing = None;
+        self.leg = None;
+        self.state = if rolling { State::Takeoff } else { State::Cruising };
+    }
+
+    /// Fly a smooth approach: leave the current track on a curved inbound leg
+    /// to the final approach fix, descend the glideslope, touch down just past
+    /// the threshold and roll out. `World::tick` then assigns a free gate.
     pub fn land(&mut self) {
+        self.begin_approach(None);
+    }
+
+    /// Start (or retarget) an approach that ends taxiing to `after`, if given.
+    pub fn begin_approach(&mut self, after: Option<GroundSpot>) {
+        if self.state == State::Landing {
+            self.after_landing = after;
+            return;
+        }
+        if self.on_ground() || (self.state == State::Takeoff && self.altitude <= 0.0) {
+            // Already down (or a rejected takeoff): just taxi over.
+            self.cleared_for_takeoff = false;
+            match after {
+                Some(spot) => self.taxi_to_spot(spot),
+                None if self.state == State::Takeoff => {
+                    self.state = State::Landed;
+                    self.ground_timer = 0.0;
+                }
+                None => {}
+            }
+            return;
+        }
+        self.state = State::Landing;
+        self.hold_reason = None;
+        self.orbit_center = None;
+        self.cleared_for_takeoff = false;
+        self.after_landing = after;
+        self.approach = Some(Approach::Inbound);
+        self.leg = None;
+    }
+
+    /// Thread done: leave the airspace. Ground aircraft taxi out and take
+    /// off; airborne ones turn away from the island and climb off the map.
+    pub fn leave(&mut self) {
+        self.hold_reason = None;
+        self.after_landing = None;
+        self.orbit_center = None;
+        self.leg = None;
+        match self.state {
+            State::Outbound => {}
+            State::Parked | State::Landed | State::Taxi | State::Ready => {
+                self.release();
+                self.leaving = true;
+            }
+            State::Takeoff => self.leaving = true,
+            State::Landing if self.approach == Some(Approach::Rollout) => {
+                self.approach = None;
+                self.state = State::Takeoff;
+                self.leaving = true;
+            }
+            _ => {
+                self.approach = None;
+                self.ground_speed = self.speed;
+                self.state = State::Outbound;
+            }
+        }
+    }
+
+    /// True once an outbound aircraft has flown off the edge of the map.
+    pub fn is_gone(&self) -> bool {
+        self.state == State::Outbound
+            && self.position[0].abs().max(self.position[1].abs()) > OUTBOUND_EXIT
+    }
+
+    /// Place the aircraft rolled out on the runway immediately (demo seeding).
+    pub fn touch_down(&mut self) {
         self.state = State::Landed;
         self.altitude = 0.0;
         self.position[2] = 0.0;
@@ -400,11 +607,185 @@ impl Aircraft {
         self.cleared_for_takeoff = false;
         self.taxi_waypoints.clear();
         self.taxi_next = None;
-        // Touch down mid-runway, rolling north.
+        self.leg = None;
+        self.approach = None;
+        self.after_landing = None;
         self.position[0] = RUNWAY_MID[0];
         self.position[1] = RUNWAY_MID[1];
         self.heading = RUNWAY_HEADING;
         self.ground_timer = 0.0;
+    }
+
+    /// Steer toward an airborne thread state without teleporting: ground
+    /// aircraft taxi out and depart, approaches go around, and airborne
+    /// aircraft enter or leave the hold where they are.
+    pub fn fly(&mut self, target: State, reason: Option<String>) {
+        match self.state {
+            State::Parked | State::Landed | State::Taxi | State::Ready => {
+                if !self.cleared_for_takeoff {
+                    self.release();
+                }
+                self.hold_reason = reason;
+                return;
+            }
+            State::Takeoff => {
+                self.hold_reason = reason;
+                return;
+            }
+            State::Landing => self.go_around(),
+            State::Outbound => return,
+            State::Cruising | State::Holding => {}
+        }
+        if self.state == State::Takeoff {
+            self.hold_reason = reason;
+            return;
+        }
+        if target == State::Holding {
+            let why = reason.unwrap_or_else(|| "awaiting your input".to_string());
+            self.hold(&why);
+        } else {
+            if self.state == State::Holding {
+                self.state = State::Cruising;
+                self.orbit_center = None;
+            }
+            self.hold_reason = reason;
+        }
+    }
+
+    /// Bring this aircraft to rest at `spot`: airborne aircraft fly the
+    /// approach and taxi there after rolling out; ground aircraft taxi over.
+    pub fn park_at(&mut self, spot: GroundSpot) {
+        if !self.on_ground() {
+            self.begin_approach(Some(spot));
+            return;
+        }
+        let bound_for = self.taxi_destination().unwrap_or([self.position[0], self.position[1]]);
+        let retarget = (bound_for[0] - spot.pos[0]).hypot(bound_for[1] - spot.pos[1]) > 1.0
+            || self.cleared_for_takeoff
+            || (self.state == State::Taxi && self.taxi_next != Some(spot.state));
+        if !retarget {
+            return;
+        }
+        self.cleared_for_takeoff = false;
+        if (self.position[0] - spot.pos[0]).hypot(self.position[1] - spot.pos[1]) > 1.0 {
+            self.taxi_to_spot(spot);
+        } else {
+            self.taxi_waypoints.clear();
+            self.taxi_next = None;
+            self.state = spot.state;
+            self.heading = spot.heading;
+            self.ground_timer = 0.0;
+        }
+    }
+
+    /// Snap straight onto the zone pattern (first sighting, nothing to animate).
+    pub fn place_on_pattern(&mut self, sectors: &[Sector]) {
+        let Some(sec) = self.sector(sectors) else { return };
+        let (p, h, _) = self.pattern_pose(sec, self.patrol_angle);
+        let alt = self.cruise_altitude() + 2.5 * (2.0 * self.patrol_angle).sin();
+        self.set_pose(p, h, alt);
+    }
+
+    fn sector<'s>(&self, sectors: &'s [Sector]) -> Option<&'s Sector> {
+        let topic = self.topic.as_ref()?;
+        sectors.iter().find(|s| s.name == *topic)
+    }
+
+    fn set_pose(&mut self, p: [f32; 2], heading: f32, alt: f32) {
+        self.position[0] = wrap_centered(p[0]);
+        self.position[1] = wrap_centered(p[1]);
+        self.heading = heading;
+        self.altitude = alt;
+        self.position[2] = alt;
+    }
+
+    /// Heading after one tick of turning toward `want` at the standard rate.
+    fn turned_toward(&self, want: f32, dt: f32) -> f32 {
+        let max_turn = TURN_RATE * dt;
+        wrap_angle(self.heading + wrap_angle(want - self.heading).clamp(-max_turn, max_turn))
+    }
+
+    fn turn_toward(&mut self, want: f32, dt: f32) {
+        self.heading = self.turned_toward(want, dt);
+    }
+
+    /// Fly one tick of `st` guidance at `speed`; true once across the target
+    /// within the capture tolerance. A miss loops back round for another try.
+    fn steer(&mut self, st: &mut Steer, speed: f32, dt: f32) -> bool {
+        let (dx, dz) = (st.heading.cos(), st.heading.sin());
+        let rx = self.position[0] - st.target[0];
+        let rz = self.position[1] - st.target[1];
+        let along = rx * dx + rz * dz;
+        let cross = rz * dx - rx * dz;
+        if !st.intercept && along < -st.lead {
+            st.intercept = true;
+        }
+        if st.intercept && along >= 0.0 {
+            if cross.abs() <= st.capture {
+                return true;
+            }
+            st.intercept = false;
+        }
+        let aim_along = if st.intercept {
+            (along + STEER_LOOKAHEAD).min(0.0)
+        } else {
+            -(st.lead + 40.0)
+        };
+        let aim = [st.target[0] + dx * aim_along, st.target[1] + dz * aim_along];
+        let want = (aim[1] - self.position[1]).atan2(aim[0] - self.position[0]);
+        self.turn_toward(want, dt);
+        // Positions stay unwrapped while steering so guidance never chases a
+        // target across the world seam; set_pose re-wraps on hand-over.
+        self.position[0] += self.heading.cos() * speed * dt;
+        self.position[1] += self.heading.sin() * speed * dt;
+        false
+    }
+
+    /// Pose on the zone pattern at parameter `t`: `([x, z], heading, ds/dt)`.
+    /// Frontier jets carve wide high-altitude figure-8s; props and drones fly
+    /// scenic ovals and lazy S-curves, all at constant true airspeed.
+    fn pattern_pose(&self, sec: &Sector, t: f32) -> ([f32; 2], f32, f32) {
+        let span = match (self.kind, self.model_class) {
+            (Kind::Agent, ModelClass::Frontier) => sec.radius * 1.18,
+            (Kind::Drone, _) => sec.radius * 0.78,
+            _ => sec.radius * 0.88,
+        };
+        let rot = (self.id as f32 * 1.17) % std::f32::consts::TAU;
+        let (cr, sr) = (rot.cos(), rot.sin());
+        let pattern = if self.kind == Kind::Drone { 1 } else { self.id % 3 };
+        let (u, v, du, dv) = match pattern {
+            // Pattern 0: wide figure-8 (Lissajous 1:2)
+            0 => {
+                let a = span * 1.12;
+                let b = span * 0.56;
+                (a * t.sin(), b * (2.0 * t).sin(), a * t.cos(), 2.0 * b * (2.0 * t).cos())
+            }
+            // Pattern 1: broad tilted scenic oval
+            1 => {
+                let a = span * 1.15;
+                let b = span * 0.68;
+                (a * t.cos(), b * t.sin(), -a * t.sin(), b * t.cos())
+            }
+            // Pattern 2: gentle three-lobe scenic S-loop
+            _ => {
+                let a = span * 0.88;
+                (
+                    a * (t.cos() + 0.22 * (3.0 * t).cos()),
+                    a * (t.sin() - 0.22 * (3.0 * t).sin()),
+                    a * (-t.sin() - 0.66 * (3.0 * t).sin()),
+                    a * (t.cos() - 0.66 * (3.0 * t).cos()),
+                )
+            }
+        };
+        let ox = u * cr - v * sr;
+        let oz = u * sr + v * cr;
+        let vx = du * cr - dv * sr;
+        let vz = du * sr + dv * cr;
+        (
+            [sec.center[0] + ox, sec.center[1] + oz],
+            vz.atan2(vx),
+            du.hypot(dv).max(1.0),
+        )
     }
 
     /// Advance the simulation by `dt` seconds (for non-wingman aircraft).
@@ -418,13 +799,17 @@ impl Aircraft {
         match self.state {
             State::Holding => {
                 if self.orbit_center.is_none() {
-                    let r = HOLD_TURN_RADIUS;
-                    let cx = self.position[0] + self.heading.cos() * r;
-                    let cy = self.position[1] + self.heading.sin() * r;
+                    // Centre the orbit off the left wing so the turn starts
+                    // tangent to the current track instead of snapping 90°.
+                    let side = self.heading + std::f32::consts::FRAC_PI_2;
+                    let cx = self.position[0] + side.cos() * HOLD_TURN_RADIUS;
+                    let cy = self.position[1] + side.sin() * HOLD_TURN_RADIUS;
                     self.orbit_center = Some([cx, cy]);
                 }
                 let [cx, cy] = self.orbit_center.unwrap();
-                let angle = (self.position[1] - cy).atan2(self.position[0] - cx);
+                let dx = wrap_delta(self.position[0] - cx);
+                let dy = wrap_delta(self.position[1] - cy);
+                let angle = dy.atan2(dx);
                 let omega = HOLD_DRIFT_SPEED / HOLD_TURN_RADIUS;
                 let angle = angle + omega * dt;
                 let nx = cx + angle.cos() * HOLD_TURN_RADIUS;
@@ -432,105 +817,68 @@ impl Aircraft {
                 self.heading = angle + std::f32::consts::FRAC_PI_2;
                 self.position[0] = wrap_centered(nx);
                 self.position[1] = wrap_centered(ny);
+                // Climb gently back to the hold level after a low go-around.
                 let hold_alt = self.cruise_altitude();
-                if self.altitude < 40.0 {
-                    self.altitude = hold_alt;
-                    self.position[2] = hold_alt;
+                if self.altitude < hold_alt - 2.0 {
+                    self.altitude = (self.altitude + TAKEOFF_RATE * dt).min(hold_alt);
+                    self.position[2] = self.altitude;
                 }
             }
             State::Cruising => {
                 let base_alt = self.cruise_altitude();
-
-                if let Some(topic) = &self.topic {
-                    if let Some(sec) = sectors.iter().find(|s| s.name == *topic) {
-                        // Sweeping, calm parametric flight paths instead of tight circles:
-                        // Frontier jets carve wide high-altitude figure-8s / arcs; props &
-                        // drones fly scenic ovals and lazy S-curves at constant true airspeed.
-                        let span = match (self.kind, self.model_class) {
-                            (Kind::Agent, ModelClass::Frontier) => sec.radius * 1.18,
-                            (Kind::Drone, _) => sec.radius * 0.78,
-                            _ => sec.radius * 0.88,
-                        };
-                        let rot = (self.id as f32 * 1.17) % std::f32::consts::TAU;
-                        let (cr, sr) = (rot.cos(), rot.sin());
-                        let pattern = if self.kind == Kind::Drone {
-                            1
-                        } else {
-                            self.id % 3
-                        };
-
-                        let t = self.patrol_angle;
-                        let (du, dv) = match pattern {
-                            // Pattern 0: wide figure-8 (Lissajous 1:2)
-                            0 => {
-                                let a = span * 1.12;
-                                let b = span * 0.56;
-                                (a * t.cos(), 2.0 * b * (2.0 * t).cos())
-                            }
-                            // Pattern 1: broad tilted scenic oval
-                            1 => {
-                                let a = span * 1.15;
-                                let b = span * 0.68;
-                                (-a * t.sin(), b * t.cos())
-                            }
-                            // Pattern 2: gentle three-lobe scenic S-loop
-                            _ => {
-                                let a = span * 0.88;
-                                (
-                                    a * (-t.sin() - 0.66 * (3.0 * t).sin()),
-                                    a * (t.cos() - 0.66 * (3.0 * t).cos()),
-                                )
-                            }
-                        };
-                        let ds_dt = du.hypot(dv).max(1.0);
-                        self.patrol_angle =
-                            (self.patrol_angle + (self.speed / ds_dt) * dt) % std::f32::consts::TAU;
-
-                        let t = self.patrol_angle;
-                        let (u, v, du, dv) = match pattern {
-                            0 => {
-                                let a = span * 1.12;
-                                let b = span * 0.56;
-                                (
-                                    a * t.sin(),
-                                    b * (2.0 * t).sin(),
-                                    a * t.cos(),
-                                    2.0 * b * (2.0 * t).cos(),
-                                )
-                            }
-                            1 => {
-                                let a = span * 1.15;
-                                let b = span * 0.68;
-                                (a * t.cos(), b * t.sin(), -a * t.sin(), b * t.cos())
-                            }
-                            _ => {
-                                let a = span * 0.88;
-                                (
-                                    a * (t.cos() + 0.22 * (3.0 * t).cos()),
-                                    a * (t.sin() - 0.22 * (3.0 * t).sin()),
-                                    a * (-t.sin() - 0.66 * (3.0 * t).sin()),
-                                    a * (t.cos() - 0.66 * (3.0 * t).cos()),
-                                )
-                            }
-                        };
-
-                        let ox = u * cr - v * sr;
-                        let oz = u * sr + v * cr;
-                        let vx = du * cr - dv * sr;
-                        let vz = du * sr + dv * cr;
-
-                        self.heading = vz.atan2(vx);
-                        self.position[0] = wrap_centered(sec.center[0] + ox + self.sep_offset[0]);
-                        self.position[1] = wrap_centered(sec.center[1] + oz + self.sep_offset[1]);
-                        // Gentle vertical breath while cruising + TCAS altitude offset.
-                        let wave = 2.5 * (2.0 * t).sin();
-                        self.altitude = (base_alt + wave + self.sep_offset[2]).max(30.0);
+                if let Some(sec) = self.sector(sectors) {
+                    let wave = |t: f32| 2.5 * (2.0 * t).sin();
+                    let (p, h, _) = self.pattern_pose(sec, self.patrol_angle);
+                    if self.leg.is_none() {
+                        // Off the pattern (just departed, left a hold, changed
+                        // zone): steer back on instead of jumping.
+                        let off = (self.position[0] - self.sep_offset[0] - p[0])
+                            .hypot(self.position[1] - self.sep_offset[1] - p[1]);
+                        let misaligned = wrap_angle(self.heading - h).abs() > 0.1;
+                        if off > REJOIN_THRESHOLD || misaligned {
+                            self.leg = Some(Steer::new(p, h, REJOIN_LEAD, 12.0));
+                        } else if off > 1e-3 {
+                            // Close enough: absorb the gap into the decaying offset.
+                            self.sep_offset = [
+                                self.position[0] - p[0],
+                                self.position[1] - p[1],
+                                self.altitude - (base_alt + wave(self.patrol_angle)),
+                            ];
+                        }
+                    }
+                    if let Some(mut st) = self.leg.take() {
+                        let target_alt = base_alt + wave(self.patrol_angle);
+                        self.altitude = ease_toward(self.altitude, target_alt, TAKEOFF_RATE * dt);
                         self.position[2] = self.altitude;
+                        if self.steer(&mut st, self.speed, dt) && (self.altitude - target_alt).abs() < 3.0 {
+                            // Fold the small residual into the decaying offset so
+                            // the hand-over to the pattern is seamless.
+                            self.sep_offset = [
+                                self.position[0] - p[0],
+                                self.position[1] - p[1],
+                                self.altitude - target_alt,
+                            ];
+                            self.position[0] = wrap_centered(self.position[0]);
+                            self.position[1] = wrap_centered(self.position[1]);
+                        } else {
+                            self.leg = Some(st);
+                        }
                         return;
                     }
+
+                    let (_, _, ds_dt) = self.pattern_pose(sec, self.patrol_angle);
+                    self.patrol_angle =
+                        (self.patrol_angle + (self.speed / ds_dt) * dt) % std::f32::consts::TAU;
+                    let (p, h, _) = self.pattern_pose(sec, self.patrol_angle);
+                    let s = self.sep_offset;
+                    // Gentle vertical breath while cruising + TCAS altitude offset.
+                    let alt = (base_alt + wave(self.patrol_angle) + s[2]).max(30.0);
+                    self.set_pose([p[0] + s[0], p[1] + s[1]], h, alt);
+                    return;
                 }
-                self.altitude = base_alt;
-                self.position[2] = base_alt;
+                self.leg = None;
+                self.altitude = ease_toward(self.altitude, base_alt, TAKEOFF_RATE * dt);
+                self.position[2] = self.altitude;
                 let dx = self.heading.cos() * self.speed * dt;
                 let dy = self.heading.sin() * self.speed * dt;
                 self.position[0] = wrap_centered(self.position[0] + dx);
@@ -549,7 +897,7 @@ impl Aircraft {
                 let mut rem = TAXI_SPEED * dt;
                 while rem > 0.0 {
                     let Some(&target) = self.taxi_waypoints.first() else {
-                        self.state = self.taxi_next.take().unwrap_or(State::Parked);
+                        self.finish_taxi();
                         break;
                     };
                     let dx = target[0] - self.position[0];
@@ -561,13 +909,7 @@ impl Aircraft {
                         rem -= dist;
                         self.taxi_waypoints.remove(0);
                         if self.taxi_waypoints.is_empty() {
-                            self.state = self.taxi_next.take().unwrap_or(State::Parked);
-                            self.ground_timer = 0.0;
-                            if self.state == State::Ready {
-                                self.heading = RUNWAY_HEADING;
-                            } else if self.state == State::Parked {
-                                self.heading = GATE_HEADING;
-                            }
+                            self.finish_taxi();
                             break;
                         }
                     } else {
@@ -581,6 +923,7 @@ impl Aircraft {
             State::Ready => {
                 self.altitude = 0.0;
                 self.position[2] = 0.0;
+                self.ground_speed = 0.0;
                 // Only roll onto takeoff when explicitly cleared via `release()`;
                 // planes queued on the taxiway wait here until awakened.
                 if self.cleared_for_takeoff {
@@ -592,29 +935,115 @@ impl Aircraft {
                 }
             }
             State::Takeoff => {
-                let target_alt = self.cruise_altitude();
-                self.altitude += TAKEOFF_RATE * dt;
+                // Roll and accelerate down the runway, rotate, then climb out
+                // to a safe height before curving onto the zone pattern.
+                let rolling = self.altitude <= 0.0 && self.ground_speed < self.speed * 0.9;
+                if rolling {
+                    self.ground_speed += TAKEOFF_ACCEL * dt;
+                } else {
+                    self.ground_speed = self.speed;
+                    self.altitude += TAKEOFF_RATE * dt;
+                }
                 self.position[2] = self.altitude;
-                let dx = self.heading.cos() * self.speed * dt;
-                let dy = self.heading.sin() * self.speed * dt;
+                let dx = self.heading.cos() * self.ground_speed * dt;
+                let dy = self.heading.sin() * self.ground_speed * dt;
                 self.position[0] = wrap_centered(self.position[0] + dx);
                 self.position[1] = wrap_centered(self.position[1] + dy);
-                if self.altitude >= target_alt {
-                    self.altitude = target_alt;
-                    self.position[2] = target_alt;
-                    self.state = State::Cruising;
+                if self.altitude >= DEPARTURE_ALTITUDE.min(self.cruise_altitude()) {
+                    self.state = if self.leaving { State::Outbound } else { State::Cruising };
+                    self.leaving = false;
+                    self.leg = None;
                 }
             }
-            State::Landing => {
-                self.altitude = (self.altitude - TAKEOFF_RATE * dt).max(0.0);
+            State::Outbound => {
+                // Turn away from the island and climb out past the map edge.
+                // Positions stay unwrapped so it never reappears on the far side.
+                let want = self.position[1].atan2(self.position[0]);
+                self.turn_toward(want, dt);
+                self.ground_speed = (self.ground_speed.max(self.speed) + 2.0 * dt)
+                    .min(self.speed * OUTBOUND_SPEED_FACTOR);
+                let ceiling = self.cruise_altitude() + OUTBOUND_CLIMB;
+                self.altitude = ease_toward(self.altitude, ceiling, TAKEOFF_RATE * dt);
                 self.position[2] = self.altitude;
-                if self.altitude <= 0.0 {
-                    self.state = State::Landed;
-                }
+                self.position[0] += self.heading.cos() * self.ground_speed * dt;
+                self.position[1] += self.heading.sin() * self.ground_speed * dt;
             }
+            State::Landing => self.fly_approach(dt),
             State::Parked => {
                 self.altitude = 0.0;
                 self.position[2] = 0.0;
+            }
+        }
+    }
+
+    /// Settle at the end of a taxi route into the queued state and heading.
+    fn finish_taxi(&mut self) {
+        self.state = self.taxi_next.take().unwrap_or(State::Parked);
+        self.ground_timer = 0.0;
+        if let Some(h) = self.taxi_heading.take() {
+            self.heading = h;
+        } else if self.state == State::Ready {
+            self.heading = RUNWAY_HEADING;
+        } else if self.state == State::Parked {
+            self.heading = GATE_HEADING;
+        }
+    }
+
+    /// Inbound leg → glideslope down the extended centreline → rollout.
+    fn fly_approach(&mut self, dt: f32) {
+        match self.approach.unwrap_or(Approach::Inbound) {
+            Approach::Inbound => {
+                let mut st = self.leg.take().unwrap_or_else(|| {
+                    Steer::new(FINAL_APPROACH_FIX, RUNWAY_HEADING, APPROACH_LEAD, 3.0)
+                });
+                // Descend toward a height proportional to distance from the
+                // FAF, never climbing, so the plane arrives near FAF altitude.
+                let to_faf = (self.position[0] - FINAL_APPROACH_FIX[0])
+                    .hypot(self.position[1] - FINAL_APPROACH_FIX[1]);
+                let want = FAF_ALTITUDE + to_faf * INBOUND_GRADIENT;
+                self.altitude = self
+                    .altitude
+                    .min(ease_toward(self.altitude, want, DESCENT_RATE * dt));
+                self.position[2] = self.altitude;
+                if self.steer(&mut st, self.speed, dt) {
+                    self.approach = Some(Approach::Final);
+                } else {
+                    self.leg = Some(st);
+                }
+            }
+            Approach::Final => {
+                // Keep chasing a carrot down the centreline at the same turn
+                // rate, so the hand-over from the intercept never snaps.
+                let speed = self.speed * FINAL_SPEED_FACTOR;
+                let want = (-STEER_LOOKAHEAD).atan2(TOUCHDOWN[0] - self.position[0]);
+                let heading = self.turned_toward(want, dt);
+                let x = self.position[0] + heading.cos() * speed * dt;
+                let z = self.position[1] + heading.sin() * speed * dt;
+                let span = FINAL_APPROACH_FIX[1] - TOUCHDOWN[1];
+                if z <= TOUCHDOWN[1] {
+                    self.set_pose(TOUCHDOWN, RUNWAY_HEADING, 0.0);
+                    self.ground_speed = speed;
+                    self.approach = Some(Approach::Rollout);
+                } else {
+                    let glide = FAF_ALTITUDE * ((z - TOUCHDOWN[1]) / span).clamp(0.0, 1.0);
+                    let alt = self
+                        .altitude
+                        .min(glide.max(self.altitude - FINAL_DESCENT_MAX * dt));
+                    self.set_pose([x, z], heading, alt);
+                }
+            }
+            Approach::Rollout => {
+                self.ground_speed = (self.ground_speed - ROLLOUT_DECEL * dt).max(TAXI_SPEED);
+                let z = self.position[1] - self.ground_speed * dt;
+                self.set_pose([TOUCHDOWN[0], z], RUNWAY_HEADING, 0.0);
+                if self.ground_speed <= TAXI_SPEED {
+                    self.approach = None;
+                    self.ground_timer = 0.0;
+                    match self.after_landing.take() {
+                        Some(spot) => self.taxi_to_spot(spot),
+                        None => self.state = State::Landed,
+                    }
+                }
             }
         }
     }
@@ -793,6 +1222,13 @@ impl World {
                 a.tick_with_sectors(dt, &sectors);
                 continue;
             };
+            if p_state == State::Outbound {
+                // Parent's thread is done: peel off and leave with it.
+                a.parent_id = None;
+                a.wing_slot = None;
+                a.leave();
+                continue;
+            }
             let on_ground = matches!(
                 p_state,
                 State::Parked | State::Landed | State::Taxi | State::Ready
@@ -839,14 +1275,18 @@ impl World {
         // conflicting traffic, then enforce hard 3D clearance so no two airborne
         // planes can ever overlap.
         self.enforce_air_separation(dt);
+
+        // Outbound aircraft that have flown off the map are gone.
+        self.aircraft.retain(|a| !a.is_gone());
     }
 
     fn enforce_air_separation(&mut self, dt: f32) {
-        let is_airborne = |s: State| {
-            matches!(
-                s,
-                State::Cruising | State::Holding | State::Takeoff | State::Landing
-            )
+        // Approach and low climb-out traffic is sequenced by the tower, so
+        // TCAS never shoves it off the glideslope or runway centreline.
+        let is_airborne = |a: &Aircraft| match a.state {
+            State::Cruising | State::Holding => true,
+            State::Takeoff => a.altitude > 40.0,
+            _ => false,
         };
         let is_formation_pair = |a: &Aircraft, b: &Aircraft| {
             a.parent_id == Some(b.id)
@@ -857,7 +1297,7 @@ impl World {
         // Gently relax previous TCAS offsets back toward zero when clear.
         let decay = (-0.45 * dt).exp();
         for a in &mut self.aircraft {
-            if is_airborne(a.state) {
+            if is_airborne(a) {
                 a.sep_offset[0] *= decay;
                 a.sep_offset[1] *= decay;
                 a.sep_offset[2] *= decay;
@@ -871,11 +1311,11 @@ impl World {
         let mut hard_alt: Vec<f32> = vec![0.0; n];
 
         for i in 0..n {
-            if !is_airborne(self.aircraft[i].state) {
+            if !is_airborne(&self.aircraft[i]) {
                 continue;
             }
             for j in (i + 1)..n {
-                if !is_airborne(self.aircraft[j].state) {
+                if !is_airborne(&self.aircraft[j]) {
                     continue;
                 }
                 if is_formation_pair(&self.aircraft[i], &self.aircraft[j]) {
@@ -941,7 +1381,7 @@ impl World {
         }
 
         for i in 0..n {
-            if !is_airborne(self.aircraft[i].state) {
+            if !is_airborne(&self.aircraft[i]) {
                 continue;
             }
             let a = &mut self.aircraft[i];
@@ -1032,7 +1472,7 @@ mod tests {
 
         // Land a plane — it must claim the only free gate (HOME_GATES[last]).
         let mut arriving = Aircraft::new("SKY9", Kind::Agent);
-        arriving.land();
+        arriving.touch_down();
         world.add(arriving);
 
         for _ in 0..600 {
@@ -1046,7 +1486,7 @@ mod tests {
 
         // Land another plane when ALL gates are full — must stay Landed, never overlap!
         let mut overflow = Aircraft::new("SKY10", Kind::Agent);
-        overflow.land();
+        overflow.touch_down();
         world.add(overflow);
         for _ in 0..200 {
             world.tick(0.1);
@@ -1090,5 +1530,213 @@ mod tests {
                 "collision at step {step}: hdist={hdist:.2}, vdist={vdist:.2}"
             );
         }
+    }
+    /// Largest per-tick horizontal step and the tick it happened at.
+    fn max_step(a: &mut Aircraft, secs: f32, sectors: &[Sector], until: impl Fn(&Aircraft) -> bool) -> f32 {
+        let dt = 0.05;
+        let mut worst: f32 = 0.0;
+        for _ in 0..(secs / dt) as usize {
+            let before = a.position;
+            a.tick_with_sectors(dt, sectors);
+            let step = wrap_delta(a.position[0] - before[0]).hypot(wrap_delta(a.position[1] - before[1]));
+            worst = worst.max(step);
+            if until(a) {
+                break;
+            }
+        }
+        worst
+    }
+
+    fn on_pattern(a: &Aircraft, sectors: &[Sector]) -> bool {
+        let Some(sec) = a.sector(sectors) else { return false };
+        let (p, _, _) = a.pattern_pose(sec, a.patrol_angle);
+        a.state == State::Cruising
+            && a.leg.is_none()
+            && wrap_delta(a.position[0] - p[0]).hypot(wrap_delta(a.position[1] - p[1])) < 1.0
+    }
+
+    fn cruising_in(sector: &str, model: ModelClass, sectors: &[Sector]) -> Aircraft {
+        let mut a = Aircraft::with_model("SKY1", Kind::Agent, model);
+        a.assign(sector);
+        a.place_on_pattern(sectors);
+        a
+    }
+
+    #[test]
+    fn approach_glides_from_zone_onto_runway_without_jumps() {
+        let sectors = default_sectors();
+        for sector in ["Build", "Homelab", "AI & Models", "Research"] {
+            let mut a = cruising_in(sector, ModelClass::Frontier, &sectors);
+            a.land();
+            assert_eq!(a.state, State::Landing);
+            let mut touchdown = None;
+            let mut last_alt = a.altitude;
+            let dt = 0.05;
+            for _ in 0..(300.0 / dt) as usize {
+                let before = a.position;
+                a.tick_with_sectors(dt, &sectors);
+                let step = wrap_delta(a.position[0] - before[0]).hypot(wrap_delta(a.position[1] - before[1]));
+                assert!(step <= a.speed * dt * 1.05, "{sector}: jumped {step}");
+                assert!(a.altitude <= last_alt + 1e-3, "{sector}: climbed on approach");
+                last_alt = a.altitude;
+                if touchdown.is_none() && a.altitude <= 0.0 {
+                    touchdown = Some((a.position, a.heading));
+                }
+                if a.state == State::Landed {
+                    break;
+                }
+            }
+            let (pos, hdg) = touchdown.expect("never touched down");
+            assert!((pos[0] - TOUCHDOWN[0]).abs() < 0.5 && (pos[1] - TOUCHDOWN[1]).abs() < 0.5,
+                "{sector}: touched down at {pos:?}");
+            assert!((hdg - RUNWAY_HEADING).abs() < 1e-3, "{sector}: not aligned with runway");
+            assert_eq!(a.state, State::Landed, "{sector}: never rolled out");
+            assert!(a.position[1] < TOUCHDOWN[1] && a.position[1] > -76.0, "rolled off the runway");
+        }
+    }
+
+    #[test]
+    fn departure_climbs_out_and_curves_onto_pattern_smoothly() {
+        let sectors = default_sectors();
+        let mut a = Aircraft::with_model("SKY1", Kind::Agent, ModelClass::Local);
+        a.assign("Homelab");
+        a.position = [RUNWAY_THRESHOLD[0], RUNWAY_THRESHOLD[1], 0.0];
+        a.altitude = 0.0;
+        a.heading = RUNWAY_HEADING;
+        a.state = State::Ready;
+        a.release();
+        assert_eq!(a.state, State::Takeoff);
+        let worst = max_step(&mut a, 200.0, &sectors, |a| on_pattern(a, &sectors));
+        assert!(worst <= a.speed * 0.05 * 1.05, "jumped {worst}");
+        assert_eq!(a.state, State::Cruising);
+        assert!(a.leg.is_none(), "never rejoined the pattern");
+        let sec = a.sector(&sectors).unwrap();
+        let (p, _, _) = a.pattern_pose(sec, a.patrol_angle);
+        assert!((a.position[0] - p[0]).hypot(a.position[1] - p[1]) < 1.0);
+        assert!((a.altitude - a.cruise_altitude()).abs() < 4.0, "not at cruise level");
+    }
+
+    #[test]
+    fn hold_entry_and_exit_stay_on_track() {
+        let sectors = default_sectors();
+        let mut a = cruising_in("Build", ModelClass::Frontier, &sectors);
+        a.tick_with_sectors(0.05, &sectors);
+        let heading = a.heading;
+        a.hold("awaiting approval");
+        a.tick_with_sectors(0.05, &sectors);
+        let turn = wrap_angle(a.heading - heading).abs();
+        assert!(turn < 0.05, "hold entry snapped heading by {turn}");
+        max_step(&mut a, 20.0, &sectors, |_| false);
+        a.fly(State::Cruising, None);
+        let worst = max_step(&mut a, 200.0, &sectors, |a| on_pattern(a, &sectors));
+        assert!(worst <= a.speed * 0.05 * 1.05, "rejoin jumped {worst}");
+        assert!(on_pattern(&a, &sectors), "never rejoined the pattern");
+    }
+
+    #[test]
+    fn finished_thread_lands_and_taxis_to_its_queue_slot() {
+        let sectors = default_sectors();
+        let mut a = cruising_in("Research", ModelClass::Local, &sectors);
+        let (slot, hdg) = TAXIWAY_QUEUE[2];
+        a.park_at(GroundSpot { pos: slot, heading: hdg, state: State::Ready });
+        assert_eq!(a.state, State::Landing);
+        max_step(&mut a, 400.0, &sectors, |a| a.state == State::Ready);
+        assert_eq!(a.state, State::Ready);
+        assert!((a.position[0] - slot[0]).hypot(a.position[1] - slot[1]) < 0.5);
+        assert!((a.heading - hdg).abs() < 1e-3);
+
+        // Thread resumes: taxi out, take off, and fly back to the zone.
+        a.fly(State::Cruising, None);
+        assert_eq!(a.state, State::Taxi);
+        let worst = max_step(&mut a, 400.0, &sectors, |a| on_pattern(a, &sectors));
+        assert!(worst <= a.speed * 0.05 * 1.05, "jumped {worst}");
+        assert!(on_pattern(&a, &sectors), "never got back to the zone");
+    }
+
+    #[test]
+    fn go_around_from_final_rejoins_pattern() {
+        let sectors = default_sectors();
+        let mut a = cruising_in("Build", ModelClass::Local, &sectors);
+        a.land();
+        max_step(&mut a, 400.0, &sectors, |a| a.approach == Some(Approach::Final));
+        a.fly(State::Cruising, None);
+        assert_eq!(a.state, State::Cruising);
+        let worst = max_step(&mut a, 400.0, &sectors, |a| on_pattern(a, &sectors));
+        assert!(worst <= a.speed * 0.05 * 1.05, "jumped {worst}");
+        assert!(on_pattern(&a, &sectors), "never rejoined the pattern");
+    }
+    /// Tick the world until `callsign` is gone; returns (seconds, worst step / speed·dt).
+    fn fly_until_gone(world: &mut World, callsign: &str, max_secs: f32) -> (f32, f32) {
+        let dt = 0.05;
+        let mut worst: f32 = 0.0;
+        let mut t = 0.0;
+        while t < max_secs {
+            let before = world.iter().find(|a| a.callsign == callsign).map(|a| (a.position, a.speed));
+            world.tick(dt);
+            t += dt;
+            let Some((bp, speed)) = before else { break };
+            let Some(a) = world.iter().find(|a| a.callsign == callsign) else { return (t, worst) };
+            let step = (a.position[0] - bp[0]).hypot(a.position[1] - bp[1]);
+            worst = worst.max(step / (speed * dt));
+        }
+        (t, worst)
+    }
+
+    #[test]
+    fn done_thread_in_flight_flies_off_the_map() {
+        let sectors = default_sectors();
+        let mut world = World::new();
+        let mut a = cruising_in("Build", ModelClass::Frontier, &sectors);
+        a.leave();
+        assert_eq!(a.state, State::Outbound);
+        world.add(a);
+        let (t, worst) = fly_until_gone(&mut world, "SKY1", 120.0);
+        assert!(world.iter().all(|a| a.callsign != "SKY1"), "still in the airspace after {t}s");
+        assert!(worst <= OUTBOUND_SPEED_FACTOR * 1.01, "jumped {worst}x speed");
+    }
+
+    #[test]
+    fn done_thread_at_gate_taxis_out_takes_off_and_leaves() {
+        let mut world = World::new();
+        let mut a = Aircraft::with_model("GT1", Kind::Agent, ModelClass::Local);
+        a.state = State::Parked;
+        a.position = [HOME_GATES[4][0], HOME_GATES[4][1], 0.0];
+        a.altitude = 0.0;
+        a.heading = GATE_HEADING;
+        a.leave();
+        assert_eq!(a.state, State::Taxi);
+        world.add(a);
+        let mut saw = (false, false);
+        for _ in 0..(300.0 / 0.05) as usize {
+            world.tick(0.05);
+            match world.iter().find(|a| a.callsign == "GT1") {
+                Some(a) if a.state == State::Takeoff => saw.0 = true,
+                Some(a) if a.state == State::Outbound => saw.1 = true,
+                Some(a) => assert_ne!(a.state, State::Cruising, "rejoined a zone instead of leaving"),
+                None => break,
+            }
+        }
+        assert!(saw.0 && saw.1, "expected takeoff then outbound, saw {saw:?}");
+        assert!(world.iter().all(|a| a.callsign != "GT1"), "never left");
+    }
+
+    #[test]
+    fn wingmen_peel_off_with_a_done_parent() {
+        let sectors = default_sectors();
+        let mut world = World::new();
+        let parent = cruising_in("Research", ModelClass::Frontier, &sectors);
+        let pid = parent.id;
+        let start = formation_position(parent.position, parent.heading, false, 0);
+        world.add(Aircraft::wingman("SKY1-A", pid, 0, start, parent.heading));
+        world.add(parent);
+        world.get_mut("SKY1").unwrap().leave();
+        world.tick(0.05);
+        world.tick(0.05);
+        let w = world.iter().find(|a| a.callsign == "SKY1-A").unwrap();
+        assert_eq!(w.state, State::Outbound);
+        assert_eq!(w.parent_id, None);
+        fly_until_gone(&mut world, "SKY1", 120.0);
+        fly_until_gone(&mut world, "SKY1-A", 120.0);
+        assert!(world.aircraft.is_empty(), "everyone should have left");
     }
 }

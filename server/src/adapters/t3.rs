@@ -8,8 +8,8 @@
 //! radio-panel messages back into the owning thread via `t3 thread send`.
 
 use crate::world::{
-    default_sectors, formation_position, Aircraft, Airport, Kind, ModelClass, Sector, State, World,
-    GATE_HEADING, HOME_GATES, PROJECT_SECTOR_RADIUS, PROJECT_SECTOR_SLOTS, SATELLITE_SLOTS,
+    default_sectors, formation_position, Aircraft, Airport, GroundSpot, Kind, ModelClass, Sector,
+    State, World, GATE_HEADING, HOME_GATES, RUNWAY_HEADING, RUNWAY_THRESHOLD, PROJECT_SECTOR_RADIUS, PROJECT_SECTOR_SLOTS, SATELLITE_SLOTS,
     TAXIWAY_QUEUE,
 };
 use crate::ws::{ClientFrame, SharedWorld};
@@ -445,10 +445,38 @@ fn poll_subagents(parent_thread_ids: &HashSet<String>, now: i64) -> Vec<Subagent
         .collect()
 }
 
+/// SQL predicate over `t.payload_json`: the thread is marked done (settled).
+const SETTLED_SQL: &str = "COALESCE(json_extract(t.payload_json, '$.settledOverride') = 'settled', 0) \
+     OR (json_extract(t.payload_json, '$.settledAt') IS NOT NULL \
+         AND (json_extract(t.payload_json, '$.unsettledAt') IS NULL \
+              OR json_extract(t.payload_json, '$.unsettledAt') < json_extract(t.payload_json, '$.settledAt')))";
+
+#[derive(Deserialize)]
+struct RetiredRow {
+    thread_id: String,
+}
+
+/// Threads marked done (settled) or archived in the last few minutes. Their
+/// aircraft fly away instead of vanishing.
+fn poll_retired() -> HashSet<String> {
+    let sql = format!(
+        "SELECT t.thread_id FROM orchestration_v2_projection_threads t \
+         WHERE t.deleted_at IS NULL AND ( \
+           t.archived_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes') \
+           OR (({SETTLED_SQL}) AND json_extract(t.payload_json, '$.settledAt') \
+               >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')));"
+    );
+    run_sqlite_json(&sql)
+        .filter(|raw| !raw.trim().is_empty())
+        .and_then(|raw| serde_json::from_str::<Vec<RetiredRow>>(&raw).ok())
+        .map(|rows| rows.into_iter().map(|r| r.thread_id).collect())
+        .unwrap_or_default()
+}
+
 /// Query recent threads across all projects from SQLite (fast), or fall back to
 /// `t3 thread list --json` for the current directory's project.
 fn poll_threads() -> Option<Vec<ThreadListEntry>> {
-    let sql = "SELECT t.thread_id, t.title, t.updated_at, \
+    let sql = &"SELECT t.thread_id, t.title, t.updated_at, \
                p.title AS project, \
                json_extract(t.payload_json, '$.modelSelection.model') AS model, \
                COALESCE((SELECT r.status FROM orchestration_v2_projection_runs r \
@@ -459,9 +487,11 @@ fn poll_threads() -> Option<Vec<ThreadListEntry>> {
                FROM orchestration_v2_projection_threads t \
                LEFT JOIN projection_projects p ON p.project_id = t.project_id \
                WHERE t.deleted_at IS NULL AND t.archived_at IS NULL \
+                 AND NOT (SETTLED) \
                  AND (json_extract(t.payload_json, '$.lineage.relationshipToParent') IS NULL \
                       OR json_extract(t.payload_json, '$.lineage.relationshipToParent') != 'subagent') \
-               ORDER BY t.updated_at DESC LIMIT 60;";
+               ORDER BY t.updated_at DESC LIMIT 60;"
+        .replace("SETTLED", SETTLED_SQL);
     if let Some(raw) = run_sqlite_json(sql) {
         if let Ok(entries) = serde_json::from_str::<Vec<ThreadListEntry>>(&raw) {
             if !entries.is_empty() {
@@ -498,6 +528,8 @@ struct PollData {
     taxiway: Vec<ThreadListEntry>,
     /// Stale (>24h untouched) threads parked at the extended terminal gates.
     stale: Vec<ThreadListEntry>,
+    /// Threads just marked done or archived: their aircraft fly away.
+    retired: HashSet<String>,
     subagents: Vec<SubagentRow>,
     now: i64,
 }
@@ -533,17 +565,62 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>) -> Opt
     let flying_ids: HashSet<String> = flying.iter().map(|(e, _)| e.thread_id.clone()).collect();
     let subagents = poll_subagents(&flying_ids, now);
 
+    let retired = poll_retired();
+
     Some(PollData {
         airports,
         flying,
         taxiway,
         stale,
+        retired,
         subagents,
         now,
     })
 }
 
+/// A thread left every pool. If it was just marked done (or archived) its
+/// aircraft flies away; otherwise (deleted, or squeezed out) it is removed.
+fn retire(world: &mut World, cs: &str, done: bool, events: &mut Vec<(String, String)>) {
+    if done {
+        if let Some(a) = world.get_mut(cs) {
+            a.leave();
+            events.push((cs.to_string(), "thread done — outbound, leaving the airspace".to_string()));
+            return;
+        }
+    }
+    world.remove_by_callsign(cs);
+}
+
+/// Hand a thread's existing airframe over from another pool to `new_cs`, so
+/// the client animates the move (approach, taxi, departure) instead of one
+/// plane vanishing and another appearing. Returns true if one was adopted.
+fn adopt(
+    world: &mut World,
+    thread_id: &str,
+    new_cs: &str,
+    others: &mut [&mut HashMap<String, String>],
+) -> bool {
+    let mut have = world.iter().any(|a| a.callsign == new_cs);
+    let mut adopted = false;
+    for map in others.iter_mut() {
+        let Some(old) = map.remove(thread_id) else { continue };
+        if !have {
+            if let Some(a) = world.get_mut(&old) {
+                a.callsign = new_cs.to_string();
+                have = true;
+                adopted = true;
+                continue;
+            }
+        }
+        world.remove_by_callsign(&old);
+    }
+    adopted
+}
+
 /// Reconcile the world in-memory from already-fetched `PollData`.
+/// On the `first_poll` aircraft appear in place; afterwards new working
+/// threads depart from the runway and every pool change is flown or taxied.
+#[allow(clippy::too_many_arguments)]
 fn apply_poll(
     world: &mut World,
     home_name: &str,
@@ -552,9 +629,14 @@ fn apply_poll(
     taxiway_cs: &mut TaxiwayCallsigns,
     gates: &mut GateCallsigns,
     wingmen: &mut Wingmen,
+    first_poll: bool,
 ) -> Vec<(String, String)> {
     world.airports = data.airports;
     let _ = data.now;
+    let taxi_ids: HashSet<String> = data.taxiway.iter().map(|e| e.thread_id.clone()).collect();
+    let stale_ids: HashSet<String> = data.stale.iter().map(|e| e.thread_id.clone()).collect();
+    let retired = data.retired;
+    let mut radio_events = Vec::new();
 
     let mut keep: HashMap<String, (State, Option<String>, Option<String>, ModelClass, String)> =
         HashMap::new();
@@ -609,26 +691,35 @@ fn apply_poll(
     let drop: Vec<String> = callsigns
         .by_thread
         .keys()
-        .filter(|id| !keep.contains_key(*id))
+        .filter(|id| {
+            !keep.contains_key(*id) && !taxi_ids.contains(*id) && !stale_ids.contains(*id)
+        })
         .cloned()
         .collect();
     for id in drop {
         if let Some(cs) = callsigns.by_thread.remove(&id) {
-            world.remove_by_callsign(&cs);
+            retire(world, &cs, retired.contains(&id), &mut radio_events);
         }
     }
 
     let mut order: Vec<String> = callsigns.by_thread.keys().cloned().collect();
     order.extend(new_threads.iter().map(|(id, _, _)| id.clone()));
-    let mut radio_events = Vec::new();
 
     for thread_id in &order {
         let Some((state, reason, title, _model_class, zone)) = keep.get(thread_id) else {
             continue;
         };
         let cs = callsigns.get(thread_id);
+        let adopted = adopt(
+            world,
+            thread_id,
+            &cs,
+            &mut [&mut taxiway_cs.by_thread, &mut gates.by_thread],
+        );
         if let Some(a) = world.get_mut(&cs) {
-            if a.state != *state {
+            if adopted {
+                radio_events.push((cs.clone(), "taxiing out for departure".to_string()));
+            } else if a.state != *state {
                 radio_events.push((
                     cs.clone(),
                     match state {
@@ -638,8 +729,7 @@ fn apply_poll(
                     },
                 ));
             }
-            a.state = *state;
-            a.hold_reason = reason.clone();
+            a.fly(*state, reason.clone());
             a.title = title.clone();
             a.topic = Some(zone.clone());
             a.model = models.get(thread_id).cloned().flatten();
@@ -649,28 +739,33 @@ fn apply_poll(
             a.title = Some(t.clone());
             a.model = models.get(thread_id).cloned().flatten();
             a.device = Some(home_name.to_string());
-            if let Some((_, reason, title, _, zone)) = keep.get(thread_id) {
-                a.hold_reason = reason.clone();
-                a.title = title.clone();
-                a.assign(zone);
+            a.title = title.clone();
+            a.assign(zone);
+            if first_poll {
+                a.place_on_pattern(&world.sectors);
+            } else {
+                // A newly started thread departs from the home runway.
+                a.position = [RUNWAY_THRESHOLD[0], RUNWAY_THRESHOLD[1], 0.0];
+                a.altitude = 0.0;
+                a.heading = RUNWAY_HEADING;
+                a.state = State::Ready;
+                radio_events.push((cs.clone(), "departing".to_string()));
             }
-            a.state = *state;
+            a.fly(*state, reason.clone());
             world.add(a);
         }
     }
 
     // --- Taxiway Alpha Departure Queue: recent (<24h) non-working threads waiting for takeoff ---
-    let taxi_ids: HashSet<String> = data.taxiway.iter().map(|e| e.thread_id.clone()).collect();
     let taxi_drop: Vec<String> = taxiway_cs
         .by_thread
         .keys()
-        .filter(|id| !taxi_ids.contains(*id))
+        .filter(|id| !taxi_ids.contains(*id) && !stale_ids.contains(*id) && !keep.contains_key(*id))
         .cloned()
         .collect();
     for id in taxi_drop {
         if let Some(cs) = taxiway_cs.by_thread.remove(&id) {
-            world.remove_by_callsign(&cs);
-            radio_events.push((cs, "cleared for departure".to_string()));
+            retire(world, &cs, retired.contains(&id), &mut radio_events);
         }
     }
 
@@ -679,14 +774,25 @@ fn apply_poll(
         let (slot_pos, slot_hdg) = TAXIWAY_QUEUE[i % TAXIWAY_QUEUE.len()];
         let (_, reason) = flight_state(&entry.status, entry.pending);
         let (zone, _) = classify_zone(entry.project.as_deref(), &entry.title);
+        let adopted = adopt(
+            world,
+            &entry.thread_id,
+            &cs,
+            &mut [&mut callsigns.by_thread, &mut gates.by_thread],
+        );
         if let Some(a) = world.get_mut(&cs) {
+            if adopted {
+                let what = if matches!(a.state, State::Cruising | State::Holding | State::Landing) {
+                    "on approach for Taxiway Alpha"
+                } else {
+                    "taxiing to Taxiway Alpha"
+                };
+                radio_events.push((cs.clone(), what.to_string()));
+            }
             a.title = Some(entry.title.clone());
-            a.hold_reason = reason;
             a.topic = Some(zone);
-            a.state = State::Ready;
-            a.position = [slot_pos[0], slot_pos[1], 0.0];
-            a.altitude = 0.0;
-            a.heading = slot_hdg;
+            a.park_at(GroundSpot { pos: slot_pos, heading: slot_hdg, state: State::Ready });
+            a.hold_reason = reason;
             a.model = entry.model.clone();
             a.device = Some(home_name.to_string());
         } else {
@@ -706,29 +812,33 @@ fn apply_poll(
     }
 
     // --- Extended Terminal Gates: STRICTLY threads untouched for >24 hours ---
-    let stale_ids: HashSet<String> = data.stale.iter().map(|e| e.thread_id.clone()).collect();
     let gate_drop: Vec<String> = gates
         .by_thread
         .keys()
-        .filter(|id| !stale_ids.contains(*id))
+        .filter(|id| !stale_ids.contains(*id) && !taxi_ids.contains(*id) && !keep.contains_key(*id))
         .cloned()
         .collect();
     for id in gate_drop {
         if let Some(cs) = gates.by_thread.remove(&id) {
-            world.remove_by_callsign(&cs);
-            radio_events.push((cs, "pushing back from gate".to_string()));
+            retire(world, &cs, retired.contains(&id), &mut radio_events);
         }
     }
 
     for (i, entry) in data.stale.iter().enumerate() {
         let cs = gates.get(&entry.thread_id);
         let slot = HOME_GATES[i % HOME_GATES.len()];
+        let adopted = adopt(
+            world,
+            &entry.thread_id,
+            &cs,
+            &mut [&mut callsigns.by_thread, &mut taxiway_cs.by_thread],
+        );
         if let Some(a) = world.get_mut(&cs) {
+            if adopted {
+                radio_events.push((cs.clone(), format!("taxiing to gate {}", i + 1)));
+            }
             a.title = Some(entry.title.clone());
-            a.state = State::Parked;
-            a.position = [slot[0], slot[1], 0.0];
-            a.altitude = 0.0;
-            a.heading = GATE_HEADING;
+            a.park_at(GroundSpot { pos: slot, heading: GATE_HEADING, state: State::Parked });
             a.model = entry.model.clone();
             a.device = Some(home_name.to_string());
         } else {
@@ -814,6 +924,14 @@ fn apply_poll(
         .collect();
     for id in drop_subs {
         if let Some((cs, _)) = wingmen.by_subagent.remove(&id) {
+            // Wingmen of a done thread are already peeling off with it.
+            let parent_id = world.iter().find(|a| a.callsign == cs).and_then(|a| a.parent_id);
+            let leaving = world.iter().any(|a| {
+                (a.callsign == cs || Some(a.id) == parent_id) && a.state == State::Outbound
+            });
+            if leaving {
+                continue;
+            }
             world.remove_by_callsign(&cs);
             radio_events.push((cs, "breaking formation — RTB".to_string()));
         }
@@ -830,6 +948,7 @@ pub async fn run(world: SharedWorld, mut rx: mpsc::Receiver<ClientFrame>) {
     let mut taxiway_cs = TaxiwayCallsigns::default();
     let mut gates = GateCallsigns::default();
     let mut wingmen = Wingmen::default();
+    let mut first_poll = true;
 
     // Set home airport immediately before first poll returns.
     {
@@ -889,7 +1008,9 @@ pub async fn run(world: SharedWorld, mut rx: mpsc::Receiver<ClientFrame>) {
                     &mut taxiway_cs,
                     &mut gates,
                     &mut wingmen,
+                    first_poll,
                 );
+                first_poll = false;
                 for (cs, what) in &events {
                     tracing::info!(callsign = cs, what, "t3 aircraft update");
                 }

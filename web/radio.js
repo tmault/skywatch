@@ -169,6 +169,7 @@ export function stateColor(state) {
     case 'ready': return '#ff8c42';
     case 'takeoff':
     case 'landing': return '#35d6e8';
+    case 'outbound': return '#9be59b';
     default: return '#ffffff';
   }
 }
