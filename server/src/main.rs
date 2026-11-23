@@ -1,3 +1,4 @@
+mod seed;
 mod world;
 mod ws;
 
@@ -26,7 +27,32 @@ async fn main() {
 
     let world: SharedWorld = Arc::new(Mutex::new(World::new()));
     let (deltas, _delta_rx) = broadcast::channel::<String>(BROADCAST_CAPACITY);
-    let (adapter_tx, adapter_rx) = mpsc::channel(ADAPTER_CHANNEL_BUFFER);
+    let (adapter_tx, mut adapter_rx) = mpsc::channel(ADAPTER_CHANNEL_BUFFER);
+
+    // Demo mode: seed a fixed cast and run the scripted state machine.
+    // SKYWATCH_DEMO=0 disables; unset or any other value enables it for now.
+    let demo_mode = match std::env::var("SKYWATCH_DEMO").as_deref() {
+        Ok("0") | Ok("false") => false,
+        _ => true,
+    };
+    if demo_mode {
+        {
+            let mut w = world.lock().await;
+            seed::seed(&mut w);
+            tracing::info!(count = w.iter().count(), "demo world seeded");
+        }
+        {
+            let world = Arc::clone(&world);
+            tokio::spawn(seed::run_script(world));
+        }
+        // Drain client frames so the channel keeps working; the ws layer has
+        // already applied world effects (e.g. approve releases the aircraft).
+        tokio::spawn(async move {
+            while let Some(frame) = adapter_rx.recv().await {
+                tracing::debug!(?frame, "demo adapter: frame dropped");
+            }
+        });
+    }
 
     // Sim ticker: advance the world at 20 Hz and broadcast full snapshots.
     {
@@ -48,7 +74,7 @@ async fn main() {
         });
     }
 
-    // TODO(Task 4): adapters consume `adapter_rx`.
+    // TODO(Task 4): real adapters replace the demo drain above.
 
     // Serve the browser client; unknown paths fall back to index.html with 200.
     let web_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
