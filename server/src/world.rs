@@ -20,11 +20,25 @@ pub enum State {
     Landing,
 }
 
+/// The class of model powering an agent: local props vs frontier jets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelClass {
+    /// Little private plane: local model (e.g. Ollama on the devbox).
+    #[default]
+    Local,
+    /// Big jet: frontier model (e.g. Claude, GPT).
+    Frontier,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Aircraft {
     pub id: u64,
     pub callsign: String,
     pub kind: Kind,
+    /// Airframe class: what model powers this agent (agents only).
+    #[serde(default)]
+    pub model_class: ModelClass,
     pub state: State,
     pub position: [f32; 3],
     pub heading: f32,
@@ -43,7 +57,8 @@ fn default_speed() -> f32 {
 const AREA_SIZE: f32 = 1000.0;
 const TAKEOFF_RATE: f32 = 5.0; // m/s climb
 const CRUISE_ALTITUDE: f32 = 120.0;
-const AGENT_SPEED: f32 = 20.0; // m/s
+const AGENT_SPEED: f32 = 20.0; // m/s, local models
+const FRONTIER_SPEED: f32 = 32.0; // m/s, frontier jets are faster
 const DRONE_SPEED: f32 = 6.0; // m/s, drones always slow loiter
 const ORBIT_RADIUS: f32 = 40.0;
 const HOLD_TURN_RATE: f32 = 0.4; // rad/s turn rate while holding
@@ -54,15 +69,22 @@ static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 impl Aircraft {
     /// New aircraft with a random-ish start position, cruising.
     pub fn new(callsign: &str, kind: Kind) -> Self {
+        Self::with_model(callsign, kind, ModelClass::Local)
+    }
+
+    /// New aircraft with an explicit model class.
+    pub fn with_model(callsign: &str, kind: Kind, model_class: ModelClass) -> Self {
         let mut rng = rand::thread_rng();
-        let speed = match kind {
-            Kind::Agent => AGENT_SPEED,
-            Kind::Drone => DRONE_SPEED,
+        let speed = match (kind, model_class) {
+            (Kind::Agent, ModelClass::Frontier) => FRONTIER_SPEED,
+            (Kind::Agent, ModelClass::Local) => AGENT_SPEED,
+            (Kind::Drone, _) => DRONE_SPEED,
         };
         Aircraft {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             callsign: callsign.to_string(),
             kind,
+            model_class,
             state: State::Cruising,
             position: [
                 rng.gen_range(0.0..AREA_SIZE),

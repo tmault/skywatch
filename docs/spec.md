@@ -15,6 +15,14 @@ devbox in Tower, viewable in a browser.
 | **Landed plane** | Blocked / failed agent, waiting to take off | Parked on the apron, engine off |
 | **Cruising plane** | Healthy, working agent | Straight-and-level transit across the sky |
 
+**Airframe class reflects the model powering the agent:**
+
+| Airframe | Model class |
+|---|---|
+| **Little private plane** (single prop) | Local model (e.g. Ollama on the devbox) |
+| **Big jet** (twin-engine airliner) | Frontier model (e.g. Claude, GPT) |
+| **Reaper drone** | Monitoring/scheduled (regardless of model) |
+
 State changes move the aircraft: an agent that asks a question peels off into a
 holding pattern; an approval received lines it up for takeoff and it climbs back
 to cruise.
@@ -64,7 +72,7 @@ a possible v2 — the WebSocket protocol is the boundary that keeps that door op
 
 ## Data model (v1)
 
-- `Aircraft { id, callsign, kind: Agent|Drone, state: Cruising|Holding|Landed|Takeoff|Landing, position, heading, altitude, owner: Ref }`
+- `Aircraft { id, callsign, kind: Agent|Drone, model_class: Local|Frontier, state: Cruising|Holding|Landed|Takeoff|Landing, position, heading, altitude, owner: Ref }`
 - `RadioMessage { id, aircraft_id, from: Pilot|Tower|You|Agent, text, at, kind: Chatter|Attention|Instruction }`
 - `WorldSnapshot { aircraft: [Aircraft], messages: [RadioMessage] }` — full snapshot on connect, deltas after.
 

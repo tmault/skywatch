@@ -77,27 +77,103 @@ scene.add(sun);
 // first sight and driven by snapshots with exponential smoothing.
 const meshes = new Map();
 
+// Little private plane (single prop): local models. Points along +Z.
 function makeAgentMesh() {
   const group = new THREE.Group();
   const mat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+  const darkMat = new THREE.MeshLambertMaterial({ color: 0x222831 });
+  const propMat = new THREE.MeshLambertMaterial({
+    color: 0x222831, transparent: true, opacity: 0.35, side: THREE.DoubleSide,
+  });
 
-  const fuselage = new THREE.Mesh(new THREE.ConeGeometry(2.2, 12, 8), mat);
-  fuselage.rotation.x = Math.PI / 2; // point along +Z (heading axis)
+  // Cabin: rounded fuselage.
+  const fuselage = new THREE.Mesh(new THREE.CapsuleGeometry(1.3, 7, 6, 10), mat);
+  fuselage.rotation.x = Math.PI / 2; // along Z
+  fuselage.position.z = -1;
   group.add(fuselage);
 
-  const wings = new THREE.Mesh(new THREE.BoxGeometry(16, 0.6, 3), mat);
-  wings.position.z = -1;
+  // Nose cone + spinner.
+  const nose = new THREE.Mesh(new THREE.ConeGeometry(1.3, 3.5, 10), mat);
+  nose.rotation.x = Math.PI / 2; // point along +Z
+  nose.position.z = 5.5;
+  group.add(nose);
+
+  // Tractor propeller at the nose (spinning disc).
+  const prop = new THREE.Mesh(new THREE.CircleGeometry(2.2, 14), propMat);
+  prop.position.z = 7.2;
+  group.add(prop);
+  prop.name = 'prop';
+
+  // High wing over the cabin.
+  const wings = new THREE.Mesh(new THREE.BoxGeometry(15, 0.4, 2.4), mat);
+  wings.position.set(0, 1.3, -0.5);
   group.add(wings);
 
-  const tail = new THREE.Mesh(new THREE.BoxGeometry(6, 0.5, 2.4), mat);
-  tail.position.set(0, 1.6, -5);
+  // Struts.
+  for (const side of [1, -1]) {
+    const strut = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.3, 2), darkMat);
+    strut.position.set(side * 4.5, 0.2, -0.5);
+    strut.rotation.z = side * 0.45;
+    group.add(strut);
+  }
+
+  // Tailplane + fin.
+  const tail = new THREE.Mesh(new THREE.BoxGeometry(6, 0.4, 2), mat);
+  tail.position.set(0, 0.6, -5.5);
   group.add(tail);
 
-  const fin = new THREE.Mesh(new THREE.BoxGeometry(0.5, 3, 2.4), mat);
-  fin.position.set(0, 1.8, -5);
+  const fin = new THREE.Mesh(new THREE.BoxGeometry(0.4, 2.6, 2), mat);
+  fin.position.set(0, 1.8, -5.8);
   group.add(fin);
 
-  return { group, materials: [mat] };
+  return { group, materials: [mat, darkMat, propMat] };
+}
+
+// Big twin-engine jet: frontier models. Points along +Z.
+function makeJetMesh() {
+  const group = new THREE.Group();
+  const mat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+  const darkMat = new THREE.MeshLambertMaterial({ color: 0x222831 });
+
+  // Long airliner fuselage.
+  const fuselage = new THREE.Mesh(new THREE.CapsuleGeometry(1.7, 20, 6, 10), mat);
+  fuselage.rotation.x = Math.PI / 2; // along Z
+  fuselage.position.z = -2;
+  group.add(fuselage);
+
+  // Cockpit nose cone.
+  const nose = new THREE.Mesh(new THREE.ConeGeometry(1.7, 4, 10), mat);
+  nose.rotation.x = Math.PI / 2;
+  nose.position.z = 11.5;
+  group.add(nose);
+
+  // Swept wings.
+  for (const side of [1, -1]) {
+    const wing = new THREE.Mesh(new THREE.BoxGeometry(13, 0.5, 4), mat);
+    wing.position.set(side * 6.5, -0.8, -2);
+    wing.rotation.y = side * -0.35; // sweep back
+    group.add(wing);
+  }
+
+  // Engines under the wings.
+  for (const side of [1, -1]) {
+    const engine = new THREE.Mesh(new THREE.CylinderGeometry(1.1, 1.1, 3.4, 10), darkMat);
+    engine.rotation.x = Math.PI / 2; // along Z
+    engine.position.set(side * 5.5, -2, 0.5);
+    group.add(engine);
+  }
+
+  // Tailplane + tall swept fin.
+  const tail = new THREE.Mesh(new THREE.BoxGeometry(9, 0.4, 2.6), mat);
+  tail.position.set(0, 1.2, -10);
+  group.add(tail);
+
+  const fin = new THREE.Mesh(new THREE.BoxGeometry(0.5, 5.5, 3.6), mat);
+  fin.position.set(0, 3.4, -10.5);
+  fin.rotation.x = -0.25;
+  group.add(fin);
+
+  return { group, materials: [mat, darkMat] };
 }
 
 // MQ-9-style drone: long fuselage, wide straight wings, inverted V-tail,
@@ -183,7 +259,9 @@ function makeHoldRing() {  const ring = new THREE.Mesh(
 function ensureMesh(a) {
   let entry = meshes.get(a.id);
   if (entry) return entry;
-  const built = a.kind === 'drone' ? makeDroneMesh() : makeAgentMesh();
+  const built = a.kind === 'drone'
+    ? makeDroneMesh()
+    : (a.model_class === 'frontier' ? makeJetMesh() : makeAgentMesh());
   built.group.scale.setScalar(5); // aircraft are visible from the tower view
   const label = makeLabel(a.callsign);
   built.group.add(label);
