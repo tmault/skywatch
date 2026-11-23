@@ -1,3 +1,5 @@
+mod world;
+
 use axum::{routing::get, Router};
 
 #[tokio::main]
