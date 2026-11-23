@@ -56,19 +56,86 @@ const sun = new THREE.DirectionalLight(0xffffff, 1.4);
 sun.position.set(300, 500, 200);
 scene.add(sun);
 
-// Ground plane + grid.
+// Sea + grid, and the island (home of the Tower).
 {
-  const ground = new THREE.Mesh(
+  const sea = new THREE.Mesh(
     new THREE.PlaneGeometry(WORLD_SIZE, WORLD_SIZE),
-    new THREE.MeshLambertMaterial({ color: 0x0d2b22 }),
+    new THREE.MeshLambertMaterial({ color: 0x0d2b3a }),
   );
-  ground.rotation.x = -Math.PI / 2;
-  ground.position.y = 0;
-  scene.add(ground);
+  sea.rotation.x = -Math.PI / 2;
+  sea.position.y = 0;
+  scene.add(sea);
 
-  const grid = new THREE.GridHelper(WORLD_SIZE, 40, 0x2f7f66, 0x1a4a3a);
+  const grid = new THREE.GridHelper(WORLD_SIZE, 40, 0x1f6f8f, 0x14455c);
   grid.position.y = 0.5;
   scene.add(grid);
+
+  // Island: irregular sand base with a grassy mound, near map centre.
+  const island = new THREE.Group();
+
+  const beach = new THREE.Mesh(
+    new THREE.CircleGeometry(110, 28),
+    new THREE.MeshLambertMaterial({ color: 0xc9b47a }),
+  );
+  beach.rotation.x = -Math.PI / 2;
+  beach.position.y = 0.6;
+  island.add(beach);
+
+  // Two overlapping grass blobs give an irregular coastline.
+  for (const [dx, dz, r] of [[-25, -15, 78], [30, 25, 62]]) {
+    const grass = new THREE.Mesh(
+      new THREE.CircleGeometry(r, 22),
+      new THREE.MeshLambertMaterial({ color: 0x3f7a45 }),
+    );
+    grass.rotation.x = -Math.PI / 2;
+    grass.position.set(dx, 1.2, dz);
+    island.add(grass);
+  }
+
+  // Low hill under the tower.
+  const hill = new THREE.Mesh(
+    new THREE.ConeGeometry(46, 18, 18),
+    new THREE.MeshLambertMaterial({ color: 0x35683b }),
+  );
+  hill.position.set(0, 8.5, 0);
+  island.add(hill);
+
+  // The Tower itself: dark base, cabin disc, radar bar.
+  const towerMat = new THREE.MeshLambertMaterial({ color: 0x25333d });
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(4, 6, 26, 10), towerMat);
+  base.position.set(0, 30, 0);
+  island.add(base);
+
+  const cabin = new THREE.Mesh(
+    new THREE.CylinderGeometry(11, 8, 7, 10),
+    new THREE.MeshLambertMaterial({ color: 0x8fb6c9 }),
+  );
+  cabin.position.set(0, 46, 0);
+  island.add(cabin);
+
+  const roof = new THREE.Mesh(
+    new THREE.ConeGeometry(12, 5, 10),
+    new THREE.MeshLambertMaterial({ color: 0x1d2830 }),
+  );
+  roof.position.set(0, 52, 0);
+  island.add(roof);
+
+  const radar = new THREE.Mesh(new THREE.BoxGeometry(9, 0.6, 1), towerMat);
+  radar.position.set(0, 56, 0);
+  radar.name = 'radar';
+  island.add(radar);
+
+  // Runway strip on the island for landed aircraft.
+  const runway = new THREE.Mesh(
+    new THREE.PlaneGeometry(16, 95),
+    new THREE.MeshLambertMaterial({ color: 0x2b2f36 }),
+  );
+  runway.rotation.x = -Math.PI / 2;
+  runway.position.set(55, 1.4, -20);
+  island.add(runway);
+
+  island.position.set(0, 0, 0);
+  scene.add(island);
 }
 
 /* ------------------------------------------------------ aircraft meshes */
@@ -496,7 +563,7 @@ function animate() {
     entry.heading += dh * k;
     entry.group.rotation.y = -entry.heading; // heading: radians, CCW in world
 
-    // Spin the pusher prop on drones.
+    // Spin the pusher prop on drones and the tower radar.
     const prop = entry.group.getObjectByName('prop');
     if (prop) prop.rotation.y = now * 30;
 
@@ -509,6 +576,10 @@ function animate() {
   }
 
   controls.update();
+
+  const radar = scene.getObjectByName('radar');
+  if (radar) radar.rotation.y = now * 0.8;
+
   renderer.render(scene, camera);
 }
 
