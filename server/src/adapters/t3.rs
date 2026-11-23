@@ -315,7 +315,7 @@ fn poll_threads() -> Option<Vec<ThreadListEntry>> {
                json_extract(t.payload_json, '$.modelSelection.model') AS model, \
                COALESCE((SELECT r.status FROM orchestration_v2_projection_runs r \
                          WHERE r.thread_id = t.thread_id \
-                         ORDER BY r.created_at DESC LIMIT 1), 'idle') AS status, \
+                         ORDER BY (r.completed_at IS NULL) DESC, r.ordinal DESC LIMIT 1), 'idle') AS status, \
                (SELECT COUNT(*) FROM orchestration_v2_projection_runtime_requests q \
                 WHERE q.thread_id = t.thread_id AND q.resolved_at IS NULL) AS pending \
                FROM orchestration_v2_projection_threads t \
