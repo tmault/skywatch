@@ -12,6 +12,7 @@ import {
   buildAlpineIsland, buildAlpineBackdrop, makeSwissFlag, updateAlpine, SWISS_RED,
 } from './alpine.js';
 import { addRunwayLights } from './runway-lights.js';
+import { makeAgentMesh, makeJetMesh, makeFighterMesh, makeDroneMesh } from './aircraft.js';
 
 const WORLD_SIZE = 820;
 const INTERP_RATE = 10; // exponential smoothing constant (per second)
@@ -558,477 +559,6 @@ function ensureSectors(sectors) {
 
 const meshes = new Map();
 
-// Helper: create an extruded flat airfoil/wing shape in the XZ plane (shape XY -> XZ, +Y -> +Z).
-function makePlanform(points, thickness, mat) {
-  const shape = new THREE.Shape();
-  points.forEach(([x, z], idx) => {
-    if (idx === 0) shape.moveTo(x, z);
-    else shape.lineTo(x, z);
-  });
-  shape.closePath();
-  const geo = new THREE.ExtrudeGeometry(shape, {
-    depth: thickness, bevelEnabled: true, bevelThickness: thickness * 0.25,
-    bevelSize: thickness * 0.2, bevelSegments: 2,
-  });
-  geo.rotateX(Math.PI / 2); // XY -> XZ with +Y mapping to +Z (forward)
-  geo.translate(0, thickness * 0.5, 0);
-  return new THREE.Mesh(geo, mat);
-}
-
-// Helper: extruded vertical fin in the YZ plane (shape X = Z forward, Y = up).
-function makeVerticalFin(points, thickness, mat) {
-  const shape = new THREE.Shape();
-  points.forEach(([z, y], idx) => {
-    if (idx === 0) shape.moveTo(z, y);
-    else shape.lineTo(z, y);
-  });
-  shape.closePath();
-  const geo = new THREE.ExtrudeGeometry(shape, {
-    depth: thickness, bevelEnabled: true, bevelThickness: thickness * 0.2,
-    bevelSize: thickness * 0.15, bevelSegments: 2,
-  });
-  geo.rotateY(-Math.PI / 2); // local +X -> +Z, local +Y -> +Y
-  geo.translate(thickness * 0.5, 0, 0);
-  return new THREE.Mesh(geo, mat);
-}
-
-// Wingtip navigation lights (port red, starboard green).
-function addNavLights(group, wingX, wingY, wingZ, disposeMaterials) {
-  const redMat = new THREE.MeshBasicMaterial({ color: 0xff3b3b });
-  const greenMat = new THREE.MeshBasicMaterial({ color: 0x3bff7c });
-  const port = new THREE.Mesh(new THREE.SphereGeometry(0.26, 8, 8), redMat);
-  port.position.set(-wingX, wingY, wingZ);
-  const stbd = new THREE.Mesh(new THREE.SphereGeometry(0.26, 8, 8), greenMat);
-  stbd.position.set(wingX, wingY, wingZ);
-  group.add(port, stbd);
-  disposeMaterials.push(redMat, greenMat);
-}
-
-// Little private plane (single prop, Cessna/Cirrus style): local models. Points along +Z.
-function makeAgentMesh() {
-  const group = new THREE.Group();
-  const bodyMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.38, metalness: 0.15 });
-  const accentMat = new THREE.MeshStandardMaterial({ color: 0x2b7cb3, roughness: 0.4, metalness: 0.2 });
-  const darkMat = new THREE.MeshStandardMaterial({ color: 0x1e2630, roughness: 0.45, metalness: 0.35 });
-  const glassMat = new THREE.MeshStandardMaterial({ color: 0x17314a, roughness: 0.12, metalness: 0.7 });
-  const propMat = new THREE.MeshBasicMaterial({
-    color: 0x1c2229, transparent: true, opacity: 0.28, side: THREE.DoubleSide,
-  });
-
-  // Sculpted lathe fuselage (nose -> cowl -> cabin -> tapered tailcone).
-  const profile = [
-    new THREE.Vector2(0.01, 6.7),
-    new THREE.Vector2(0.55, 6.2),
-    new THREE.Vector2(1.05, 5.2),
-    new THREE.Vector2(1.38, 3.6),
-    new THREE.Vector2(1.42, 0.8),
-    new THREE.Vector2(1.18, -1.6),
-    new THREE.Vector2(0.68, -4.4),
-    new THREE.Vector2(0.32, -6.2),
-    new THREE.Vector2(0.01, -6.6),
-  ];
-  const fuselageGeo = new THREE.LatheGeometry(profile, 18);
-  fuselageGeo.rotateX(Math.PI / 2); // Lathe Y -> +Z (nose at +6.7)
-  const fuselage = new THREE.Mesh(fuselageGeo, bodyMat);
-  group.add(fuselage);
-
-  // Subtle side livery cheatline.
-  for (const side of [1, -1]) {
-    const stripe = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.28, 7.6), accentMat);
-    stripe.position.set(side * 1.36, 0.15, 0.2);
-    group.add(stripe);
-  }
-
-  // Spinner cone + 3-blade tractor propeller.
-  const spinner = new THREE.Mesh(new THREE.ConeGeometry(0.52, 1.25, 14), accentMat);
-  spinner.rotation.x = Math.PI / 2;
-  spinner.position.z = 7.15;
-  group.add(spinner);
-
-  const prop = new THREE.Group();
-  const disc = new THREE.Mesh(new THREE.CircleGeometry(2.35, 20), propMat);
-  prop.add(disc);
-  for (let i = 0; i < 3; i++) {
-    const blade = new THREE.Mesh(new THREE.BoxGeometry(0.24, 2.25, 0.08), darkMat);
-    const a = (i / 3) * Math.PI * 2;
-    blade.position.set(Math.cos(a) * 1.1, Math.sin(a) * 1.1, 0);
-    blade.rotation.z = a - Math.PI / 2;
-    prop.add(blade);
-  }
-  prop.position.z = 7.25;
-  prop.name = 'prop';
-  group.add(prop);
-
-  // Fairing cabin roof + wrap-around cockpit glazing.
-  const cabinRoof = new THREE.Mesh(new THREE.BoxGeometry(1.75, 0.95, 3.2), bodyMat);
-  cabinRoof.position.set(0, 1.35, 0.6);
-  group.add(cabinRoof);
-
-  const windscreen = new THREE.Mesh(new THREE.BoxGeometry(1.62, 0.85, 0.18), glassMat);
-  windscreen.position.set(0, 1.35, 2.45);
-  windscreen.rotation.x = -0.68;
-  group.add(windscreen);
-
-  for (const side of [1, -1]) {
-    const sideWin = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.62, 2.7), glassMat);
-    sideWin.position.set(side * 0.92, 1.15, 0.55);
-    group.add(sideWin);
-  }
-
-  // Tapered high wings with dihedral & rounded wingtips.
-  for (const side of [1, -1]) {
-    const wPts = side > 0
-      ? [[0.4, 1.4], [7.6, 0.9], [8.0, 0.4], [7.6, -0.7], [0.4, -1.3]]
-      : [[-0.4, 1.4], [-7.6, 0.9], [-8.0, 0.4], [-7.6, -0.7], [-0.4, -1.3]];
-    const wing = makePlanform(wPts, 0.34, bodyMat);
-    wing.position.set(0, 1.82, 0.3);
-    wing.rotation.z = side * 0.05;
-    group.add(wing);
-
-    // Wing strut.
-    const strut = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 2.9, 6), darkMat);
-    strut.position.set(side * 2.45, 0.85, 0.4);
-    strut.rotation.z = side * -0.92;
-    group.add(strut);
-  }
-
-  // Tapered horizontal tailplane & swept vertical fin.
-  const hTail = makePlanform([
-    [0, 0.6], [3.1, -0.1], [3.0, -0.95], [0, -0.85],
-    [-3.0, -0.95], [-3.1, -0.1],
-  ], 0.24, bodyMat);
-  hTail.position.set(0, 0.35, -5.2);
-  group.add(hTail);
-
-  const fin = makeVerticalFin([
-    [-3.8, 0.35], [-5.3, 3.1], [-6.35, 3.0], [-6.2, 0.2],
-  ], 0.26, accentMat);
-  group.add(fin);
-
-  // Fixed tricycle landing gear with wheel pants.
-  for (const side of [1, -1]) {
-    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 1.35, 8), darkMat);
-    leg.position.set(side * 1.45, -1.25, 0.2);
-    leg.rotation.z = side * 0.25;
-    group.add(leg);
-
-    const spat = new THREE.Mesh(new THREE.CapsuleGeometry(0.36, 1.35, 6, 10), bodyMat);
-    spat.rotation.x = Math.PI / 2;
-    spat.position.set(side * 1.65, -1.82, 0.2);
-    group.add(spat);
-  }
-  const noseLeg = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 1.2, 8), darkMat);
-  noseLeg.position.set(0, -1.2, 4.1);
-  const noseWheel = new THREE.Mesh(new THREE.CapsuleGeometry(0.28, 0.9, 6, 8), bodyMat);
-  noseWheel.rotation.x = Math.PI / 2;
-  noseWheel.position.set(0, -1.78, 4.1);
-  group.add(noseLeg, noseWheel);
-
-  const disposeMaterials = [bodyMat, accentMat, darkMat, glassMat, propMat];
-  addNavLights(group, 7.9, 2.2, 0.6, disposeMaterials);
-
-  return { group, tintMaterials: [bodyMat], disposeMaterials, scale: 0.92, wheelDrop: 2.05 };
-}
-
-// Twin-engine frontier airliner (A320 / 787 silhouette): frontier models. Points along +Z.
-function makeJetMesh() {
-  const group = new THREE.Group();
-  const bodyMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.32, metalness: 0.25 });
-  const tailAccentMat = new THREE.MeshStandardMaterial({ color: 0x1e6da8, roughness: 0.35, metalness: 0.25 });
-  const darkMat = new THREE.MeshStandardMaterial({ color: 0x1f2731, roughness: 0.4, metalness: 0.5 });
-  const metalMat = new THREE.MeshStandardMaterial({ color: 0xb8c4cf, roughness: 0.25, metalness: 0.75 });
-  const glassMat = new THREE.MeshStandardMaterial({ color: 0x102233, roughness: 0.1, metalness: 0.85 });
-
-  // Sculpted continuous airliner fuselage (ogive nose -> cabin tube -> tapered tailcone).
-  const profile = [
-    new THREE.Vector2(0.01, 13.8),
-    new THREE.Vector2(0.65, 13.0),
-    new THREE.Vector2(1.25, 11.6),
-    new THREE.Vector2(1.68, 9.6),
-    new THREE.Vector2(1.78, 7.0),
-    new THREE.Vector2(1.78, -5.0),
-    new THREE.Vector2(1.45, -8.5),
-    new THREE.Vector2(0.85, -11.4),
-    new THREE.Vector2(0.28, -13.2),
-    new THREE.Vector2(0.01, -13.5),
-  ];
-  const fuseGeo = new THREE.LatheGeometry(profile, 22);
-  fuseGeo.rotateX(Math.PI / 2);
-  const fuselage = new THREE.Mesh(fuseGeo, bodyMat);
-  group.add(fuselage);
-
-  // Curved wrap-around flight-deck windscreen.
-  const visor = new THREE.Mesh(
-    new THREE.CylinderGeometry(1.52, 1.66, 0.72, 16, 1, false, -Math.PI * 0.42, Math.PI * 0.84),
-    glassMat,
-  );
-  visor.position.set(0, 0.55, 10.1);
-  visor.rotation.x = 0.22;
-  group.add(visor);
-
-  // Swept tapered airliner wings + upturned blended winglets.
-  for (const side of [1, -1]) {
-    const s = side;
-    const wing = makePlanform([
-      [s * 1.1, 2.8],
-      [s * 13.4, -3.5],
-      [s * 13.4, -4.9],
-      [s * 5.2, -3.2],
-      [s * 1.1, -3.4],
-    ], 0.44, bodyMat);
-    wing.position.set(0, -0.45, 0.4);
-    wing.rotation.z = s * 0.06;
-    group.add(wing);
-
-    // Blended winglet.
-    const winglet = makeVerticalFin([
-      [-3.1, -0.1], [-4.3, 2.1], [-4.95, 2.05], [-4.45, -0.1],
-    ], 0.22, tailAccentMat);
-    winglet.position.set(s * 13.25, 0.35, 0);
-    winglet.rotation.z = s * -0.18;
-    group.add(winglet);
-
-    // Pylon + high-bypass turbofan nacelle + silver intake lip + dark fan face.
-    const pylon = new THREE.Mesh(new THREE.BoxGeometry(0.42, 1.35, 2.6), metalMat);
-    pylon.position.set(s * 5.2, -1.0, 0.55);
-    group.add(pylon);
-
-    const nacelle = new THREE.Mesh(new THREE.CylinderGeometry(1.05, 0.92, 3.6, 16), bodyMat);
-    nacelle.rotation.x = Math.PI / 2;
-    nacelle.position.set(s * 5.2, -1.85, 1.15);
-    group.add(nacelle);
-
-    const intakeRing = new THREE.Mesh(new THREE.TorusGeometry(0.96, 0.14, 10, 18), metalMat);
-    intakeRing.position.set(s * 5.2, -1.85, 2.95);
-    group.add(intakeRing);
-
-    const fan = new THREE.Mesh(new THREE.CircleGeometry(0.88, 16), darkMat);
-    fan.position.set(s * 5.2, -1.85, 2.88);
-    group.add(fan);
-
-    const exhaust = new THREE.Mesh(new THREE.ConeGeometry(0.65, 1.1, 12), darkMat);
-    exhaust.rotation.x = -Math.PI / 2;
-    exhaust.position.set(s * 5.2, -1.85, -1.0);
-    group.add(exhaust);
-  }
-
-  // Swept horizontal tailplane.
-  const hTail = makePlanform([
-    [0, 1.1], [5.4, -1.4], [5.4, -2.5], [0, -1.7],
-    [-5.4, -2.5], [-5.4, -1.4],
-  ], 0.32, bodyMat);
-  hTail.position.set(0, 0.55, -10.8);
-  group.add(hTail);
-
-  // Tall swept vertical tail fin with airline color.
-  const vFin = makeVerticalFin([
-    [-7.4, 1.1], [-11.5, 6.7], [-13.2, 6.5], [-12.2, 0.4],
-  ], 0.42, tailAccentMat);
-  group.add(vFin);
-
-  const disposeMaterials = [bodyMat, tailAccentMat, darkMat, metalMat, glassMat];
-  addNavLights(group, 13.4, 0.4, -3.5, disposeMaterials);
-
-  return { group, tintMaterials: [bodyMat], disposeMaterials, scale: 0.72, wheelDrop: 2.15 };
-}
-
-// Sleek delta-wing fighter jet (F-22 / Rafale style): sub-agent wingman! Points along +Z.
-function makeFighterMesh() {
-  const group = new THREE.Group();
-  const bodyMat = new THREE.MeshStandardMaterial({ color: 0x7ce8ff, roughness: 0.3, metalness: 0.45 });
-  const darkMat = new THREE.MeshStandardMaterial({ color: 0x1a232e, roughness: 0.45, metalness: 0.55 });
-  const canopyMat = new THREE.MeshStandardMaterial({ color: 0xc29838, roughness: 0.12, metalness: 0.85 });
-  const burnerOuterMat = new THREE.MeshBasicMaterial({
-    color: 0x38d9ff, transparent: true, opacity: 0.8,
-  });
-  const burnerCoreMat = new THREE.MeshBasicMaterial({ color: 0xfff0b3 });
-
-  // Sharp needle radome + sleek chined fuselage.
-  const profile = [
-    new THREE.Vector2(0.01, 10.6),
-    new THREE.Vector2(0.42, 8.8),
-    new THREE.Vector2(0.95, 6.2),
-    new THREE.Vector2(1.25, 3.0),
-    new THREE.Vector2(1.32, -2.2),
-    new THREE.Vector2(1.18, -6.2),
-    new THREE.Vector2(0.01, -6.4),
-  ];
-  const fuseGeo = new THREE.LatheGeometry(profile, 14);
-  fuseGeo.rotateX(Math.PI / 2);
-  fuseGeo.scale(1.15, 0.78, 1.0); // wide sleek stealth cross-section
-  const fuselage = new THREE.Mesh(fuseGeo, bodyMat);
-  group.add(fuselage);
-
-  // Gold-tinted stealth bubble canopy.
-  const canopy = new THREE.Mesh(new THREE.CapsuleGeometry(0.65, 2.8, 8, 14), canopyMat);
-  canopy.rotation.x = Math.PI / 2;
-  canopy.scale.set(0.92, 0.75, 1.0);
-  canopy.position.set(0, 0.88, 3.0);
-  group.add(canopy);
-
-  // Side engine air intakes.
-  for (const side of [1, -1]) {
-    const intake = new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.72, 4.6), darkMat);
-    intake.position.set(side * 1.4, -0.12, 1.1);
-    group.add(intake);
-  }
-
-  // Cropped-delta swept wings + wingtip rails.
-  const wings = makePlanform([
-    [0, 3.4], [2.4, 2.2], [7.0, -3.2], [7.0, -4.6], [2.2, -4.2],
-    [0, -4.8],
-    [-2.2, -4.2], [-7.0, -4.6], [-7.0, -3.2], [-2.4, 2.2],
-  ], 0.28, bodyMat);
-  wings.position.set(0, -0.05, 0.1);
-  group.add(wings);
-
-  for (const side of [1, -1]) {
-    const rail = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 2.5, 6), darkMat);
-    rail.rotation.x = Math.PI / 2;
-    rail.position.set(side * 7.05, -0.05, -3.6);
-    group.add(rail);
-  }
-
-  // Forward swept canards.
-  const canards = makePlanform([
-    [0.9, 5.2], [3.2, 3.5], [3.0, 2.8], [0.9, 3.6],
-  ], 0.18, bodyMat);
-  const canardsL = makePlanform([
-    [-0.9, 5.2], [-3.2, 3.5], [-3.0, 2.8], [-0.9, 3.6],
-  ], 0.18, bodyMat);
-  canards.position.y = 0.08;
-  canardsL.position.y = 0.08;
-  group.add(canards, canardsL);
-
-  // Twin outward-canted swept vertical stabilizers (extruded trapezoidal fins).
-  for (const side of [1, -1]) {
-    const fin = makeVerticalFin([
-      [-2.8, 0.3], [-5.2, 3.4], [-6.5, 3.2], [-5.9, 0.2],
-    ], 0.24, bodyMat);
-    fin.position.set(side * 1.35, 0.15, 0);
-    fin.rotation.z = side * -0.34;
-    group.add(fin);
-
-    // Twin nozzles + layered shock-diamond afterburner plumes.
-    const nozzle = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.56, 1.3, 10), darkMat);
-    nozzle.rotation.x = Math.PI / 2;
-    nozzle.position.set(side * 0.62, -0.05, -6.5);
-    group.add(nozzle);
-
-    const burner = new THREE.Group();
-    const outer = new THREE.Mesh(new THREE.ConeGeometry(0.44, 3.0, 10), burnerOuterMat);
-    outer.rotation.x = -Math.PI / 2;
-    outer.position.z = -1.5;
-    const inner = new THREE.Mesh(new THREE.ConeGeometry(0.24, 1.8, 8), burnerCoreMat);
-    inner.rotation.x = -Math.PI / 2;
-    inner.position.z = -0.9;
-    burner.add(outer, inner);
-    burner.position.set(side * 0.62, -0.05, -7.1);
-    burner.name = 'afterburner';
-    group.add(burner);
-  }
-
-  const disposeMaterials = [bodyMat, darkMat, canopyMat, burnerOuterMat, burnerCoreMat];
-  addNavLights(group, 7.05, 0.05, -3.9, disposeMaterials);
-
-  return { group, tintMaterials: [bodyMat], disposeMaterials, scale: 0.72, wheelDrop: 1.05 };
-}
-
-// MQ-9 Reaper drone: monitoring / scheduled tasks. Points along +Z.
-function makeDroneMesh() {
-  const group = new THREE.Group();
-  const bodyMat = new THREE.MeshStandardMaterial({ color: 0xd8e0e6, roughness: 0.45, metalness: 0.2 });
-  const darkMat = new THREE.MeshStandardMaterial({ color: 0x1d252e, roughness: 0.45, metalness: 0.45 });
-  const lensMat = new THREE.MeshBasicMaterial({ color: 0x35e8ff });
-  const rotorMat = new THREE.MeshBasicMaterial({
-    color: 0x1d252e, transparent: true, opacity: 0.3, side: THREE.DoubleSide,
-  });
-
-  // Slim fuselage tapering cleanly fore and aft.
-  const profile = [
-    new THREE.Vector2(0.01, 10.6),
-    new THREE.Vector2(0.62, 9.6),
-    new THREE.Vector2(1.08, 7.6),
-    new THREE.Vector2(1.18, 4.0),
-    new THREE.Vector2(1.02, -1.5),
-    new THREE.Vector2(0.75, -7.5),
-    new THREE.Vector2(0.42, -9.2),
-    new THREE.Vector2(0.01, -9.5),
-  ];
-  const fuseGeo = new THREE.LatheGeometry(profile, 16);
-  fuseGeo.rotateX(Math.PI / 2);
-  const fuselage = new THREE.Mesh(fuseGeo, bodyMat);
-  group.add(fuselage);
-
-  // Iconic MQ-9 bulbous satcom dome on the forward upper fuselage.
-  const dome = new THREE.Mesh(new THREE.SphereGeometry(1.38, 16, 12), bodyMat);
-  dome.scale.set(0.86, 0.72, 2.35);
-  dome.position.set(0, 0.55, 5.5);
-  group.add(dome);
-
-  // Dorsal turboprop air intake scoop at rear.
-  const scoop = new THREE.Mesh(new THREE.BoxGeometry(0.75, 0.65, 2.2), darkMat);
-  scoop.position.set(0, 1.05, -4.5);
-  group.add(scoop);
-
-  // Chin EO/IR gimbal sensor ball + glowing optical lens.
-  const turret = new THREE.Mesh(new THREE.SphereGeometry(0.85, 14, 12), darkMat);
-  turret.position.set(0, -1.15, 6.2);
-  group.add(turret);
-  const lens = new THREE.Mesh(new THREE.SphereGeometry(0.28, 10, 10), lensMat);
-  lens.position.set(0, -1.25, 6.95);
-  group.add(lens);
-
-  // High-aspect-ratio tapered Reaper wings + underwing pods.
-  const wings = makePlanform([
-    [0, 1.5], [13.2, 0.2], [13.2, -0.75], [0, -0.95],
-    [-13.2, -0.75], [-13.2, 0.2],
-  ], 0.26, bodyMat);
-  wings.position.set(0, 0.15, 0.4);
-  group.add(wings);
-
-  for (const side of [1, -1]) {
-    const pod = new THREE.Mesh(new THREE.CapsuleGeometry(0.28, 1.6, 6, 8), darkMat);
-    pod.rotation.x = Math.PI / 2;
-    pod.position.set(side * 4.4, -0.45, 0.4);
-    group.add(pod);
-  }
-
-  // Upward V-tail (signature MQ-9) + ventral fin.
-  for (const side of [1, -1]) {
-    const vfin = makeVerticalFin([
-      [-6.5, 0.2], [-8.4, 3.8], [-9.4, 3.7], [-8.6, 0.2],
-    ], 0.2, bodyMat);
-    vfin.position.set(side * 0.4, 0.2, 0);
-    vfin.rotation.z = side * -0.68;
-    group.add(vfin);
-  }
-  const ventral = makeVerticalFin([
-    [-6.8, -0.3], [-8.5, -2.0], [-9.2, -1.9], [-8.6, -0.3],
-  ], 0.18, bodyMat);
-  group.add(ventral);
-
-  // 4-blade pusher propeller at the rear.
-  const prop = new THREE.Group();
-  const disc = new THREE.Mesh(new THREE.CircleGeometry(2.3, 18), rotorMat);
-  prop.add(disc);
-  for (let i = 0; i < 4; i++) {
-    const blade = new THREE.Mesh(new THREE.BoxGeometry(0.2, 2.2, 0.08), darkMat);
-    const a = (i / 4) * Math.PI * 2;
-    blade.position.set(Math.cos(a) * 1.05, Math.sin(a) * 1.05, 0);
-    blade.rotation.z = a - Math.PI / 2;
-    prop.add(blade);
-  }
-  prop.position.set(0, 0.0, -9.6);
-  prop.name = 'prop';
-  group.add(prop);
-
-  const disposeMaterials = [bodyMat, darkMat, lensMat, rotorMat];
-  addNavLights(group, 13.2, 0.25, -0.2, disposeMaterials);
-
-  return { group, tintMaterials: [bodyMat], disposeMaterials, scale: 0.78, wheelDrop: 1.9 };
-}
-
 /* --------------------------------------------------------------- labels */
 
 // Clean banner sprite for airport and sector names. Airports pass a solid
@@ -1344,8 +874,9 @@ function makeContrailsFor(a) {
   }
   if (a.model_class === 'frontier') {
     // High-altitude frontier jets stream twin rich white contrails from both engines!
-    return [-5.2, 5.2].map((x) => new ContrailRibbon({
-      localOffset: [x, -1.85, -1.8],
+    // Offsets are in aircraft.js model space: nacelle exhausts / wingtips.
+    return [-4.6, 4.6].map((x) => new ContrailRibbon({
+      localOffset: [x, -1.8, -1.3],
       maxPoints: 120,
       sampleInterval: 0.13,
       startWidth: 0.85,
@@ -1355,8 +886,8 @@ function makeContrailsFor(a) {
     }));
   }
   // Local prop: subtle wingtip wisps.
-  return [-7.9, 7.9].map((x) => new ContrailRibbon({
-    localOffset: [x, 2.0, -0.6],
+  return [-7.8, 7.8].map((x) => new ContrailRibbon({
+    localOffset: [x, 1.75, 0.8],
     maxPoints: 34,
     sampleInterval: 0.12,
     startWidth: 0.25,
@@ -1371,10 +902,12 @@ function ensureMesh(a) {
   if (entry) return entry;
 
   let built;
-  if (a.kind === 'fighter') built = makeFighterMesh();
-  else if (a.kind === 'drone') built = makeDroneMesh();
-  else if (a.model_class === 'frontier') built = makeJetMesh();
-  else built = makeAgentMesh();
+  // Each airframe is painted in its model provider's livery.
+  if (a.kind === 'fighter') built = makeFighterMesh(a.model);
+  else if (a.kind === 'drone') built = makeDroneMesh(a.model);
+  else if (a.model_class === 'frontier') built = makeJetMesh(a.model);
+  else built = makeAgentMesh(a.model);
+  built.model = a.model ?? null;
 
   const s = built.scale;
   built.group.scale.setScalar(s);
@@ -1411,6 +944,8 @@ function ensureMesh(a) {
   built.model_class = a.model_class;
   built.ring = ring;
   built.contrails = makeContrailsFor(a);
+  built.prop = built.group.getObjectByName('prop');
+  built.gear = built.group.getObjectByName('gear');
 
   scene.add(built.group);
   meshes.set(a.id, entry = built);
@@ -1435,10 +970,11 @@ function disposeMesh(id) {
   entry.group.traverse((o) => {
     if (o.geometry) o.geometry.dispose();
     if (o.material && !entry.disposeMaterials.includes(o.material)) {
-      if (o.material.map) o.material.map.dispose();
+      if (o.material.map && !o.material.map.userData.shared) o.material.map.dispose();
       o.material.dispose();
     }
   });
+  // Livery textures are shared between aircraft; only materials are owned.
   for (const m of entry.disposeMaterials) m.dispose();
   if (entry.contrails) {
     for (const c of entry.contrails) c.dispose();
@@ -1608,6 +1144,8 @@ function applySnapshot(snapshot) {
 
   for (const a of aircraft) {
     seen.add(a.id);
+    // Repaint when the thread switches model (new livery).
+    if (meshes.has(a.id) && meshes.get(a.id).model !== (a.model ?? null)) disposeMesh(a.id);
     const entry = ensureMesh(a);
     const onGround = ['landed', 'taxi', 'ready', 'parked'].includes(a.state);
     const groundY = onGround ? TARMAC_TOP_Y + entry.wheelDrop : 0;
@@ -1774,9 +1312,13 @@ function animate() {
       }
     }
 
-    const prop = entry.group.getObjectByName('prop');
-    if (prop && entry.state !== 'parked' && entry.state !== 'landed') {
-      prop.rotation.z = now * 30;
+    if (entry.prop && entry.state !== 'parked' && entry.state !== 'landed') {
+      entry.prop.rotation.z = now * 30;
+    }
+
+    // Retract landing gear while en route.
+    if (entry.gear) {
+      entry.gear.visible = entry.state !== 'cruising' && entry.state !== 'holding';
     }
 
     if (entry.kind === 'fighter') {

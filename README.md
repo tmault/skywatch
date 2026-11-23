@@ -22,6 +22,7 @@ Open [http://localhost:8422](http://localhost:8422).
 
 - `SKYWATCH_T3=0` — Disable T3 adapter (falls back to demo mode).
 - `SKYWATCH_DEMO=0` — Disable demo seeding when T3 adapter is off.
+- `SKYWATCH_PORT=8423` — Listen on a different port (default `8422`).
 
 ## Tests
 

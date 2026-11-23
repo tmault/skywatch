@@ -44,17 +44,18 @@ pub fn seed(world: &mut World) {
     world.sectors = sectors;
 
     let callsigns = [
-        ("SKY1", Kind::Agent, ModelClass::Frontier, "Skywatch"),
-        ("SKY2", Kind::Agent, ModelClass::Local, "AI & Models"),
-        ("SKY3", Kind::Agent, ModelClass::Local, "Build"),
-        ("REAP1", Kind::Drone, ModelClass::Local, "Homelab"),
-        ("REAP2", Kind::Drone, ModelClass::Local, "Homelab"),
+        ("SKY1", Kind::Agent, ModelClass::Frontier, "Skywatch", "claude-opus-5-5"),
+        ("SKY2", Kind::Agent, ModelClass::Local, "AI & Models", "local-models/qwen3.8-27b"),
+        ("SKY3", Kind::Agent, ModelClass::Local, "Build", "ollama/deepseek-v4.1-flash"),
+        ("REAP1", Kind::Drone, ModelClass::Local, "Homelab", "gemini-4-argon"),
+        ("REAP2", Kind::Drone, ModelClass::Local, "Homelab", "gpt-6-luna"),
     ];
 
     let mut sky1_info = None;
 
-    for (i, (callsign, kind, model_class, sector)) in callsigns.iter().enumerate() {
+    for (i, (callsign, kind, model_class, sector, model)) in callsigns.iter().enumerate() {
         let mut a = Aircraft::with_model(callsign, *kind, *model_class);
+        a.model = Some((*model).to_string());
         a.position = POSITIONS[i];
         a.heading = HEADINGS[i];
         a.altitude = ALTITUDES[i];
@@ -89,21 +90,23 @@ pub fn seed(world: &mut World) {
             let start = formation_position(pos, heading, false, slot);
             let mut wing = Aircraft::wingman(&format!("SKY1-{suffix}"), pid, slot, start, heading);
             wing.title = Some(role.to_string());
+            wing.model = Some("claude-sonnet-5-5".to_string());
             wing.device = Some("omarchy".to_string());
             world.add(wing);
         }
     }
 
     // Seed two idle (>24h) threads parked neatly at the home airport gates.
-    for (i, (cs, title, mc)) in [
-        ("SKY4", "Weekend blog draft", ModelClass::Local),
-        ("SKY5", "Benchmark notes", ModelClass::Frontier),
+    for (i, (cs, title, mc, model)) in [
+        ("SKY4", "Weekend blog draft", ModelClass::Local, "opencode-go/glm-5.3-flash"),
+        ("SKY5", "Benchmark notes", ModelClass::Frontier, "gpt-6.1-sol"),
     ]
     .iter()
     .enumerate()
     {
         let gate = HOME_GATES[i];
         let mut a = Aircraft::with_model(cs, Kind::Agent, *mc);
+        a.model = Some((*model).to_string());
         a.state = State::Parked;
         a.position = [gate[0], gate[1], 0.0];
         a.altitude = 0.0;

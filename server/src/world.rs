@@ -97,6 +97,10 @@ pub struct Aircraft {
     /// Airframe class: what model powers this agent (agents only).
     #[serde(default)]
     pub model_class: ModelClass,
+    /// Raw model id (e.g. "claude-opus-5-5"); the client derives the
+    /// provider livery from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub state: State,
     /// `[x, z, altitude]` in world units (client maps to Three.js `(x, altitude, z)`).
     pub position: [f32; 3],
@@ -281,6 +285,7 @@ impl Aircraft {
             callsign: callsign.to_string(),
             kind,
             model_class,
+            model: None,
             state: State::Cruising,
             position: [
                 rng.gen_range(-AREA_SIZE * 0.35..AREA_SIZE * 0.35),

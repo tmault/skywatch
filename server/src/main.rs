@@ -126,7 +126,9 @@ async fn main() {
             }
         }));
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8422").await.unwrap();
-    tracing::info!("listening on 0.0.0.0:8422");
+    let port = std::env::var("SKYWATCH_PORT").unwrap_or_else(|_| "8422".to_string());
+    let addr = format!("0.0.0.0:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    tracing::info!("listening on {addr}");
     axum::serve(listener, app).await.unwrap();
 }

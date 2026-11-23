@@ -1,5 +1,7 @@
 // Radio panel: per-aircraft message history, text chat, approve/reject actions.
 
+import { liveryFor } from './livery.js';
+
 const panel = document.getElementById('radio-panel');
 const callsignEl = document.getElementById('radio-callsign');
 const kindEl = document.getElementById('radio-kind');
@@ -73,6 +75,12 @@ function render(a) {
   else airframe = 'AGENT · LOCAL PROP';
 
   const parts = [airframe];
+  if (a.model) {
+    // Generic liveries use the model name as their title; don't repeat it.
+    const { title, variant } = liveryFor(a.model);
+    const name = title === variant ? title : [title, variant].filter(Boolean).join(' ');
+    parts.push(name.toUpperCase());
+  }
   if (a.device) parts.push(a.device.toUpperCase());
   if (a.topic) parts.push(a.topic.toUpperCase());
   kindEl.textContent = parts.join(' · ');

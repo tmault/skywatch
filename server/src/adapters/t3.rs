@@ -81,6 +81,8 @@ struct SubagentRow {
     status: String,
     updated_at: Option<String>,
     title: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// Stable callsign allocation: thread id -> SKYn, in first-sight order.
@@ -410,7 +412,8 @@ fn poll_subagents(parent_thread_ids: &HashSet<String>, now: i64) -> Vec<Subagent
         .unwrap_or(SUBAGENT_LINGER_SECS);
 
     let sql = "SELECT s.subagent_id, s.thread_id, s.child_thread_id, s.status, s.updated_at, \
-               COALESCE(t.title, json_extract(s.payload_json, '$.title'), json_extract(s.payload_json, '$.role'), 'sub-agent') AS title \
+               COALESCE(t.title, json_extract(s.payload_json, '$.title'), json_extract(s.payload_json, '$.role'), 'sub-agent') AS title, \
+               json_extract(t.payload_json, '$.modelSelection.model') AS model \
                FROM orchestration_v2_projection_subagents s \
                LEFT JOIN orchestration_v2_projection_threads t ON t.thread_id = s.child_thread_id \
                ORDER BY s.updated_at DESC LIMIT 40;";
@@ -557,8 +560,10 @@ fn apply_poll(
         HashMap::new();
     let mut new_threads: Vec<(String, String, ModelClass)> = Vec::new();
     let mut active_projects: Vec<String> = Vec::new();
+    let mut models: HashMap<String, Option<String>> = HashMap::new();
 
     for (entry, pending) in &data.flying {
+        models.insert(entry.thread_id.clone(), entry.model.clone());
         let (state, reason) = flight_state(&entry.status, *pending);
         let (zone, is_project) = classify_zone(entry.project.as_deref(), &entry.title);
         if is_project && !active_projects.contains(&zone) {
@@ -637,10 +642,12 @@ fn apply_poll(
             a.hold_reason = reason.clone();
             a.title = title.clone();
             a.topic = Some(zone.clone());
+            a.model = models.get(thread_id).cloned().flatten();
             a.device = Some(home_name.to_string());
         } else if let Some((_, t, mc)) = new_threads.iter().find(|(id, _, _)| id == thread_id) {
             let mut a = Aircraft::with_model(&cs, Kind::Agent, *mc);
             a.title = Some(t.clone());
+            a.model = models.get(thread_id).cloned().flatten();
             a.device = Some(home_name.to_string());
             if let Some((_, reason, title, _, zone)) = keep.get(thread_id) {
                 a.hold_reason = reason.clone();
@@ -680,10 +687,12 @@ fn apply_poll(
             a.position = [slot_pos[0], slot_pos[1], 0.0];
             a.altitude = 0.0;
             a.heading = slot_hdg;
+            a.model = entry.model.clone();
             a.device = Some(home_name.to_string());
         } else {
             let mut a = Aircraft::with_model(&cs, Kind::Agent, model_class(&entry.model));
             a.title = Some(entry.title.clone());
+            a.model = entry.model.clone();
             a.hold_reason = reason;
             a.topic = Some(zone);
             a.state = State::Ready;
@@ -720,10 +729,12 @@ fn apply_poll(
             a.position = [slot[0], slot[1], 0.0];
             a.altitude = 0.0;
             a.heading = GATE_HEADING;
+            a.model = entry.model.clone();
             a.device = Some(home_name.to_string());
         } else {
             let mut a = Aircraft::with_model(&cs, Kind::Agent, model_class(&entry.model));
             a.title = Some(entry.title.clone());
+            a.model = entry.model.clone();
             a.state = State::Parked;
             a.position = [slot[0], slot[1], 0.0];
             a.altitude = 0.0;
@@ -754,8 +765,8 @@ fn apply_poll(
         let parent_info = world
             .iter()
             .find(|a| a.callsign == parent_cs)
-            .map(|a| (a.id, a.position, a.heading, a.state));
-        let Some((parent_id, p_pos, p_heading, p_state)) = parent_info else {
+            .map(|a| (a.id, a.position, a.heading, a.state, a.model.clone()));
+        let Some((parent_id, p_pos, p_heading, p_state, p_model)) = parent_info else {
             continue;
         };
         let on_ground = matches!(
@@ -774,15 +785,19 @@ fn apply_poll(
                 .by_subagent
                 .insert(sub.subagent_id.clone(), (cs.clone(), relay_tid));
 
+            // Wingmen wear their own model's livery, falling back to the parent's.
+            let model = sub.model.clone().or_else(|| p_model.clone());
             if let Some(a) = world.get_mut(&cs) {
                 a.parent_id = Some(parent_id);
                 a.wing_slot = Some(slot);
                 a.title = sub.title.clone();
+                a.model = model;
                 a.device = Some(home_name.to_string());
             } else {
                 let start = formation_position(p_pos, p_heading, on_ground, slot);
                 let mut fighter = Aircraft::wingman(&cs, parent_id, slot, start, p_heading);
                 fighter.title = sub.title.clone();
+                fighter.model = model;
                 fighter.device = Some(home_name.to_string());
                 world.add(fighter);
                 radio_events.push((cs, format!("scrambled on {parent_cs}'s wing")));
