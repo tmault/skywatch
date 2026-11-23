@@ -1481,6 +1481,7 @@ function animate() {
   const now = performance.now() / 1000;
   for (const entry of meshes.values()) {
     const wrapped = entry.group.position.distanceToSquared(entry.target) > 40000;
+    const prev = entry.group.position.clone();
     if (wrapped) {
       entry.group.position.copy(entry.target);
       if (entry.contrails) for (const c of entry.contrails) c.clear();
@@ -1504,6 +1505,29 @@ function animate() {
       : 0;
     entry.roll += (targetRoll - entry.roll) * (1 - Math.exp(-5 * dt));
     entry.group.rotation.z = entry.roll;
+
+    // Pitch the nose along the flight path: up on the climb-out, down on the
+    // descent, with a gentle flare in the last few units before touchdown.
+    entry.pitch ??= 0;
+    entry.climb ??= 0;
+    if (!wrapped && dt > 0.001) {
+      const vy = (entry.group.position.y - prev.y) / dt;
+      const vh = Math.hypot(entry.group.position.x - prev.x, entry.group.position.z - prev.z) / dt;
+      const flightPath = Math.atan2(vy, Math.max(vh, 4));
+      entry.climb += (flightPath - entry.climb) * (1 - Math.exp(-6 * dt));
+    }
+    let targetPitch = 0;
+    if (airborne) {
+      targetPitch = Math.max(-0.26, Math.min(0.3, entry.climb * 1.1));
+      const aboveDeck = entry.group.position.y - TARMAC_TOP_Y - entry.wheelDrop;
+      // Flare only while still in the air; on the rollout the nose settles.
+      if (entry.state === 'landing' && aboveDeck > 0.3 && aboveDeck < 8) {
+        targetPitch += 0.14 * (1 - Math.max(0, aboveDeck) / 8);
+      }
+    }
+    entry.pitch += (targetPitch - entry.pitch) * (1 - Math.exp(-4 * dt));
+    // Model nose is +Z; a negative X rotation raises it (YXZ order: yaw, pitch, roll).
+    entry.group.rotation.x = -entry.pitch;
 
     // Update contrail ribbons (emit only when airborne above ground).
     if (entry.contrails) {

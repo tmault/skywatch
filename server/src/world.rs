@@ -165,6 +165,13 @@ pub struct Aircraft {
     /// Leave the airspace after takeoff instead of rejoining the zone.
     #[serde(skip)]
     leaving: bool,
+    /// Tower clearance: this aircraft owns the runway (see `World::sequence_runway`).
+    #[serde(skip)]
+    has_runway: bool,
+    /// May enter the runway / start final this tick. Always true for an
+    /// aircraft ticked on its own; `World` grants it to one aircraft at a time.
+    #[serde(skip)]
+    runway_ok: bool,
     /// Ground speed in m/s (serde default keeps old snapshots deserialisable).
     #[serde(default = "default_speed")]
     pub speed: f32,
@@ -249,6 +256,16 @@ pub const FINAL_APPROACH_FIX: [f32; 2] = [56.0, 166.0];
 pub const FAF_ALTITUDE: f32 = 32.0;
 /// Touchdown point just past the threshold; rollout continues north.
 pub const TOUCHDOWN: [f32; 2] = [56.0, 38.0];
+/// Runway 36 strip extent: x = 56 ± half width, z from the north end to the south end.
+const RUNWAY_HALF_WIDTH: f32 = 11.0;
+const RUNWAY_NORTH_Z: f32 = -80.0;
+const RUNWAY_SOUTH_Z: f32 = 60.0;
+/// Departures wait this far short of the threshold until cleared on.
+const HOLD_SHORT_DIST: f32 = 18.0;
+/// Holding point on the runway entry taxiway, facing the runway.
+pub const HOLD_SHORT_POINT: [f32; 2] = [RUNWAY_THRESHOLD[0] + HOLD_SHORT_DIST, RUNWAY_THRESHOLD[1]];
+/// Arrivals ask the tower for the runway once this close to the FAF.
+const LANDING_REQUEST_DIST: f32 = 60.0;
 const TAXI_DELAY_AFTER_LANDING: f32 = 5.0; // s rolled out on runway, then taxi
 const HOLD_SHORT_TIME: f32 = 4.0; // s lined up before rolling
 
@@ -412,6 +429,8 @@ impl Aircraft {
             taxi_heading: None,
             ground_speed: 0.0,
             leaving: false,
+            has_runway: false,
+            runway_ok: true,
             speed,
         }
     }
@@ -589,6 +608,52 @@ impl Aircraft {
                 self.state = State::Outbound;
             }
         }
+    }
+
+    fn on_runway_strip(&self) -> bool {
+        (self.position[0] - RUNWAY_THRESHOLD[0]).abs() < RUNWAY_HALF_WIDTH
+            && (RUNWAY_NORTH_Z..=RUNWAY_SOUTH_Z).contains(&self.position[1])
+            && self.altitude < 30.0
+    }
+
+    fn dist_to_faf(&self) -> f32 {
+        (self.position[0] - FINAL_APPROACH_FIX[0]).hypot(self.position[1] - FINAL_APPROACH_FIX[1])
+    }
+
+    /// Physically using the runway: on the strip, or on final / rolling out.
+    pub fn occupies_runway(&self) -> bool {
+        match self.state {
+            State::Landing => matches!(self.approach, Some(Approach::Final | Approach::Rollout)),
+            State::Takeoff | State::Taxi | State::Ready | State::Landed => self.on_runway_strip(),
+            _ => false,
+        }
+    }
+
+    /// Still needs the runway clearance it holds: on it, cleared and taxiing
+    /// on, or about to turn final.
+    fn needs_runway(&self) -> bool {
+        self.occupies_runway()
+            || (self.cleared_for_takeoff && matches!(self.state, State::Taxi | State::Ready))
+            || (self.state == State::Landing
+                && self.approach == Some(Approach::Inbound)
+                && self.dist_to_faf() < LANDING_REQUEST_DIST + 20.0)
+    }
+
+    /// Asking the tower for the runway: `Some(priority)`, lower goes first.
+    /// Arrivals near the FAF beat departures holding short.
+    fn runway_request(&self) -> Option<f32> {
+        if self.state == State::Landing
+            && self.approach == Some(Approach::Inbound)
+            && self.dist_to_faf() < LANDING_REQUEST_DIST
+        {
+            return Some(self.dist_to_faf());
+        }
+        let at_hold_short = self.state == State::Taxi
+            && self.cleared_for_takeoff
+            && self.taxi_waypoints.first() == Some(&RUNWAY_THRESHOLD)
+            && (self.position[0] - RUNWAY_THRESHOLD[0]).hypot(self.position[1] - RUNWAY_THRESHOLD[1])
+                <= HOLD_SHORT_DIST + 0.5;
+        at_hold_short.then_some(1000.0 - self.ground_timer)
     }
 
     /// True once an outbound aircraft has flown off the edge of the map.
@@ -903,6 +968,15 @@ impl Aircraft {
                     let dx = target[0] - self.position[0];
                     let dy = target[1] - self.position[1];
                     let dist = dx.hypot(dy);
+                    if target == RUNWAY_THRESHOLD && !self.runway_ok {
+                        // Hold short until the tower clears us onto the runway.
+                        rem = rem.min(dist - HOLD_SHORT_DIST);
+                        if rem <= 0.0 {
+                            self.heading = dy.atan2(dx);
+                            self.ground_timer += dt;
+                            break;
+                        }
+                    }
                     if rem >= dist {
                         self.position[0] = target[0];
                         self.position[1] = target[1];
@@ -1005,9 +1079,14 @@ impl Aircraft {
                     .altitude
                     .min(ease_toward(self.altitude, want, DESCENT_RATE * dt));
                 self.position[2] = self.altitude;
-                if self.steer(&mut st, self.speed, dt) {
+                let at_faf = self.steer(&mut st, self.speed, dt);
+                if at_faf && self.runway_ok {
                     self.approach = Some(Approach::Final);
                 } else {
+                    if at_faf {
+                        // Runway busy: go round the intercept and try again.
+                        st.intercept = false;
+                    }
                     self.leg = Some(st);
                 }
             }
@@ -1179,6 +1258,7 @@ impl World {
     /// landed aircraft claim an unoccupied gate before taxiing, and fighter
     /// wingmen smoothly track their parent's wing formation.
     pub fn tick(&mut self, dt: f32) {
+        self.sequence_runway();
         let sectors = self.sectors.clone();
         for a in &mut self.aircraft {
             if a.parent_id.is_none() {
@@ -1278,6 +1358,42 @@ impl World {
 
         // Outbound aircraft that have flown off the map are gone.
         self.aircraft.retain(|a| !a.is_gone());
+    }
+
+    /// Tower: exactly one aircraft owns the runway at a time. Clearances are
+    /// released once the owner is off it; arrivals near the FAF go first,
+    /// then departures holding short in the order they arrived.
+    fn sequence_runway(&mut self) {
+        for a in &mut self.aircraft {
+            if a.has_runway && !a.needs_runway() {
+                a.has_runway = false;
+            }
+        }
+        if !self.aircraft.iter().any(|a| a.has_runway) {
+            let occupant = self
+                .aircraft
+                .iter_mut()
+                .find(|a| a.parent_id.is_none() && a.occupies_runway());
+            if let Some(a) = occupant {
+                a.has_runway = true;
+            }
+        }
+        if !self.aircraft.iter().any(|a| a.has_runway) {
+            let next = self
+                .aircraft
+                .iter()
+                .filter(|a| a.parent_id.is_none())
+                .filter_map(|a| a.runway_request().map(|p| (p, a.id)))
+                .min_by(|x, y| x.0.total_cmp(&y.0));
+            if let Some((_, id)) = next {
+                if let Some(a) = self.aircraft.iter_mut().find(|a| a.id == id) {
+                    a.has_runway = true;
+                }
+            }
+        }
+        for a in &mut self.aircraft {
+            a.runway_ok = a.has_runway || a.parent_id.is_some();
+        }
     }
 
     fn enforce_air_separation(&mut self, dt: f32) {
@@ -1738,5 +1854,40 @@ mod tests {
         fly_until_gone(&mut world, "SKY1", 120.0);
         fly_until_gone(&mut world, "SKY1-A", 120.0);
         assert!(world.aircraft.is_empty(), "everyone should have left");
+    }
+    #[test]
+    fn only_one_aircraft_ever_uses_the_runway() {
+        let sectors = default_sectors();
+        let mut world = World::new();
+        let names = ["Build", "Homelab", "AI & Models", "Research"];
+        for (i, sector) in names.iter().enumerate() {
+            let mut a = cruising_in(sector, ModelClass::Frontier, &sectors);
+            a.callsign = format!("ARR{i}");
+            let (slot, hdg) = TAXIWAY_QUEUE[i + 1];
+            a.park_at(GroundSpot { pos: slot, heading: hdg, state: State::Ready });
+            world.add(a);
+        }
+        for i in 0..3 {
+            let mut d = Aircraft::with_model(&format!("DEP{i}"), Kind::Agent, ModelClass::Local);
+            d.assign(names[i]);
+            d.state = State::Parked;
+            d.position = [HOME_GATES[i][0], HOME_GATES[i][1], 0.0];
+            d.altitude = 0.0;
+            d.release();
+            world.add(d);
+        }
+        let dt = 0.05;
+        for step in 0..(1500.0 / dt) as usize {
+            world.tick(dt);
+            let on: Vec<_> = world.iter().filter(|a| a.occupies_runway()).map(|a| a.callsign.clone()).collect();
+            assert!(on.len() <= 1, "step {step}: runway shared by {on:?}");
+        }
+        for a in world.iter() {
+            if a.callsign.starts_with("ARR") {
+                assert_eq!(a.state, State::Ready, "{} never reached its slot", a.callsign);
+            } else {
+                assert!(matches!(a.state, State::Cruising), "{} never departed ({:?})", a.callsign, a.state);
+            }
+        }
     }
 }

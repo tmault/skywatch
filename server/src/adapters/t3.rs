@@ -9,7 +9,7 @@
 
 use crate::world::{
     default_sectors, formation_position, Aircraft, Airport, GroundSpot, Kind, ModelClass, Sector,
-    State, World, GATE_HEADING, HOME_GATES, RUNWAY_HEADING, RUNWAY_THRESHOLD, PROJECT_SECTOR_RADIUS, PROJECT_SECTOR_SLOTS, SATELLITE_SLOTS,
+    State, World, GATE_HEADING, HOLD_SHORT_POINT, HOME_GATES, PROJECT_SECTOR_RADIUS, PROJECT_SECTOR_SLOTS, SATELLITE_SLOTS,
     TAXIWAY_QUEUE,
 };
 use crate::ws::{ClientFrame, SharedWorld};
@@ -744,10 +744,11 @@ fn apply_poll(
             if first_poll {
                 a.place_on_pattern(&world.sectors);
             } else {
-                // A newly started thread departs from the home runway.
-                a.position = [RUNWAY_THRESHOLD[0], RUNWAY_THRESHOLD[1], 0.0];
+                // A newly started thread departs from the home runway,
+                // appearing at the holding point to wait for its clearance.
+                a.position = [HOLD_SHORT_POINT[0], HOLD_SHORT_POINT[1], 0.0];
                 a.altitude = 0.0;
-                a.heading = RUNWAY_HEADING;
+                a.heading = std::f32::consts::PI;
                 a.state = State::Ready;
                 radio_events.push((cs.clone(), "departing".to_string()));
             }
