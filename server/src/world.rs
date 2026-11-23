@@ -124,9 +124,9 @@ pub struct Aircraft {
     /// Patrol orbit angle for sector-bound aircraft.
     #[serde(default)]
     patrol_angle: f32,
-    /// Ground-movement target (taxiing), not serialised.
+    /// Ordered ground-movement waypoints (taxiway routing), not serialised.
     #[serde(skip)]
-    taxi_target: Option<[f32; 2]>,
+    taxi_waypoints: Vec<[f32; 2]>,
     /// Where taxiing leads next (Ready at the runway, Parked at the gate).
     #[serde(skip)]
     taxi_next: Option<State>,
@@ -157,6 +157,8 @@ const HOLD_DRIFT_SPEED: f32 = 12.0; // m/s along the holding orbit
 pub const RUNWAY_MID: [f32; 2] = [66.0, -10.0];
 pub const RUNWAY_THRESHOLD: [f32; 2] = [66.0, 36.0];
 pub const RUNWAY_HEADING: f32 = -std::f32::consts::FRAC_PI_2; // rolling north (-Z)
+/// Yellow taxiway spine between the runway (x=66) and terminal gates (x=98).
+pub const TAXIWAY_X: f32 = 81.0;
 /// Six terminal gates along the eastern apron of the home island.
 pub const HOME_GATES: [[f32; 2]; 6] = [
     [98.0, -55.0],
@@ -239,7 +241,7 @@ impl Aircraft {
             wing_slot: None,
             orbit_center: None,
             patrol_angle: rng.gen_range(0.0..std::f32::consts::TAU),
-            taxi_target: None,
+            taxi_waypoints: Vec::new(),
             taxi_next: None,
             ground_timer: 0.0,
             speed,
@@ -271,17 +273,41 @@ impl Aircraft {
         self.hold_reason = Some(reason.to_string());
     }
 
-    /// Cleared for takeoff: taxi out, hold short, then roll.
+    /// Start taxiing to `dest` via the yellow taxiway centerline so aircraft
+    /// never cut diagonally across parked planes at neighboring gates.
+    pub fn taxi_to(&mut self, dest: [f32; 2], next_state: State) {
+        self.state = State::Taxi;
+        self.taxi_next = Some(next_state);
+        self.ground_timer = 0.0;
+        self.taxi_waypoints.clear();
+
+        let cur = [self.position[0], self.position[1]];
+        // Route via TAXIWAY_X unless already on the runway moving along it.
+        let same_lane = (cur[0] - dest[0]).abs() < 3.0;
+        if !same_lane {
+            if (cur[0] - TAXIWAY_X).abs() > 2.0 {
+                self.taxi_waypoints.push([TAXIWAY_X, cur[1]]);
+            }
+            if (cur[1] - dest[1]).abs() > 2.0 {
+                self.taxi_waypoints.push([TAXIWAY_X, dest[1]]);
+            }
+        }
+        self.taxi_waypoints.push(dest);
+    }
+
+    /// The final destination of any in-progress taxi, if taxiing.
+    pub fn taxi_destination(&self) -> Option<[f32; 2]> {
+        self.taxi_waypoints.last().copied()
+    }
+
+    /// Cleared for takeoff: taxi out via the taxiway, hold short, then roll.
     pub fn release(&mut self) {
         self.orbit_center = None;
         self.hold_reason = None;
         match self.state {
             // On the ground: taxi to the runway threshold first.
             State::Parked | State::Landed | State::Taxi => {
-                self.state = State::Taxi;
-                self.taxi_target = Some(RUNWAY_THRESHOLD);
-                self.taxi_next = Some(State::Ready);
-                self.ground_timer = 0.0;
+                self.taxi_to(RUNWAY_THRESHOLD, State::Ready);
             }
             // Already lined up: roll now.
             State::Ready => {
@@ -293,13 +319,15 @@ impl Aircraft {
         }
     }
 
-    /// Touch down: roll out, then taxi to a terminal gate.
+    /// Touch down: roll out, then wait for World::tick to assign a free gate.
     pub fn land(&mut self) {
         self.state = State::Landed;
         self.altitude = 0.0;
         self.position[2] = 0.0;
         self.hold_reason = None;
         self.orbit_center = None;
+        self.taxi_waypoints.clear();
+        self.taxi_next = None;
         // Touch down mid-runway, rolling north.
         self.position[0] = RUNWAY_MID[0];
         self.position[1] = RUNWAY_MID[1];
@@ -361,43 +389,45 @@ impl Aircraft {
                 self.position[1] = wrap_centered(self.position[1] + dy);
             }
             State::Landed => {
-                // Rolled out on the runway; after a short pause, taxi to a gate.
+                // Rolled out on the runway; World::tick assigns a free gate once
+                // the landing pause elapses so no two aircraft share a gate.
                 self.altitude = 0.0;
                 self.position[2] = 0.0;
                 self.ground_timer += dt;
-                if self.ground_timer >= TAXI_DELAY_AFTER_LANDING {
-                    let gate = HOME_GATES[(self.id as usize) % HOME_GATES.len()];
-                    self.taxi_target = Some(gate);
-                    self.taxi_next = Some(State::Parked);
-                    self.state = State::Taxi;
-                }
             }
             State::Taxi => {
                 self.altitude = 0.0;
                 self.position[2] = 0.0;
-                if let Some(target) = self.taxi_target {
+                let mut rem = TAXI_SPEED * dt;
+                while rem > 0.0 {
+                    let Some(&target) = self.taxi_waypoints.first() else {
+                        self.state = self.taxi_next.take().unwrap_or(State::Parked);
+                        break;
+                    };
                     let dx = target[0] - self.position[0];
                     let dy = target[1] - self.position[1];
                     let dist = dx.hypot(dy);
-                    let step = (TAXI_SPEED * dt).min(dist);
-                    if step >= dist {
+                    if rem >= dist {
                         self.position[0] = target[0];
                         self.position[1] = target[1];
-                        self.state = self.taxi_next.unwrap_or(State::Parked);
-                        self.taxi_target = None;
-                        self.ground_timer = 0.0;
-                        if self.state == State::Ready {
-                            self.heading = RUNWAY_HEADING;
-                        } else if self.state == State::Parked {
-                            self.heading = GATE_HEADING;
+                        rem -= dist;
+                        self.taxi_waypoints.remove(0);
+                        if self.taxi_waypoints.is_empty() {
+                            self.state = self.taxi_next.take().unwrap_or(State::Parked);
+                            self.ground_timer = 0.0;
+                            if self.state == State::Ready {
+                                self.heading = RUNWAY_HEADING;
+                            } else if self.state == State::Parked {
+                                self.heading = GATE_HEADING;
+                            }
+                            break;
                         }
                     } else {
                         self.heading = dy.atan2(dx);
-                        self.position[0] += dx / dist * step;
-                        self.position[1] += dy / dist * step;
+                        self.position[0] += dx / dist * rem;
+                        self.position[1] += dy / dist * rem;
+                        break;
                     }
-                } else {
-                    self.state = State::Parked;
                 }
             }
             State::Ready => {
@@ -515,12 +545,63 @@ impl World {
         self.aircraft.iter()
     }
 
+    /// Return true if `gate` is currently occupied or reserved by any aircraft
+    /// other than `exclude_id`.
+    pub fn is_gate_occupied(&self, gate: [f32; 2], exclude_id: Option<u64>) -> bool {
+        const CLEARANCE: f32 = 12.0;
+        self.aircraft.iter().any(|a| {
+            if Some(a.id) == exclude_id {
+                return false;
+            }
+            let at_gate = matches!(a.state, State::Parked | State::Landed | State::Taxi | State::Ready)
+                && (a.position[0] - gate[0]).hypot(a.position[1] - gate[1]) < CLEARANCE;
+            let reserved = a
+                .taxi_destination()
+                .map(|d| (d[0] - gate[0]).hypot(d[1] - gate[1]) < CLEARANCE)
+                .unwrap_or(false);
+            at_gate || reserved
+        })
+    }
+
+    /// Pick an unoccupied home terminal gate (rotating by `prefer_idx` for variety),
+    /// or `None` if every gate is full.
+    pub fn find_free_gate(&self, exclude_id: Option<u64>, prefer_idx: usize) -> Option<[f32; 2]> {
+        for offset in 0..HOME_GATES.len() {
+            let gate = HOME_GATES[(prefer_idx + offset) % HOME_GATES.len()];
+            if !self.is_gate_occupied(gate, exclude_id) {
+                return Some(gate);
+            }
+        }
+        None
+    }
+
     /// Advance every aircraft by `dt` seconds. Non-wingman aircraft move first,
-    /// then fighter wingmen smoothly track their parent's wing formation.
+    /// landed aircraft claim an unoccupied gate before taxiing, and fighter
+    /// wingmen smoothly track their parent's wing formation.
     pub fn tick(&mut self, dt: f32) {
         for a in &mut self.aircraft {
             if a.parent_id.is_none() {
                 a.tick(dt);
+            }
+        }
+
+        // Assign unoccupied gates to landed aircraft ready to clear the runway.
+        let ready_to_taxi: Vec<u64> = self
+            .aircraft
+            .iter()
+            .filter(|a| {
+                a.parent_id.is_none()
+                    && a.state == State::Landed
+                    && a.ground_timer >= TAXI_DELAY_AFTER_LANDING
+            })
+            .map(|a| a.id)
+            .collect();
+
+        for id in ready_to_taxi {
+            if let Some(gate) = self.find_free_gate(Some(id), id as usize) {
+                if let Some(a) = self.aircraft.iter_mut().find(|a| a.id == id) {
+                    a.taxi_to(gate, State::Parked);
+                }
             }
         }
 
@@ -647,5 +728,41 @@ mod tests {
         let expected = formation_position(p.position, p.heading, false, 0);
         let dist = (w.position[0] - expected[0]).hypot(w.position[1] - expected[1]);
         assert!(dist < 5.0, "wingman should track formation closely, dist={dist}");
+    }
+
+    #[test]
+    fn landed_aircraft_never_parks_on_occupied_gate() {
+        let mut world = World::new();
+        // Fill the first 5 gates with parked aircraft.
+        for i in 0..5 {
+            let mut p = Aircraft::new(&format!("GT{}", i + 1), Kind::Agent);
+            p.state = State::Parked;
+            p.position = [HOME_GATES[i][0], HOME_GATES[i][1], 0.0];
+            p.altitude = 0.0;
+            world.add(p);
+        }
+
+        // Land a plane — it must claim the only free gate (HOME_GATES[5]).
+        let mut arriving = Aircraft::new("SKY9", Kind::Agent);
+        arriving.land();
+        world.add(arriving);
+
+        for _ in 0..400 {
+            world.tick(0.1);
+        }
+        let sky9 = world.iter().find(|a| a.callsign == "SKY9").unwrap();
+        assert_eq!(sky9.state, State::Parked);
+        let d = (sky9.position[0] - HOME_GATES[5][0]).hypot(sky9.position[1] - HOME_GATES[5][1]);
+        assert!(d < 1.0, "SKY9 should park at the only free gate, got {:?}", sky9.position);
+
+        // Land another plane when ALL 6 gates are full — must stay Landed, never overlap!
+        let mut overflow = Aircraft::new("SKY10", Kind::Agent);
+        overflow.land();
+        world.add(overflow);
+        for _ in 0..200 {
+            world.tick(0.1);
+        }
+        let sky10 = world.iter().find(|a| a.callsign == "SKY10").unwrap();
+        assert_eq!(sky10.state, State::Landed, "must not park over an occupied gate");
     }
 }

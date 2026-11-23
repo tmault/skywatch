@@ -156,6 +156,7 @@ fn is_stale(updated_at: &Option<String>, now: i64) -> bool {
 }
 
 /// Gate slot i at the home device airport (6 gates along the terminal).
+#[cfg(test)]
 fn home_gate_slot(i: usize) -> [f32; 2] {
     HOME_GATES[i % HOME_GATES.len()]
 }
@@ -528,8 +529,23 @@ fn apply_poll(
         }
     }
 
-    // --- Terminal Gates: stale (>24h) threads parked nose-in at the home airport ---
-    let stale_ids: HashSet<String> = data.stale.iter().map(|e| e.thread_id.clone()).collect();
+    // --- Terminal Gates: idle/completed threads fill only remaining open gates ---
+    // Reserve gate capacity for any grounded/blocked active aircraft so arriving
+    // SKY planes always have an open gate to taxi into and never park over GT planes.
+    let grounded_sky = world
+        .iter()
+        .filter(|a| {
+            !a.callsign.starts_with("GT")
+                && a.parent_id.is_none()
+                && matches!(
+                    a.state,
+                    State::Landed | State::Taxi | State::Parked | State::Ready
+                )
+        })
+        .count();
+    let max_gt = HOME_GATES.len().saturating_sub(grounded_sky);
+    let stale_slice = &data.stale[..data.stale.len().min(max_gt)];
+    let stale_ids: HashSet<String> = stale_slice.iter().map(|e| e.thread_id.clone()).collect();
 
     let gate_drop: Vec<String> = gates
         .by_thread
@@ -540,22 +556,19 @@ fn apply_poll(
     for id in gate_drop {
         if let Some(cs) = gates.by_thread.remove(&id) {
             world.remove_by_callsign(&cs);
-            radio_events.push((cs, "pushing back from gate — returning to service".to_string()));
+            radio_events.push((cs, "vacating gate".to_string()));
         }
     }
 
-    for (i, entry) in data.stale.iter().enumerate() {
+    for (i, entry) in stale_slice.iter().enumerate() {
         let cs = gates.get(&entry.thread_id);
-        let slot = home_gate_slot(i);
         if let Some(a) = world.get_mut(&cs) {
             a.title = Some(entry.title.clone());
-            a.position[0] = slot[0];
-            a.position[1] = slot[1];
             a.position[2] = 0.0;
             a.altitude = 0.0;
             a.heading = GATE_HEADING;
             a.device = Some(home_name.to_string());
-        } else {
+        } else if let Some(slot) = world.find_free_gate(None, i) {
             let mut a = Aircraft::with_model(&cs, Kind::Agent, model_class(&entry.model));
             a.title = Some(entry.title.clone());
             a.state = State::Parked;
