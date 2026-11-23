@@ -137,6 +137,10 @@ pub struct Aircraft {
     /// Ground timer: auto-taxi after landing, hold-short before takeoff.
     #[serde(skip)]
     ground_timer: f32,
+    /// Smooth TCAS collision-avoidance offset `[dx, dz, dalt]` applied over nominal
+    /// flight paths and decayed gently once clear of traffic.
+    #[serde(skip)]
+    sep_offset: [f32; 3],
     /// Ground speed in m/s (serde default keeps old snapshots deserialisable).
     #[serde(default = "default_speed")]
     pub speed: f32,
@@ -149,15 +153,21 @@ fn default_speed() -> f32 {
 /// Sim area is 820x820; positions wrap around at the edges.
 const AREA_SIZE: f32 = 820.0;
 const TAKEOFF_RATE: f32 = 6.0; // m/s climb
-const FRONTIER_ALTITUDE: f32 = 152.0; // high-altitude jet flight level
-const LOCAL_ALTITUDE: f32 = 92.0;     // mid-altitude private prop level
-const DRONE_ALTITUDE: f32 = 60.0;     // low-mid surveillance drone level
+const FRONTIER_ALTITUDE: f32 = 148.0; // high-altitude jet flight levels (148..198)
+const LOCAL_ALTITUDE: f32 = 88.0;     // mid-altitude private prop levels (88..128)
+const DRONE_ALTITUDE: f32 = 56.0;     // low-mid surveillance drone levels (56..72)
 const AGENT_SPEED: f32 = 10.5;        // m/s, calm scenic prop cruise
 const FRONTIER_SPEED: f32 = 14.0;     // m/s, majestic high-altitude jet cruise
 const DRONE_SPEED: f32 = 5.5;         // m/s, slow Reaper loiter
 const FIGHTER_SPEED: f32 = 36.0;      // m/s, wingman catch-up speed
 const HOLD_TURN_RADIUS: f32 = 78.0;   // m, wide calm holding orbit
 const HOLD_DRIFT_SPEED: f32 = 8.0;    // m/s along the holding orbit
+
+/// Airborne TCAS separation envelope (horizontal & vertical).
+const TCAS_HORIZ_BUFFER: f32 = 36.0; // begin smooth sidestep/climb below 36u horizontal
+const TCAS_VERT_BUFFER: f32 = 18.0;  // ...and within 18u vertical
+const TCAS_HARD_HORIZ: f32 = 28.0;   // hard minimum horizontal if within hard vertical
+const TCAS_HARD_VERT: f32 = 12.0;    // hard minimum vertical when crossing horizontally
 
 /// Home airport geometry (matches the client's island rendering).
 pub const RUNWAY_MID: [f32; 2] = [56.0, -10.0];
@@ -238,14 +248,14 @@ impl Aircraft {
     }
 
     /// Target cruise flight level based on airframe class (frontier jets fly higher,
-    /// with slight per-aircraft vertical RVSM separation).
+    /// with 6 distinct RVSM flight-level slots per class so aircraft naturally stack).
     pub fn cruise_altitude(&self) -> f32 {
         match (self.kind, self.model_class) {
-            (Kind::Drone, _) => DRONE_ALTITUDE + (self.id % 2) as f32 * 4.0,
+            (Kind::Drone, _) => DRONE_ALTITUDE + (self.id % 3) as f32 * 8.0,
             (Kind::Agent, ModelClass::Frontier) => {
-                FRONTIER_ALTITUDE + (self.id % 3) as f32 * 5.0
+                FRONTIER_ALTITUDE + (self.id % 6) as f32 * 10.0
             }
-            (Kind::Agent, ModelClass::Local) => LOCAL_ALTITUDE + (self.id % 3) as f32 * 4.0,
+            (Kind::Agent, ModelClass::Local) => LOCAL_ALTITUDE + (self.id % 6) as f32 * 8.0,
             (Kind::Fighter, _) => FRONTIER_ALTITUDE,
         }
     }
@@ -261,9 +271,9 @@ impl Aircraft {
             (Kind::Drone, _) => DRONE_SPEED,
         };
         let alt = match (kind, model_class) {
-            (Kind::Drone, _) => DRONE_ALTITUDE + (id % 2) as f32 * 4.0,
-            (Kind::Agent, ModelClass::Frontier) => FRONTIER_ALTITUDE + (id % 3) as f32 * 5.0,
-            (Kind::Agent, ModelClass::Local) => LOCAL_ALTITUDE + (id % 3) as f32 * 4.0,
+            (Kind::Drone, _) => DRONE_ALTITUDE + (id % 3) as f32 * 8.0,
+            (Kind::Agent, ModelClass::Frontier) => FRONTIER_ALTITUDE + (id % 6) as f32 * 10.0,
+            (Kind::Agent, ModelClass::Local) => LOCAL_ALTITUDE + (id % 6) as f32 * 8.0,
             (Kind::Fighter, _) => FRONTIER_ALTITUDE,
         };
         Aircraft {
@@ -291,6 +301,7 @@ impl Aircraft {
             taxi_next: None,
             cleared_for_takeoff: false,
             ground_timer: 0.0,
+            sep_offset: [0.0, 0.0, 0.0],
             speed,
         }
     }
@@ -504,11 +515,11 @@ impl Aircraft {
                         let vz = du * sr + dv * cr;
 
                         self.heading = vz.atan2(vx);
-                        self.position[0] = wrap_centered(sec.center[0] + ox);
-                        self.position[1] = wrap_centered(sec.center[1] + oz);
-                        // Gentle vertical breath while cruising.
+                        self.position[0] = wrap_centered(sec.center[0] + ox + self.sep_offset[0]);
+                        self.position[1] = wrap_centered(sec.center[1] + oz + self.sep_offset[1]);
+                        // Gentle vertical breath while cruising + TCAS altitude offset.
                         let wave = 2.5 * (2.0 * t).sin();
-                        self.altitude = base_alt + wave;
+                        self.altitude = (base_alt + wave + self.sep_offset[2]).max(30.0);
                         self.position[2] = self.altitude;
                         return;
                     }
@@ -818,6 +829,128 @@ impl World {
                 _ => State::Cruising,
             };
         }
+
+        // TCAS airborne separation: smoothly sidestep & climb/descend away from
+        // conflicting traffic, then enforce hard 3D clearance so no two airborne
+        // planes can ever overlap.
+        self.enforce_air_separation(dt);
+    }
+
+    fn enforce_air_separation(&mut self, dt: f32) {
+        let is_airborne = |s: State| {
+            matches!(
+                s,
+                State::Cruising | State::Holding | State::Takeoff | State::Landing
+            )
+        };
+        let is_formation_pair = |a: &Aircraft, b: &Aircraft| {
+            a.parent_id == Some(b.id)
+                || b.parent_id == Some(a.id)
+                || (a.parent_id.is_some() && a.parent_id == b.parent_id)
+        };
+
+        // Gently relax previous TCAS offsets back toward zero when clear.
+        let decay = (-0.45 * dt).exp();
+        for a in &mut self.aircraft {
+            if is_airborne(a.state) {
+                a.sep_offset[0] *= decay;
+                a.sep_offset[1] *= decay;
+                a.sep_offset[2] *= decay;
+            } else {
+                a.sep_offset = [0.0, 0.0, 0.0];
+            }
+        }
+
+        let n = self.aircraft.len();
+        let mut push: Vec<[f32; 3]> = vec![[0.0, 0.0, 0.0]; n];
+        let mut hard_alt: Vec<f32> = vec![0.0; n];
+
+        for i in 0..n {
+            if !is_airborne(self.aircraft[i].state) {
+                continue;
+            }
+            for j in (i + 1)..n {
+                if !is_airborne(self.aircraft[j].state) {
+                    continue;
+                }
+                if is_formation_pair(&self.aircraft[i], &self.aircraft[j]) {
+                    continue;
+                }
+
+                let mut dx = self.aircraft[j].position[0] - self.aircraft[i].position[0];
+                let mut dz = self.aircraft[j].position[1] - self.aircraft[i].position[1];
+                if dx > AREA_SIZE * 0.5 {
+                    dx -= AREA_SIZE;
+                } else if dx < -AREA_SIZE * 0.5 {
+                    dx += AREA_SIZE;
+                }
+                if dz > AREA_SIZE * 0.5 {
+                    dz -= AREA_SIZE;
+                } else if dz < -AREA_SIZE * 0.5 {
+                    dz += AREA_SIZE;
+                }
+                let hdist = dx.hypot(dz);
+                let dalt = self.aircraft[j].position[2] - self.aircraft[i].position[2];
+                let vdist = dalt.abs();
+
+                if hdist < TCAS_HORIZ_BUFFER && vdist < TCAS_VERT_BUFFER {
+                    // Lateral unit vector (deterministic fallback if exactly co-located).
+                    let (nx, nz) = if hdist > 0.1 {
+                        (dx / hdist, dz / hdist)
+                    } else {
+                        let ang = (self.aircraft[i].id as f32) * 2.1;
+                        (ang.cos(), ang.sin())
+                    };
+                    // Higher (or higher-ID tie-break) climbs, lower descends.
+                    let sign_v = if dalt > 0.01 {
+                        1.0
+                    } else if dalt < -0.01 {
+                        -1.0
+                    } else if self.aircraft[j].id >= self.aircraft[i].id {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+
+                    let urgency = (1.0 - hdist / TCAS_HORIZ_BUFFER)
+                        .max(1.0 - vdist / TCAS_VERT_BUFFER)
+                        .clamp(0.15, 1.0);
+                    let lat_step = 18.0 * urgency * dt;
+                    let vert_step = 14.0 * urgency * dt;
+
+                    push[i][0] -= nx * lat_step;
+                    push[i][1] -= nz * lat_step;
+                    push[i][2] -= sign_v * vert_step;
+                    push[j][0] += nx * lat_step;
+                    push[j][1] += nz * lat_step;
+                    push[j][2] += sign_v * vert_step;
+
+                    // Hard vertical safety floor whenever two planes cross tightly.
+                    if hdist < TCAS_HARD_HORIZ && vdist < TCAS_HARD_VERT {
+                        let need = (TCAS_HARD_VERT - vdist) * 0.5 + 0.5;
+                        hard_alt[i] -= sign_v * need;
+                        hard_alt[j] += sign_v * need;
+                    }
+                }
+            }
+        }
+
+        for i in 0..n {
+            if !is_airborne(self.aircraft[i].state) {
+                continue;
+            }
+            let a = &mut self.aircraft[i];
+            a.sep_offset[0] = (a.sep_offset[0] + push[i][0]).clamp(-32.0, 32.0);
+            a.sep_offset[1] = (a.sep_offset[1] + push[i][1]).clamp(-32.0, 32.0);
+            a.sep_offset[2] = (a.sep_offset[2] + push[i][2] + hard_alt[i]).clamp(-26.0, 36.0);
+
+            if push[i][0] != 0.0 || push[i][1] != 0.0 || push[i][2] != 0.0 || hard_alt[i] != 0.0 {
+                a.position[0] = wrap_centered(a.position[0] + push[i][0]);
+                a.position[1] = wrap_centered(a.position[1] + push[i][1]);
+                a.altitude = (a.altitude + push[i][2] + hard_alt[i]).max(30.0);
+                a.position[2] = a.altitude;
+            }
+        }
     }
 
     pub fn snapshot(&self) -> WorldSnapshot {
@@ -922,7 +1055,35 @@ mod tests {
         let jet = Aircraft::with_model("JET1", Kind::Agent, ModelClass::Frontier);
         let prop = Aircraft::with_model("PROP1", Kind::Agent, ModelClass::Local);
         let drone = Aircraft::with_model("REAP1", Kind::Drone, ModelClass::Local);
-        assert!(jet.cruise_altitude() > prop.cruise_altitude() + 30.0);
-        assert!(prop.cruise_altitude() > drone.cruise_altitude() + 20.0);
+        assert!(jet.cruise_altitude() > prop.cruise_altitude() + 20.0);
+        assert!(prop.cruise_altitude() > drone.cruise_altitude() + 15.0);
+    }
+
+    #[test]
+    fn airborne_planes_never_collide_on_crossing_paths() {
+        let mut world = World::new();
+        let mut a = Aircraft::with_model("SKY1", Kind::Agent, ModelClass::Frontier);
+        let mut b = Aircraft::with_model("SKY2", Kind::Agent, ModelClass::Frontier);
+        // Force both onto the exact same starting position, heading, and altitude.
+        a.position = [0.0, 0.0, 150.0];
+        a.altitude = 150.0;
+        a.heading = 0.0;
+        b.position = [0.0, 0.0, 150.0];
+        b.altitude = 150.0;
+        b.heading = 0.0;
+        world.add(a);
+        world.add(b);
+
+        for step in 0..200 {
+            world.tick(0.05);
+            let p1 = world.aircraft[0].position;
+            let p2 = world.aircraft[1].position;
+            let hdist = (p1[0] - p2[0]).hypot(p1[1] - p2[1]);
+            let vdist = (p1[2] - p2[2]).abs();
+            assert!(
+                hdist >= TCAS_HARD_HORIZ || vdist >= TCAS_HARD_VERT - 0.1,
+                "collision at step {step}: hdist={hdist:.2}, vdist={vdist:.2}"
+            );
+        }
     }
 }
