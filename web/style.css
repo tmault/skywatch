@@ -41,6 +41,17 @@ html, body {
 }
 #hud-status { font-size: 11px; opacity: 0.7; }
 #hud-status.error { color: #ff6a6a; opacity: 1; }
+#hud-follow {
+  pointer-events: auto;
+  font-size: 11px;
+  padding: 2px 10px;
+  border-color: rgba(53, 214, 232, 0.55);
+  background: rgba(10, 26, 38, 0.85);
+  color: var(--cyan);
+  letter-spacing: 0.04em;
+}
+#hud-follow[hidden] { display: none; }
+#hud-follow:hover { background: rgba(53, 214, 232, 0.2); }
 #hud-count { font-size: 11px; opacity: 0.6; margin-left: auto; }
 
 /* Radio panel */

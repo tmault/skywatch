@@ -18,10 +18,12 @@ const history = new Map();
 let selectedId = null;
 let onSend = null;
 let onApprove = null;
+let onClose = null;
 
-export function setupRadio({ send, approve }) {
+export function setupRadio({ send, approve, close }) {
   onSend = send;
   onApprove = approve;
+  onClose = close || null;
 }
 
 export function selectedAircraftId() {
@@ -49,8 +51,10 @@ export function closeRadio(note) {
   if (selectedId !== null && note) {
     appendHistory(selectedId, 'note', note);
   }
+  const wasOpen = selectedId !== null;
   selectedId = null;
   panel.hidden = true;
+  if (wasOpen && onClose) onClose();
 }
 
 export function updateRadio(aircraft) {

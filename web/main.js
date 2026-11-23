@@ -52,7 +52,7 @@ controls.target.set(0, 20, 0);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.maxPolarAngle = Math.PI / 2 - 0.05;
-controls.minDistance = 35;
+controls.minDistance = 18;
 controls.maxDistance = 950;
 
 // Three-point sky/sea lighting so curved aircraft fuselages and wings pop.
@@ -1163,6 +1163,82 @@ function unpinHold(aircraftId) {
 
 const statusEl = document.getElementById('hud-status');
 const countEl = document.getElementById('hud-count');
+const followEl = document.getElementById('hud-follow');
+
+/* ----------------------------------------------------------- follow cam */
+
+const OVERVIEW_CAM = new THREE.Vector3(0, 410, 355);
+const OVERVIEW_TARGET = new THREE.Vector3(0, 20, 0);
+
+let followId = null;
+let followLastPos = null;   // aircraft's position on the previous frame
+let followSwoop = false;    // smoothly approach chase offset until arrival or user drag
+let returnOverview = false; // smoothly glide back when exiting follow cam
+
+function chaseOffsetFor(entry) {
+  // Position camera slightly behind-and-above the aircraft's tail/starboard quarter.
+  const dist = entry.kind === 'fighter' ? 40 : 54;
+  const lift = entry.kind === 'fighter' ? 18 : 24;
+  // Heading h moves along (cos h, sin h); tail is opposite (-cos h, -sin h),
+  // starboard right is (-sin h, cos h).
+  const h = entry.heading || 0;
+  const backX = -Math.cos(h);
+  const backZ = -Math.sin(h);
+  const rightX = -Math.sin(h);
+  const rightZ = Math.cos(h);
+  return new THREE.Vector3(
+    backX * dist + rightX * (dist * 0.42),
+    lift,
+    backZ * dist + rightZ * (dist * 0.42),
+  );
+}
+
+function updateFollowBadge(a) {
+  if (!a) {
+    followEl.hidden = true;
+    return;
+  }
+  followEl.textContent = `FOLLOWING: ${formatTaskTitle(a)}  ×`;
+  followEl.hidden = false;
+}
+
+function startFollow(id) {
+  const entry = meshes.get(id);
+  const a = currentSnapshot.get(id);
+  if (!entry || !a) return;
+  followId = id;
+  followLastPos = entry.group.position.clone();
+  followSwoop = true;
+  returnOverview = false;
+  updateFollowBadge(a);
+}
+
+function stopFollow(glideToOverview = false) {
+  if (followId === null) return;
+  followId = null;
+  followLastPos = null;
+  followSwoop = false;
+  returnOverview = glideToOverview;
+  updateFollowBadge(null);
+}
+
+// Manual camera orbit/zoom cancels automatic swoop/return so controls feel responsive.
+controls.addEventListener('start', () => {
+  followSwoop = false;
+  returnOverview = false;
+});
+
+followEl.addEventListener('click', () => {
+  stopFollow(true);
+  closeRadio();
+});
+
+window.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape' && followId !== null) {
+    stopFollow(true);
+    closeRadio();
+  }
+});
 
 let ws = null;
 const lastStates = new Map();
@@ -1176,6 +1252,7 @@ function sendJson(obj) {
 setupRadio({
   send: (id, text) => sendJson({ type: 'message', aircraft_id: id, text }),
   approve: (id) => sendJson({ type: 'approve', aircraft_id: id }),
+  close: () => stopFollow(true),
 });
 
 function connect() {
@@ -1233,7 +1310,14 @@ function applySnapshot(snapshot) {
       disposeMesh(id);
       lastStates.delete(id);
       unpinHold(id);
+      if (followId === id) stopFollow(true);
     }
+  }
+
+  if (followId !== null) {
+    const followed = aircraft.find((a) => a.id === followId);
+    if (followed) updateFollowBadge(followed);
+    else stopFollow(true);
   }
 
   const airportCount = (snapshot.airports || []).length;
@@ -1304,7 +1388,14 @@ canvas.addEventListener('pointerup', (ev) => {
   raycaster.setFromCamera(pointer, camera);
   const groups = [...meshes.values()].map((e) => e.group);
   const hits = raycaster.intersectObjects(groups, true);
-  if (hits.length === 0) return;
+  if (hits.length === 0) {
+    // Clicking empty sky/water disengages follow cam.
+    if (followId !== null) {
+      stopFollow(false);
+      closeRadio();
+    }
+    return;
+  }
   let obj = hits[0].object;
   while (obj.parent && !groups.includes(obj)) obj = obj.parent;
   if (!groups.includes(obj)) return;
@@ -1313,7 +1404,10 @@ canvas.addEventListener('pointerup', (ev) => {
   if (id === undefined) return;
 
   const a = currentSnapshot.get(id);
-  if (a) openRadio(a);
+  if (a) {
+    openRadio(a);
+    startFollow(id);
+  }
 });
 
 /* ----------------------------------------------------------- main loop */
@@ -1373,6 +1467,39 @@ function animate() {
   for (const ap of airportGroups.values()) {
     const pulse = ap.online ? 0.85 + 0.3 * Math.sin(now * 3) : 0.7;
     ap.beacon.scale.setScalar(pulse);
+  }
+
+  // Follow camera: track the selected aircraft while keeping OrbitControls active.
+  if (followId !== null) {
+    const entry = meshes.get(followId);
+    if (entry) {
+      const pos = entry.group.position;
+      if (followLastPos) {
+        const move = pos.clone().sub(followLastPos);
+        // Carry camera + target along with the aircraft (including map wraps).
+        camera.position.add(move);
+        controls.target.add(move);
+      }
+      followLastPos = pos.clone();
+
+      const camK = 1 - Math.exp(-5.5 * dt);
+      controls.target.lerp(pos, camK);
+
+      if (followSwoop) {
+        const desiredCam = pos.clone().add(chaseOffsetFor(entry));
+        camera.position.lerp(desiredCam, camK);
+        if (camera.position.distanceTo(desiredCam) < 1.5 && controls.target.distanceTo(pos) < 0.8) {
+          followSwoop = false;
+        }
+      }
+    }
+  } else if (returnOverview) {
+    const camK = 1 - Math.exp(-4.5 * dt);
+    camera.position.lerp(OVERVIEW_CAM, camK);
+    controls.target.lerp(OVERVIEW_TARGET, camK);
+    if (camera.position.distanceTo(OVERVIEW_CAM) < 2.0 && controls.target.distanceTo(OVERVIEW_TARGET) < 1.0) {
+      returnOverview = false;
+    }
   }
 
   controls.update();
