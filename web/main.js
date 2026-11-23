@@ -426,18 +426,82 @@ function buildSatelliteAirport(ap, idx) {
     island.add(makeMarking(10, 0.7, gx - cx + 2, gz - cz, markY, yellowLineMat));
   }
 
-  // Device name banner (green-cyan when online, muted red when offline).
-  const suffix = ap.online ? '' : ' (OFF)';
+  // Device name banner (updated dynamically when online/offline changes).
   const label = makeBannerLabel(
-    `${ap.name.toUpperCase()}${suffix}`, 0xffffff, ap.online ? SWISS_RED : 0x5d6166,
+    ap.online ? ap.name.toUpperCase() : `${ap.name.toUpperCase()} (OFF)`,
+    ap.online ? 0xffffff : 0xcbd2d9,
+    ap.online ? SWISS_RED : 0x4b525a,
   );
   label.position.set(0, 38, 0);
   label.scale.set(44, 11, 1);
+  label.userData.isAirportLabel = true;
   island.add(label);
+
+  // Tag beacon & runway lights so island-wide offline dimming leaves them alone.
+  beacon.userData.skipOfflineDim = true;
+  if (lights && lights.group) {
+    lights.group.traverse((o) => { o.userData.skipOfflineDim = true; });
+  }
 
   island.position.set(cx, 0, cz);
   scene.add(island);
-  return { group: island, beacon, lights, online: ap.online };
+  const entry = {
+    group: island,
+    beacon,
+    lights,
+    label,
+    glassMat,
+    name: ap.name,
+    online: ap.online,
+  };
+  applySatelliteOnlineState(entry, ap.online);
+  return entry;
+}
+
+const OFFLINE_ISLAND_TINT = new THREE.Color(0x66707d);
+const GLASS_ONLINE_COLOR = new THREE.Color(0x7fd4f0);
+const GLASS_OFFLINE_COLOR = new THREE.Color(0x26323d);
+
+function applySatelliteOnlineState(entry, online) {
+  entry.online = online;
+  entry.beacon.material.color.setHex(online ? 0x4dff9e : 0xc94a4a);
+  if (entry.lights) entry.lights.setOnline(online);
+
+  // Dim terrain, trees, buildings, and markings with a cool overcast cast when offline.
+  const seenMats = new Set();
+  entry.group.traverse((obj) => {
+    if (!obj.isMesh || obj.userData.skipOfflineDim) return;
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+    for (const m of mats) {
+      if (!m || !m.color || seenMats.has(m)) continue;
+      seenMats.add(m);
+      if (m === entry.glassMat) {
+        m.color.copy(online ? GLASS_ONLINE_COLOR : GLASS_OFFLINE_COLOR);
+        continue;
+      }
+      if (!m.userData.baseColor) {
+        m.userData.baseColor = m.color.clone();
+      }
+      if (online) {
+        m.color.copy(m.userData.baseColor);
+      } else {
+        m.color.copy(m.userData.baseColor).multiply(OFFLINE_ISLAND_TINT);
+      }
+    }
+  });
+
+  // Update the floating airport banner live when online state flips.
+  if (entry.label) {
+    const fresh = makeBannerLabel(
+      online ? entry.name.toUpperCase() : `${entry.name.toUpperCase()} (OFF)`,
+      online ? 0xffffff : 0xcbd2d9,
+      online ? SWISS_RED : 0x4b525a,
+    );
+    if (entry.label.material.map) entry.label.material.map.dispose();
+    entry.label.material.map = fresh.material.map;
+    entry.label.material.needsUpdate = true;
+    fresh.material.dispose();
+  }
 }
 
 function ensureAirports(airports) {
@@ -447,9 +511,13 @@ function ensureAirports(airports) {
     const existing = airportGroups.get(ap.id);
     if (existing) {
       if (existing.online !== ap.online) {
-        existing.online = ap.online;
-        existing.beacon.material.color.setHex(ap.online ? 0x4dff9e : 0xff5a5a);
-        existing.lights.setOnline(ap.online); // offline airports go dark
+        if (existing.glassMat) {
+          applySatelliteOnlineState(existing, ap.online);
+        } else {
+          existing.online = ap.online;
+          existing.beacon.material.color.setHex(ap.online ? 0x4dff9e : 0xc94a4a);
+          if (existing.lights) existing.lights.setOnline(ap.online);
+        }
       }
       continue;
     }
