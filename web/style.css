@@ -1,10 +1,13 @@
 :root {
+  /* Swiss theme: flag red accent, charcoal glass panels, Helvetica. */
+  --swiss-red: #da291c;
   --amber: #ffb020;
-  --cyan: #35d6e8;
+  --cyan: #ff6a5c; /* accent text on dark panels (legible light red) */
   --grey: #8a8f98;
-  --panel-bg: rgba(10, 16, 24, 0.88);
-  --panel-border: rgba(90, 200, 250, 0.35);
-  --text: #d8e6f0;
+  --panel-bg: rgba(24, 25, 27, 0.9);
+  --panel-border: rgba(255, 255, 255, 0.14);
+  --text: #f2f2f0;
+  --sans: "Helvetica Neue", Helvetica, "Nimbus Sans", Arial, sans-serif;
 }
 
 * { box-sizing: border-box; }
@@ -13,9 +16,9 @@ html, body {
   margin: 0;
   height: 100%;
   overflow: hidden;
-  font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  font-family: var(--sans);
   color: var(--text);
-  background: #060a10;
+  background: #b9d9ef;
 }
 
 #app { position: relative; width: 100%; height: 100%; }
@@ -29,30 +32,50 @@ html, body {
   display: flex;
   align-items: baseline;
   gap: 16px;
-  padding: 10px 16px;
+  padding: 12px 16px;
   pointer-events: none;
-  background: linear-gradient(to bottom, rgba(6, 10, 16, 0.8), transparent);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
 }
 #hud h1 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   margin: 0;
+  padding: 6px 12px 6px 6px;
   font-size: 15px;
-  letter-spacing: 0.35em;
-  color: var(--cyan);
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: #fff;
+  background: var(--swiss-red);
+  border-radius: 2px;
+  text-shadow: none;
+  align-self: center;
 }
-#hud-status { font-size: 11px; opacity: 0.7; }
+/* Swiss cross badge: 32-unit flag, arms 6 wide and 20 tip to tip. */
+#hud h1::before {
+  content: "";
+  width: 20px;
+  height: 20px;
+  background:
+    linear-gradient(#fff, #fff) center / 3.75px 12.5px no-repeat,
+    linear-gradient(#fff, #fff) center / 12.5px 3.75px no-repeat,
+    var(--swiss-red);
+  outline: 1px solid rgba(255, 255, 255, 0.5);
+}
+#hud-status { font-size: 12px; font-weight: 500; opacity: 0.9; }
 #hud-status.error { color: #ff6a6a; opacity: 1; }
 #hud-follow {
   pointer-events: auto;
   font-size: 11px;
-  padding: 2px 10px;
-  border-color: rgba(53, 214, 232, 0.55);
-  background: rgba(10, 26, 38, 0.85);
-  color: var(--cyan);
+  padding: 3px 10px;
+  border-color: rgba(255, 255, 255, 0.6);
+  background: var(--swiss-red);
+  color: #fff;
   letter-spacing: 0.04em;
 }
 #hud-follow[hidden] { display: none; }
-#hud-follow:hover { background: rgba(53, 214, 232, 0.2); }
-#hud-count { font-size: 11px; opacity: 0.6; margin-left: auto; }
+#hud-follow:hover { background: #b81f14; }
+#hud-count { font-size: 12px; font-weight: 500; opacity: 0.9; margin-left: auto; }
 
 /* Radio panel */
 #radio-panel {
@@ -65,9 +88,11 @@ html, body {
   flex-direction: column;
   background: var(--panel-bg);
   border: 1px solid var(--panel-border);
-  border-radius: 6px;
+  border-top: 4px solid var(--swiss-red);
+  border-radius: 2px;
   padding: 12px;
-  backdrop-filter: blur(4px);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
 }
 #radio-panel[hidden] { display: none; }
 
@@ -85,9 +110,10 @@ html, body {
 
 #radio-callsign {
   margin: 0 0 4px;
-  font-size: 16px;
-  color: var(--cyan);
-  letter-spacing: 0.08em;
+  font-size: 17px;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: 0.04em;
 }
 #radio-meta {
   display: flex;
@@ -118,7 +144,7 @@ html, body {
   padding: 8px 2px;
   margin-bottom: 8px;
 }
-#radio-log .who { color: var(--cyan); }
+#radio-log .who { color: var(--cyan); font-weight: 600; }
 #radio-log .who.you { color: #7ddc8f; }
 #radio-log .empty { opacity: 0.4; font-style: italic; }
 
@@ -131,15 +157,15 @@ html, body {
   padding: 6px 8px;
   font: inherit;
   font-size: 12px;
-  border-radius: 3px;
+  border-radius: 2px;
 }
-#radio-text:focus { outline: none; border-color: var(--panel-border); }
+#radio-text:focus { outline: none; border-color: var(--swiss-red); }
 
 button {
   font: inherit;
   font-size: 12px;
   cursor: pointer;
-  border-radius: 3px;
+  border-radius: 2px;
   border: 1px solid rgba(255, 255, 255, 0.2);
   background: rgba(255, 255, 255, 0.08);
   color: var(--text);
@@ -176,9 +202,9 @@ button:hover { background: rgba(255, 255, 255, 0.15); }
 }
 #ticker-lines { display: flex; flex-direction: column; gap: 3px; }
 .tick-line {
-  background: rgba(6, 10, 16, 0.72);
-  border-left: 2px solid rgba(90, 200, 250, 0.5);
-  padding: 3px 8px;
+  background: rgba(24, 25, 27, 0.8);
+  border-left: 3px solid var(--swiss-red);
+  padding: 4px 9px;
   border-radius: 2px;
   white-space: nowrap;
   overflow: hidden;
