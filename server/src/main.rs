@@ -4,7 +4,13 @@ mod ws;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Body;
+use axum::extract::Request;
+use axum::http::StatusCode;
+use axum::response::Response;
 use axum::routing::{get, Router};
+use tower::ServiceExt;
+use tower_http::services::ServeDir;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 use crate::world::World;
@@ -44,6 +50,14 @@ async fn main() {
 
     // TODO(Task 4): adapters consume `adapter_rx`.
 
+    // Serve the browser client; unknown paths fall back to index.html with 200.
+    let web_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("web");
+    let serve_dir = ServeDir::new(&web_dir);
+    let index_bytes = std::fs::read(web_dir.join("index.html")).expect("web/index.html");
+
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/ws", get(ws::ws_handler))
@@ -52,7 +66,22 @@ async fn main() {
             deltas,
             adapter_tx,
         })
-        .fallback_service(get(|| async { "skywatch" }));
+        .fallback(get(move |req: Request| {
+            let serve_dir = serve_dir.clone();
+            let index_bytes = index_bytes.clone();
+            async move {
+                let res = serve_dir.oneshot(req).await.unwrap();
+                if res.status() == StatusCode::NOT_FOUND {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/html")
+                        .body(Body::from(index_bytes))
+                        .unwrap()
+                } else {
+                    res.map(Body::new)
+                }
+            }
+        }));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8422").await.unwrap();
     tracing::info!("listening on 0.0.0.0:8422");

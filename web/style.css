@@ -1,0 +1,180 @@
+:root {
+  --amber: #ffb020;
+  --cyan: #35d6e8;
+  --grey: #8a8f98;
+  --panel-bg: rgba(10, 16, 24, 0.88);
+  --panel-border: rgba(90, 200, 250, 0.35);
+  --text: #d8e6f0;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  color: var(--text);
+  background: #060a10;
+}
+
+#app { position: relative; width: 100%; height: 100%; }
+
+#scene { display: block; width: 100%; height: 100%; }
+
+/* HUD */
+#hud {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  padding: 10px 16px;
+  pointer-events: none;
+  background: linear-gradient(to bottom, rgba(6, 10, 16, 0.8), transparent);
+}
+#hud h1 {
+  margin: 0;
+  font-size: 15px;
+  letter-spacing: 0.35em;
+  color: var(--cyan);
+}
+#hud-status { font-size: 11px; opacity: 0.7; }
+#hud-status.error { color: #ff6a6a; opacity: 1; }
+#hud-count { font-size: 11px; opacity: 0.6; margin-left: auto; }
+
+/* Radio panel */
+#radio-panel {
+  position: absolute;
+  top: 48px;
+  right: 12px;
+  width: 300px;
+  max-height: calc(100% - 140px);
+  display: flex;
+  flex-direction: column;
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  padding: 12px;
+  backdrop-filter: blur(4px);
+}
+#radio-panel[hidden] { display: none; }
+
+#radio-close {
+  position: absolute;
+  top: 6px; right: 8px;
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 16px;
+  cursor: pointer;
+  opacity: 0.6;
+}
+#radio-close:hover { opacity: 1; }
+
+#radio-callsign {
+  margin: 0 0 4px;
+  font-size: 16px;
+  color: var(--cyan);
+  letter-spacing: 0.08em;
+}
+#radio-meta {
+  display: flex;
+  gap: 10px;
+  font-size: 11px;
+  opacity: 0.75;
+  margin-bottom: 8px;
+}
+#radio-state { text-transform: uppercase; letter-spacing: 0.1em; }
+
+#radio-hold-reason {
+  font-size: 11px;
+  color: var(--amber);
+  border-left: 2px solid var(--amber);
+  padding: 2px 8px;
+  margin-bottom: 8px;
+}
+#radio-hold-reason[hidden] { display: none; }
+
+#radio-log {
+  flex: 1;
+  min-height: 100px;
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.5;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 8px 2px;
+  margin-bottom: 8px;
+}
+#radio-log .who { color: var(--cyan); }
+#radio-log .who.you { color: #7ddc8f; }
+#radio-log .empty { opacity: 0.4; font-style: italic; }
+
+#radio-input-row { display: flex; gap: 6px; }
+#radio-text {
+  flex: 1;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: var(--text);
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 12px;
+  border-radius: 3px;
+}
+#radio-text:focus { outline: none; border-color: var(--panel-border); }
+
+button {
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  padding: 6px 12px;
+}
+button:hover { background: rgba(255, 255, 255, 0.15); }
+
+#radio-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+#radio-actions[hidden] { display: none; }
+#radio-approve {
+  flex: 1;
+  border-color: var(--amber);
+  color: var(--amber);
+}
+#radio-approve:hover { background: rgba(255, 176, 32, 0.15); }
+#radio-reject { flex: 1; opacity: 0.8; }
+
+/* Radio ticker */
+#ticker {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  width: 380px;
+  max-width: 60%;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  pointer-events: none;
+  font-size: 11px;
+}
+#ticker-lines { display: flex; flex-direction: column; gap: 3px; }
+.tick-line {
+  background: rgba(6, 10, 16, 0.72);
+  border-left: 2px solid rgba(90, 200, 250, 0.5);
+  padding: 3px 8px;
+  border-radius: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tick-line.hold {
+  border-left-color: var(--amber);
+  color: var(--amber);
+}
+.tick-line.hold::after { content: " ●"; font-size: 8px; vertical-align: middle; }

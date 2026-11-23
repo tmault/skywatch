@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Skywatch — Airspace Demo</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="app">
+    <canvas id="scene"></canvas>
+
+    <header id="hud">
+      <h1>SKYWATCH</h1>
+      <span id="hud-status">connecting…</span>
+      <span id="hud-count"></span>
+    </header>
+
+    <aside id="radio-panel" hidden>
+      <button id="radio-close" title="Close">×</button>
+      <h2 id="radio-callsign">—</h2>
+      <div id="radio-meta">
+        <span id="radio-kind"></span>
+        <span id="radio-state"></span>
+      </div>
+      <div id="radio-hold-reason" hidden></div>
+      <div id="radio-log"></div>
+      <div id="radio-input-row">
+        <input id="radio-text" type="text" placeholder="Message aircraft…" autocomplete="off" />
+        <button id="radio-send">Send</button>
+      </div>
+      <div id="radio-actions" hidden>
+        <button id="radio-approve">Approve</button>
+        <button id="radio-reject">Reject</button>
+      </div>
+    </aside>
+
+    <div id="ticker">
+      <div id="ticker-lines"></div>
+    </div>
+  </div>
+
+  <script type="importmap">
+    { "imports": { "three": "/vendor/three.module.js" } }
+  </script>
+  <script type="module" src="/main.js"></script>
+</body>
+</html>
