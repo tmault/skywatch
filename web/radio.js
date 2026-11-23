@@ -13,14 +13,11 @@ const approveBtn = document.getElementById('radio-approve');
 const rejectBtn = document.getElementById('radio-reject');
 const closeBtn = document.getElementById('radio-close');
 
-// Client-side radio history keyed by aircraft id. Persisted across panel
-// open/close but not across page reloads.
 const history = new Map();
 
 let selectedId = null;
-let selectedState = null;
-let onSend = null;   // (aircraftId, text) => void
-let onApprove = null; // (aircraftId) => void
+let onSend = null;
+let onApprove = null;
 
 export function setupRadio({ send, approve }) {
   onSend = send;
@@ -56,25 +53,34 @@ export function closeRadio(note) {
   panel.hidden = true;
 }
 
-// Called from the main loop with the latest snapshot entry so the panel
-// stays in sync with the live world state.
 export function updateRadio(aircraft) {
   if (selectedId === null || !aircraft || aircraft.id !== selectedId) return;
   render(aircraft);
 }
 
 function render(a) {
-  selectedState = a.state;
   callsignEl.textContent = a.title || a.callsign;
   callsignEl.title = a.title ? a.callsign : '';
-  kindEl.textContent =
-    (a.kind === 'drone' ? 'DRONE' : a.model_class === 'frontier' ? 'AGENT · FRONTIER JET' : 'AGENT · LOCAL PROP')
-    + (a.topic ? ` · ${a.topic.toUpperCase()}` : '');
-  stateEl.textContent = a.state;
+
+  let airframe;
+  if (a.kind === 'fighter') airframe = 'FIGHTER · SUB-AGENT';
+  else if (a.kind === 'drone') airframe = 'REAPER DRONE';
+  else if (a.model_class === 'frontier') airframe = 'AGENT · FRONTIER JET';
+  else airframe = 'AGENT · LOCAL PROP';
+
+  const parts = [airframe];
+  if (a.device) parts.push(a.device.toUpperCase());
+  if (a.topic) parts.push(a.topic.toUpperCase());
+  kindEl.textContent = parts.join(' · ');
+
+  stateEl.textContent = a.state === 'parked' ? 'at gate' : a.state;
   stateEl.style.color = stateColor(a.state);
 
   if (a.state === 'holding' && a.hold_reason) {
     holdReasonEl.textContent = `HOLD: ${a.hold_reason}`;
+    holdReasonEl.hidden = false;
+  } else if (a.state === 'parked') {
+    holdReasonEl.textContent = 'AT GATE: idle >24h — send a message to wake';
     holdReasonEl.hidden = false;
   } else {
     holdReasonEl.hidden = true;
@@ -118,7 +124,7 @@ function submit() {
 sendBtn.addEventListener('click', submit);
 textEl.addEventListener('keydown', (ev) => {
   if (ev.key === 'Enter') submit();
-  ev.stopPropagation(); // don't let typing drive orbit controls
+  ev.stopPropagation();
 });
 
 approveBtn.addEventListener('click', () => {
@@ -137,7 +143,7 @@ export function stateColor(state) {
   switch (state) {
     case 'holding': return '#ffb020';
     case 'landed': return '#8a8f98';
-    case 'parked': return '#6b757d';
+    case 'parked': return '#7b8794';
     case 'taxi': return '#ffd54a';
     case 'ready': return '#ff8c42';
     case 'takeoff':

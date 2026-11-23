@@ -1,64 +1,105 @@
 //! Demo seeding for the Skywatch server.
 //!
-//! When demo mode is enabled, `seed` populates the world with a fixed cast of
-//! five aircraft (three agents, two drones) so the demo starts with something
-//! interesting on screen, and `run_script` drives a simple scripted state
-//! machine so the world evolves over time without any adapters connected.
-//!
-//! Demo mode is controlled by the `SKYWATCH_DEMO` env var: set it to `0` to
-//! disable seeding. It defaults to **on** for now — real adapters (a later
-//! task) will take over seeding/behaviour, at which point the default flips.
-//!
-//! Scripted behaviour (one step applied every `SCRIPT_INTERVAL`, ~60s):
-//! - `SKY1`: occasionally enters holding ("requesting vector"), released the
-//!   next cycle.
-//! - `SKY3`: stays landed for 2 cycles, then takes off → cruises, and later
-//!   lands again. The sequence loops.
-//! - `REAP1`/`REAP2` drones: just loiter; the script emits nothing for them
-//!   (no wire chatter — chatter is client-side from state changes).
+//! When demo mode is enabled, `seed` populates the world with a cast of
+//! aircraft (agents, fighter wingmen, drones, and gate-parked threads) across
+//! sample device airports, and `run_script` drives a scripted state machine so
+//! the world evolves over time without any adapters connected.
 
 use std::time::Duration;
 
-use crate::world::{Aircraft, Kind, ModelClass, State, World};
+use crate::world::{
+    formation_position, Aircraft, Airport, Kind, ModelClass, State, World, GATE_HEADING,
+    HOME_GATES, RUNWAY_MID, SATELLITE_SLOTS,
+};
 
-/// Positions spread across the 1000x1000 map so aircraft don't overlap.
+/// Starting `[x, z, alt]` positions for the 5 primary demo aircraft.
 const POSITIONS: [[f32; 3]; 5] = [
-    [-240.0, 60.0, 120.0],
-    [210.0, 110.0, 120.0],
-    [88.0, -28.0, 0.5],
-    [30.0, -250.0, 80.0],
-    [120.0, -220.0, 80.0],
+    [-230.0, 55.0, 100.0],
+    [225.0, 95.0, 100.0],
+    [RUNWAY_MID[0], RUNWAY_MID[1], 0.0],
+    [15.0, -245.0, 65.0],
+    [95.0, -225.0, 65.0],
 ];
 
 const HEADINGS: [f32; 5] = [0.8, 2.4, 0.0, 3.9, 5.5];
-const ALTITUDES: [f32; 5] = [120.0, 120.0, 0.0, 40.0, 40.0];
+const ALTITUDES: [f32; 5] = [100.0, 100.0, 0.0, 65.0, 65.0];
 
-/// Populate a fresh world with the demo cast.
+/// Populate a fresh world with the demo cast and sample device airports.
 pub fn seed(world: &mut World) {
-    let callsigns = [
-        ("SKY1", Kind::Agent, ModelClass::Frontier),
-        ("SKY2", Kind::Agent, ModelClass::Local),
-        ("SKY3", Kind::Agent, ModelClass::Local),
-        ("REAP1", Kind::Drone, ModelClass::Local),
-        ("REAP2", Kind::Drone, ModelClass::Local),
+    world.airports = vec![
+        Airport::home("local", "omarchy"),
+        Airport::satellite("m5-air", "Tom's M5 Air", SATELLITE_SLOTS[0], true),
+        Airport::satellite("m1", "m1", SATELLITE_SLOTS[1], true),
+        Airport::satellite("devbox", "devbox", SATELLITE_SLOTS[2], false),
     ];
 
-    for (i, (callsign, kind, model_class)) in callsigns.iter().enumerate() {
+    let callsigns = [
+        ("SKY1", Kind::Agent, ModelClass::Frontier, "Deploy"),
+        ("SKY2", Kind::Agent, ModelClass::Local, "Refactor"),
+        ("SKY3", Kind::Agent, ModelClass::Local, "Refactor"),
+        ("REAP1", Kind::Drone, ModelClass::Local, "Monitor"),
+        ("REAP2", Kind::Drone, ModelClass::Local, "Monitor"),
+    ];
+
+    let mut sky1_info = None;
+
+    for (i, (callsign, kind, model_class, sector)) in callsigns.iter().enumerate() {
         let mut a = Aircraft::with_model(callsign, *kind, *model_class);
         a.position = POSITIONS[i];
         a.heading = HEADINGS[i];
         a.altitude = ALTITUDES[i];
+        a.device = Some("omarchy".to_string());
+        a.assign(sector);
         match *callsign {
-            "SKY1" => a.assign("Deploy"),
-            "SKY2" | "SKY3" => a.assign("Refactor"),
-            "REAP1" | "REAP2" => a.assign("Monitor"),
+            "SKY1" => {
+                a.title = Some("Deploy pipeline orchestrator".to_string());
+                sky1_info = Some((a.id, a.position, a.heading));
+            }
+            "SKY2" => {
+                a.title = Some("Refactor auth middleware".to_string());
+                a.hold("awaiting approval of refactor plan");
+            }
+            "SKY3" => {
+                a.title = Some("Fix flaky integration test".to_string());
+                a.land();
+            }
+            "REAP1" => a.title = Some("Tower health monitor".to_string()),
+            "REAP2" => a.title = Some("Nightly backup cron".to_string()),
             _ => {}
         }
-        match *callsign {
-            "SKY2" => a.hold("awaiting approval of refactor plan"),
-            "SKY3" => a.land(),
-            _ => {}
+        world.add(a);
+    }
+
+    // Spawn two sub-agent fighter jets flying wingman formation on SKY1!
+    if let Some((pid, pos, heading)) = sky1_info {
+        for (slot, suffix, role) in [
+            (0usize, "A", "Codebase researcher sub-agent"),
+            (1usize, "B", "Test verifier sub-agent"),
+        ] {
+            let start = formation_position(pos, heading, false, slot);
+            let mut wing = Aircraft::wingman(&format!("SKY1-{suffix}"), pid, slot, start, heading);
+            wing.title = Some(role.to_string());
+            wing.device = Some("omarchy".to_string());
+            world.add(wing);
         }
+    }
+
+    // Seed two idle (>24h) threads parked neatly at the home airport gates.
+    for (i, (cs, title, mc)) in [
+        ("SKY4", "Weekend blog draft", ModelClass::Local),
+        ("SKY5", "Benchmark notes", ModelClass::Frontier),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let gate = HOME_GATES[i];
+        let mut a = Aircraft::with_model(cs, Kind::Agent, *mc);
+        a.state = State::Parked;
+        a.position = [gate[0], gate[1], 0.0];
+        a.altitude = 0.0;
+        a.heading = GATE_HEADING;
+        a.title = Some((*title).to_string());
+        a.device = Some("omarchy".to_string());
         world.add(a);
     }
 }
@@ -66,27 +107,20 @@ pub fn seed(world: &mut World) {
 /// One scripted action: apply it to the world at a given cycle.
 #[derive(Clone, Copy, Debug)]
 enum Action {
-    /// Aircraft enters holding with the given reason.
     Hold(&'static str),
-    /// Release a holding aircraft (→ takeoff → cruising).
     Release,
-    /// Touch down.
     Land,
 }
 
-/// A scheduled (callsign, action, cycle) step. Cycles are modulo the script
-/// length, so the sequence repeats forever.
 struct Step {
     callsign: &'static str,
     action: Action,
     cycle: u32,
 }
 
-/// Script length (cycles) before it repeats.
 const SCRIPT_LEN: u32 = 6;
 
 const SCRIPT: [Step; 6] = [
-    // SKY1: hold one cycle, then released.
     Step {
         callsign: "SKY1",
         action: Action::Hold("requesting vector"),
@@ -97,7 +131,6 @@ const SCRIPT: [Step; 6] = [
         action: Action::Release,
         cycle: 2,
     },
-    // SKY3: 2 landed cycles, then takeoff; cruises for a while, then lands.
     Step {
         callsign: "SKY3",
         action: Action::Release,
@@ -108,7 +141,6 @@ const SCRIPT: [Step; 6] = [
         action: Action::Land,
         cycle: 5,
     },
-    // A second SKY1 hold cycle keeps the sky busy near the end of the loop.
     Step {
         callsign: "SKY1",
         action: Action::Hold("requesting vector"),
@@ -121,8 +153,6 @@ const SCRIPT: [Step; 6] = [
     },
 ];
 
-/// Drones keep loitering on their own; no scripted steps for them.
-
 fn apply_step(world: &mut World, step: &Step) {
     let Some(a) = world.get_mut(step.callsign) else {
         tracing::warn!(callsign = step.callsign, "scripted aircraft missing");
@@ -130,7 +160,6 @@ fn apply_step(world: &mut World, step: &Step) {
     };
     match step.action {
         Action::Hold(reason) => {
-            // Only hold if not already holding/landed, to avoid stomping state.
             if a.state == State::Cruising {
                 tracing::info!(callsign = step.callsign, reason, "script: holding");
                 a.hold(reason);
@@ -154,7 +183,6 @@ fn apply_step(world: &mut World, step: &Step) {
     }
 }
 
-/// Apply every scripted step scheduled for `cycle` (cycles wrap mod SCRIPT_LEN).
 fn run_cycle(world: &mut World, cycle: u32) {
     let cycle = cycle % SCRIPT_LEN;
     for step in SCRIPT.iter().filter(|s| s.cycle == cycle) {
@@ -162,10 +190,8 @@ fn run_cycle(world: &mut World, cycle: u32) {
     }
 }
 
-/// Interval between scripted cycles.
 pub const SCRIPT_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Run the scripted state machine forever, applying one cycle per interval.
 pub async fn run_script(world: crate::ws::SharedWorld) {
     let mut cycle: u32 = 0;
     let mut interval = tokio::time::interval(SCRIPT_INTERVAL);
@@ -182,22 +208,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seed_creates_expected_cast() {
+    fn seed_creates_expected_cast_and_wingmen() {
         let mut world = World::new();
         seed(&mut world);
-        let mut seen: Vec<(String, Kind)> =
-            world.iter().map(|a| (a.callsign.clone(), a.kind)).collect();
-        seen.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(
-            seen,
-            vec![
-                ("REAP1".to_string(), Kind::Drone),
-                ("REAP2".to_string(), Kind::Drone),
-                ("SKY1".to_string(), Kind::Agent),
-                ("SKY2".to_string(), Kind::Agent),
-                ("SKY3".to_string(), Kind::Agent),
-            ]
-        );
+        assert!(world.airports.len() >= 3);
+        let wingmen: Vec<_> = world.iter().filter(|a| a.kind == Kind::Fighter).collect();
+        assert_eq!(wingmen.len(), 2);
+        let sky1 = world.iter().find(|a| a.callsign == "SKY1").unwrap();
+        assert!(wingmen.iter().all(|w| w.parent_id == Some(sky1.id)));
     }
 
     #[test]
@@ -208,13 +226,9 @@ mod tests {
         assert_eq!(state_of("SKY1"), State::Cruising);
         assert_eq!(state_of("SKY2"), State::Holding);
         assert_eq!(state_of("SKY3"), State::Landed);
+        assert_eq!(state_of("SKY4"), State::Parked);
         assert_eq!(state_of("REAP1"), State::Cruising);
         assert_eq!(state_of("REAP2"), State::Cruising);
-        let sky2 = world.iter().find(|a| a.callsign == "SKY2").unwrap();
-        assert_eq!(
-            sky2.hold_reason.as_deref(),
-            Some("awaiting approval of refactor plan")
-        );
     }
 
     #[test]
@@ -235,25 +249,21 @@ mod tests {
         seed(&mut world);
         run_cycle(&mut world, 3);
         let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
-        // Ground release now taxis to the threshold first.
         assert_eq!(a.state, State::Taxi);
-        // Taxi (~42 m at 5 m/s), hold short, then roll and climb to cruise.
-        world.tick(10.0);
+        world.tick(12.0);
         let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
         assert_eq!(a.state, State::Ready);
-        world.tick(6.0);
+        world.tick(5.0);
         world.tick(30.0);
         let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
         assert_eq!(a.state, State::Cruising);
-        // ...then lands again.
         run_cycle(&mut world, 5);
         let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
         assert_eq!(a.state, State::Landed);
-        // And after the ground pause it taxis to its parking stand.
-        world.tick(8.0);
+        world.tick(6.0);
         let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
         assert_eq!(a.state, State::Taxi);
-        world.tick(10.0);
+        world.tick(20.0);
         let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
         assert_eq!(a.state, State::Parked);
     }

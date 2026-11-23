@@ -185,7 +185,7 @@ mod tests {
         world.lock().await.add(a);
 
         let (deltas, _dr) = broadcast::channel(64);
-        let (adapter_tx, mut adapter_rx) = mpsc::channel(64);
+        let (adapter_tx, _adapter_rx) = mpsc::channel(64);
         let state = HubState {
             world: Arc::clone(&world),
             deltas,
