@@ -32,7 +32,7 @@ async fn main() {
                 interval.tick().await;
                 let snapshot = {
                     let mut world = world.lock().await;
-                    world.tick(0.05);
+                    world.tick(TICK_INTERVAL.as_secs_f32());
                     world.snapshot()
                 };
                 let frame = ws::delta_json(&snapshot);
