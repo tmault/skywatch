@@ -26,6 +26,8 @@ pub enum State {
     Ready,
     Takeoff,
     Landing,
+    /// Out of usage: parked on a fuel stand until the provider limit resets.
+    Refuelling,
 }
 
 /// The class of model powering an agent: local props vs frontier jets.
@@ -53,6 +55,9 @@ pub struct Airport {
     pub online: bool,
     /// World `[x, z]` coordinates of parking gates at the terminal.
     pub gates: Vec<[f32; 2]>,
+    /// World `[x, z]` coordinates of fuel stands (home airport only).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fuel_stands: Vec<[f32; 2]>,
 }
 
 impl Airport {
@@ -65,6 +70,7 @@ impl Airport {
             is_home: true,
             online: true,
             gates: HOME_GATES.to_vec(),
+            fuel_stands: FUEL_STANDS.to_vec(),
         }
     }
 
@@ -85,6 +91,7 @@ impl Airport {
             is_home: false,
             online,
             gates,
+            fuel_stands: Vec::new(),
         }
     }
 }
@@ -122,6 +129,15 @@ pub struct Aircraft {
     /// Wingman formation slot: 0 = left wing, 1 = right wing, 2 = outer left, ...
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wing_slot: Option<usize>,
+    /// Refuelling only: unix ms when the thread hit its usage limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refuel_started_at: Option<i64>,
+    /// Refuelling only: unix ms when the provider usage limit resets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refuel_resets_at: Option<i64>,
+    /// Refuelling only: T3 resumes the thread by itself once the limit resets.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_resume: bool,
     /// Holding-orbit centre (derived on entry, not serialised).
     #[serde(skip)]
     orbit_center: Option<[f32; 2]>,
@@ -203,6 +219,18 @@ pub const HOME_GATES: [[f32; 2]; 10] = [
     [120.0, 66.5],
     [120.0, 85.5],
 ];
+/// Fuel apron south of the holding bay: two rows of three stands where threads
+/// that hit a provider usage limit wait for the reset.
+pub const FUEL_STANDS: [[f32; 2]; 6] = [
+    [68.0, 80.0],
+    [84.0, 80.0],
+    [100.0, 80.0],
+    [68.0, 100.0],
+    [84.0, 100.0],
+    [100.0, 100.0],
+];
+/// Heading on a fuel stand: nose-in south, facing the fuel farm.
+pub const FUEL_STAND_HEADING: f32 = std::f32::consts::FRAC_PI_2;
 /// Heading when nose-in at the home terminal (facing east, +X).
 pub const GATE_HEADING: f32 = 0.0;
 
@@ -300,6 +328,9 @@ impl Aircraft {
             device: None,
             parent_id: None,
             wing_slot: None,
+            refuel_started_at: None,
+            refuel_resets_at: None,
+            auto_resume: false,
             orbit_center: None,
             patrol_angle: rng.gen_range(0.0..std::f32::consts::TAU),
             taxi_waypoints: Vec::new(),
@@ -612,7 +643,7 @@ impl Aircraft {
                     self.state = State::Landed;
                 }
             }
-            State::Parked => {
+            State::Parked | State::Refuelling => {
                 self.altitude = 0.0;
                 self.position[2] = 0.0;
             }
@@ -724,7 +755,10 @@ impl World {
             if Some(a.id) == exclude_id {
                 return false;
             }
-            let at_gate = matches!(a.state, State::Parked | State::Landed | State::Taxi | State::Ready)
+            let at_gate = matches!(
+                a.state,
+                State::Parked | State::Landed | State::Taxi | State::Ready | State::Refuelling
+            )
                 && (a.position[0] - gate[0]).hypot(a.position[1] - gate[1]) < CLEARANCE;
             let reserved = a
                 .taxi_destination()
@@ -795,7 +829,7 @@ impl World {
             };
             let on_ground = matches!(
                 p_state,
-                State::Parked | State::Landed | State::Taxi | State::Ready
+                State::Parked | State::Landed | State::Taxi | State::Ready | State::Refuelling
             );
             let target = formation_position(p_pos, p_heading, on_ground, a.wing_slot.unwrap_or(0));
 
@@ -830,7 +864,7 @@ impl World {
 
             a.state = match p_state {
                 State::Holding => State::Holding,
-                State::Parked | State::Landed => State::Parked,
+                State::Parked | State::Landed | State::Refuelling => State::Parked,
                 _ => State::Cruising,
             };
         }

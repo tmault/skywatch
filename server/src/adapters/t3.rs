@@ -9,7 +9,7 @@
 
 use crate::world::{
     default_sectors, formation_position, Aircraft, Airport, Kind, ModelClass, Sector, State, World,
-    GATE_HEADING, HOME_GATES, PROJECT_SECTOR_RADIUS, PROJECT_SECTOR_SLOTS, SATELLITE_SLOTS,
+    FUEL_STANDS, FUEL_STAND_HEADING, GATE_HEADING, HOME_GATES, PROJECT_SECTOR_RADIUS, PROJECT_SECTOR_SLOTS, SATELLITE_SLOTS,
     TAXIWAY_QUEUE,
 };
 use crate::ws::{ClientFrame, SharedWorld};
@@ -49,6 +49,15 @@ struct ThreadListEntry {
     updated_at: Option<String>,
     #[serde(default)]
     pending: i64,
+    /// Set when the latest run failed on a provider usage limit (RFC 3339).
+    #[serde(default)]
+    limit_hit_at: Option<String>,
+    /// When that usage limit resets (RFC 3339).
+    #[serde(default)]
+    limit_reset_at: Option<String>,
+    /// 1 when T3 will resume the thread by itself after the reset.
+    #[serde(default)]
+    limit_auto_resume: i64,
 }
 
 #[derive(Deserialize)]
@@ -133,6 +142,24 @@ impl GateCallsigns {
         self.by_thread.get(thread_id).cloned().unwrap_or_else(|| {
             self.next += 1;
             let cs = format!("GT{}", self.next);
+            self.by_thread.insert(thread_id.to_string(), cs.clone());
+            cs
+        })
+    }
+}
+
+/// Stable callsign allocation for fuel-stand (usage limit) threads: RFn.
+#[derive(Default)]
+struct RefuelCallsigns {
+    by_thread: HashMap<String, String>,
+    next: usize,
+}
+
+impl RefuelCallsigns {
+    fn get(&mut self, thread_id: &str) -> String {
+        self.by_thread.get(thread_id).cloned().unwrap_or_else(|| {
+            self.next += 1;
+            let cs = format!("RF{}", self.next);
             self.by_thread.insert(thread_id.to_string(), cs.clone());
             cs
         })
@@ -304,6 +331,18 @@ fn model_class(model: &Option<String>) -> ModelClass {
     }
 }
 
+/// A thread waits on a fuel stand while its latest run failed on a usage limit,
+/// until a day after the reset (then it ages into the normal queues).
+fn is_refuelling(e: &ThreadListEntry, now: i64) -> bool {
+    if e.limit_hit_at.is_none() {
+        return false;
+    }
+    match e.limit_reset_at.as_deref().and_then(parse_rfc3339) {
+        Some(reset) => now < reset + STALE_AFTER_SECS,
+        None => !is_stale(&e.updated_at, now),
+    }
+}
+
 fn is_working_status(status: &str) -> bool {
     matches!(
         status,
@@ -455,7 +494,14 @@ fn poll_threads() -> Option<Vec<ThreadListEntry>> {
                          WHERE r.thread_id = t.thread_id \
                          ORDER BY (r.completed_at IS NULL) DESC, r.ordinal DESC LIMIT 1), 'idle') AS status, \
                (SELECT COUNT(*) FROM orchestration_v2_projection_runtime_requests q \
-                WHERE q.thread_id = t.thread_id AND q.resolved_at IS NULL) AS pending \
+                WHERE q.thread_id = t.thread_id AND q.resolved_at IS NULL) AS pending, \
+               (SELECT r.completed_at FROM orchestration_v2_projection_runs r \
+                WHERE r.thread_id = t.thread_id AND r.status = 'failed' \
+                  AND r.run_id = json_extract(t.payload_json, '$.limitRecovery.runId') \
+                  AND NOT EXISTS (SELECT 1 FROM orchestration_v2_projection_runs r2 \
+                                  WHERE r2.thread_id = t.thread_id AND r2.ordinal > r.ordinal)) AS limit_hit_at, \
+               json_extract(t.payload_json, '$.limitRecovery.resetAt') AS limit_reset_at, \
+               COALESCE(json_extract(t.payload_json, '$.limitRecovery.autoResume'), 0) AS limit_auto_resume \
                FROM orchestration_v2_projection_threads t \
                LEFT JOIN projection_projects p ON p.project_id = t.project_id \
                WHERE t.deleted_at IS NULL AND t.archived_at IS NULL \
@@ -498,6 +544,8 @@ struct PollData {
     taxiway: Vec<ThreadListEntry>,
     /// Stale (>24h untouched) threads parked at the extended terminal gates.
     stale: Vec<ThreadListEntry>,
+    /// Threads stopped by a provider usage limit, parked on the fuel stands.
+    refuel: Vec<ThreadListEntry>,
     subagents: Vec<SubagentRow>,
     now: i64,
 }
@@ -515,11 +563,16 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>) -> Opt
     let mut flying = Vec::new();
     let mut taxiway = Vec::new();
     let mut stale = Vec::new();
+    let mut refuel = Vec::new();
     for e in entries {
         if is_working_status(&e.status) {
             if flying.len() < MAX_AIRCRAFT {
                 let pending = e.pending;
                 flying.push((e, pending));
+            }
+        } else if is_refuelling(&e, now) {
+            if refuel.len() < FUEL_STANDS.len() {
+                refuel.push(e);
             }
         } else if is_stale(&e.updated_at, now) {
             if stale.len() < MAX_GATE_PARKED {
@@ -538,6 +591,7 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>) -> Opt
         flying,
         taxiway,
         stale,
+        refuel,
         subagents,
         now,
     })
@@ -551,6 +605,7 @@ fn apply_poll(
     callsigns: &mut Callsigns,
     taxiway_cs: &mut TaxiwayCallsigns,
     gates: &mut GateCallsigns,
+    refuel_cs: &mut RefuelCallsigns,
     wingmen: &mut Wingmen,
 ) -> Vec<(String, String)> {
     world.airports = data.airports;
@@ -746,6 +801,54 @@ fn apply_poll(
         }
     }
 
+    // --- Fuel apron: threads waiting out a provider usage limit ---
+    let refuel_ids: HashSet<String> = data.refuel.iter().map(|e| e.thread_id.clone()).collect();
+    let refuel_drop: Vec<String> = refuel_cs
+        .by_thread
+        .keys()
+        .filter(|id| !refuel_ids.contains(*id))
+        .cloned()
+        .collect();
+    for id in refuel_drop {
+        if let Some(cs) = refuel_cs.by_thread.remove(&id) {
+            world.remove_by_callsign(&cs);
+            radio_events.push((cs, "fuelled, leaving the fuel apron".to_string()));
+        }
+    }
+
+    for (i, entry) in data.refuel.iter().enumerate() {
+        let cs = refuel_cs.get(&entry.thread_id);
+        let stand = FUEL_STANDS[i % FUEL_STANDS.len()];
+        let is_new = world.get_mut(&cs).is_none();
+        if is_new {
+            let mut a = Aircraft::with_model(&cs, Kind::Agent, model_class(&entry.model));
+            a.topic = None;
+            world.add(a);
+            radio_events.push((cs.clone(), format!("out of fuel, on fuel stand {}", i + 1)));
+        }
+        if let Some(a) = world.get_mut(&cs) {
+            a.title = Some(entry.title.clone());
+            a.model = entry.model.clone();
+            a.state = State::Refuelling;
+            a.hold_reason = Some("usage limit reached".to_string());
+            a.position = [stand[0], stand[1], 0.0];
+            a.altitude = 0.0;
+            a.heading = FUEL_STAND_HEADING;
+            a.device = Some(home_name.to_string());
+            a.refuel_started_at = entry
+                .limit_hit_at
+                .as_deref()
+                .and_then(parse_rfc3339)
+                .map(|s| s * 1000);
+            a.refuel_resets_at = entry
+                .limit_reset_at
+                .as_deref()
+                .and_then(parse_rfc3339)
+                .map(|s| s * 1000);
+            a.auto_resume = entry.limit_auto_resume != 0;
+        }
+    }
+
     // --- Sub-agent Fighter Wingmen flanking their parent aircraft ---
     let mut by_parent: HashMap<String, Vec<SubagentRow>> = HashMap::new();
     for s in data.subagents {
@@ -829,6 +932,7 @@ pub async fn run(world: SharedWorld, mut rx: mpsc::Receiver<ClientFrame>) {
     let mut callsigns = Callsigns::default();
     let mut taxiway_cs = TaxiwayCallsigns::default();
     let mut gates = GateCallsigns::default();
+    let mut refuel_cs = RefuelCallsigns::default();
     let mut wingmen = Wingmen::default();
 
     // Set home airport immediately before first poll returns.
@@ -888,6 +992,7 @@ pub async fn run(world: SharedWorld, mut rx: mpsc::Receiver<ClientFrame>) {
                     &mut callsigns,
                     &mut taxiway_cs,
                     &mut gates,
+                    &mut refuel_cs,
                     &mut wingmen,
                 );
                 for (cs, what) in &events {
@@ -911,7 +1016,7 @@ pub async fn run(world: SharedWorld, mut rx: mpsc::Receiver<ClientFrame>) {
                     tracing::warn!(aircraft_id, "unknown aircraft; dropping message");
                     continue;
                 };
-                // Active fleet -> taxiway queue -> gate-parked threads -> fighter wingmen.
+                // Active fleet -> taxiway queue -> gate-parked -> fuel apron -> fighter wingmen.
                 let thread_id = callsigns
                     .by_thread
                     .iter()
@@ -926,6 +1031,13 @@ pub async fn run(world: SharedWorld, mut rx: mpsc::Receiver<ClientFrame>) {
                     })
                     .or_else(|| {
                         gates
+                            .by_thread
+                            .iter()
+                            .find(|(_, cs)| **cs == callsign)
+                            .map(|(id, _)| id.clone())
+                    })
+                    .or_else(|| {
+                        refuel_cs
                             .by_thread
                             .iter()
                             .find(|(_, cs)| **cs == callsign)
@@ -966,6 +1078,32 @@ mod tests {
         assert_eq!(parse_rfc3339("1970-01-02T00:00:00Z"), Some(86400));
         assert!(parse_rfc3339("2026-11-01T17:39:45.542Z").is_some());
         assert_eq!(parse_rfc3339("garbage"), None);
+    }
+
+    fn limit_entry(hit: Option<&str>, reset: Option<&str>) -> ThreadListEntry {
+        ThreadListEntry {
+            thread_id: "t".into(),
+            title: "t".into(),
+            project: None,
+            status: "failed".into(),
+            model: None,
+            updated_at: hit.map(str::to_string),
+            pending: 0,
+            limit_hit_at: hit.map(str::to_string),
+            limit_reset_at: reset.map(str::to_string),
+            limit_auto_resume: 1,
+        }
+    }
+
+    #[test]
+    fn usage_limited_threads_refuel_until_a_day_after_reset() {
+        let reset = parse_rfc3339("2026-11-23T22:22:00Z").unwrap();
+        let e = limit_entry(Some("2026-11-23T21:31:46.355Z"), Some("2026-11-23T22:22:00.000Z"));
+        assert!(is_refuelling(&e, reset - 600), "counting down to reset");
+        assert!(is_refuelling(&e, reset + 600), "fuelled, awaiting resume");
+        assert!(!is_refuelling(&e, reset + STALE_AFTER_SECS + 1));
+        // Latest run was not the limited one: back in the normal queues.
+        assert!(!is_refuelling(&limit_entry(None, Some("2026-11-23T22:22:00Z")), reset));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 // Radio panel: per-aircraft message history, text chat, approve/reject actions.
 
 import { liveryFor } from './livery.js';
+import { refuelStatus } from './refuel.js';
 
 const panel = document.getElementById('radio-panel');
 const callsignEl = document.getElementById('radio-callsign');
@@ -64,6 +65,12 @@ export function updateRadio(aircraft) {
   render(aircraft);
 }
 
+function refuellingStateText(a) {
+  const fuel = refuelStatus(a);
+  if (fuel.fuelled) return 'fuelled';
+  return `refuelling · ${fuel.clock ?? '--:--'}`;
+}
+
 function render(a) {
   callsignEl.textContent = a.title || a.callsign;
   callsignEl.title = a.title ? a.callsign : '';
@@ -89,7 +96,9 @@ function render(a) {
     ? 'at gate'
     : a.state === 'ready'
       ? 'taxiway queue'
-      : a.state;
+      : a.state === 'refuelling'
+        ? refuellingStateText(a)
+        : a.state;
   stateEl.style.color = stateColor(a.state);
 
   if (a.state === 'holding' && a.hold_reason) {
@@ -99,6 +108,9 @@ function render(a) {
     holdReasonEl.textContent = a.hold_reason
       ? `TAXIWAY: ${a.hold_reason} — message to clear for takeoff`
       : 'TAXIWAY QUEUE: waiting for takeoff — send a message to depart';
+    holdReasonEl.hidden = false;
+  } else if (a.state === 'refuelling') {
+    holdReasonEl.textContent = `FUEL APRON: ${refuelStatus(a).long}`;
     holdReasonEl.hidden = false;
   } else if (a.state === 'parked') {
     holdReasonEl.textContent = 'AT GATE: untouched >24h — send a message to wake & push back';
@@ -167,6 +179,7 @@ export function stateColor(state) {
     case 'parked': return '#7b8794';
     case 'taxi': return '#ffd54a';
     case 'ready': return '#ff8c42';
+    case 'refuelling': return '#b8f03a';
     case 'takeoff':
     case 'landing': return '#35d6e8';
     default: return '#ffffff';

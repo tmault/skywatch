@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::world::{
     default_sectors, formation_position, Aircraft, Airport, Kind, ModelClass, Sector, State, World,
-    GATE_HEADING, HOME_GATES, PROJECT_SECTOR_RADIUS, PROJECT_SECTOR_SLOTS, RUNWAY_MID,
+    FUEL_STANDS, FUEL_STAND_HEADING, GATE_HEADING, HOME_GATES, PROJECT_SECTOR_RADIUS, PROJECT_SECTOR_SLOTS, RUNWAY_MID,
     SATELLITE_SLOTS,
 };
 
@@ -113,6 +113,35 @@ pub fn seed(world: &mut World) {
         a.heading = GATE_HEADING;
         a.title = Some((*title).to_string());
         a.device = Some("omarchy".to_string());
+        world.add(a);
+    }
+
+    // Two threads that hit a usage limit wait on the fuel stands: one resumes
+    // by itself at the reset, the other waits for the pilot.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    for (i, (cs, title, mc, model, mins_left, auto)) in [
+        ("RF1", "Refactor sync engine", ModelClass::Frontier, "gpt-6.1-sol", 14, true),
+        ("RF2", "Draft release notes", ModelClass::Frontier, "claude-opus-5-5", 52, false),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let stand = FUEL_STANDS[i];
+        let mut a = Aircraft::with_model(cs, Kind::Agent, *mc);
+        a.model = Some((*model).to_string());
+        a.state = State::Refuelling;
+        a.position = [stand[0], stand[1], 0.0];
+        a.altitude = 0.0;
+        a.heading = FUEL_STAND_HEADING;
+        a.title = Some((*title).to_string());
+        a.device = Some("omarchy".to_string());
+        a.hold_reason = Some("usage limit reached".to_string());
+        a.refuel_started_at = Some(now_ms - 40 * 60_000);
+        a.refuel_resets_at = Some(now_ms + mins_left * 60_000);
+        a.auto_resume = *auto;
         world.add(a);
     }
 }

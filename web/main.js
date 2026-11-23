@@ -13,6 +13,7 @@ import {
   makeLakeMaterial, enableShadows,
 } from './alpine.js';
 import { addRunwayLights } from './runway-lights.js';
+import { addFuelApron, refuelStatus, FUEL_ACCENT, FUELLED_ACCENT } from './refuel.js';
 import { makeAgentMesh, makeJetMesh, makeFighterMesh, makeDroneMesh } from './aircraft.js';
 
 const WORLD_SIZE = 820;
@@ -167,6 +168,7 @@ function buildHomeAirport(ap) {
     pads: [
       { x: 70, z: -8, hw: 30, hl: 75 },  // Runway 36 + grass median + Taxiway Alpha
       { x: 123, z: 0, hw: 26, hl: 102 }, // Extended 10-gate concourse pier
+      { x: 84, z: 94, hw: 28, hl: 28 },  // Fuel apron (usage-limit stands)
     ],
     peaks: [
       { ...towerSpot, h: 15, r: 44, flat: 7, crag: 0.25 },
@@ -333,6 +335,18 @@ function buildHomeAirport(ap) {
     island.add(bridge);
   }
 
+  // Fuel apron south of the holding bay for threads waiting out a usage limit.
+  let fuelApron = null;
+  if (ap.fuel_stands?.length) {
+    fuelApron = addFuelApron(island, ap.fuel_stands, {
+      y: TARMAC_TOP_Y, markY, makeDeckSlab, makeMarking, taxiMat, apronMat, yellowLineMat,
+    });
+    const fuelSign = makeBannerLabel('FUEL APRON', 0x0b1a10, FUEL_ACCENT);
+    fuelSign.position.set(fuelApron.center[0], 12, fuelApron.backZ + 2);
+    fuelSign.scale.set(24, 4.7, 1);
+    island.add(fuelSign);
+  }
+
   // Airport name banner above the tower.
   const label = makeBannerLabel(ap.name.toUpperCase(), 0xffffff, SWISS_RED, 10);
   label.position.set(towerSpot.x, 63, towerSpot.z);
@@ -340,7 +354,7 @@ function buildHomeAirport(ap) {
 
   enableShadows(island);
   scene.add(island);
-  return { group: island, beacon, lights, online: ap.online };
+  return { group: island, beacon, lights, fuelApron, online: ap.online };
 }
 
 function buildSatelliteAirport(ap, idx) {
@@ -739,6 +753,23 @@ function buildAircraftLabelTexture(a, accentHex) {
   ctx.textBaseline = 'middle';
   ctx.fillText(taskText, 28, 37);
 
+  // Refuelling: countdown to the usage reset plus a fuel gauge along the base.
+  if (a.state === 'refuelling') {
+    const fuel = refuelStatus(a);
+    ctx.font = 'bold 21px "IBM Plex Mono", ui-monospace, monospace';
+    ctx.fillStyle = accent;
+    ctx.fillText(`${a.callsign} · ${fuel.short}`, 28, 68);
+    const gx = 28;
+    const gw = c.width - 52;
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.14)';
+    ctx.fillRect(gx, 84, gw, 8);
+    ctx.fillStyle = accent;
+    ctx.fillRect(gx, 84, gw * fuel.progress, 8);
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
   // Secondary line: callsign + role/state.
   const stateLabel = a.state === 'parked'
     ? 'AT GATE · >24H'
@@ -758,6 +789,7 @@ function buildAircraftLabelTexture(a, accentHex) {
 }
 
 function labelAccentFor(a) {
+  if (a.state === 'refuelling') return refuelStatus(a).fuelled ? FUELLED_ACCENT : FUEL_ACCENT;
   if (a.state === 'holding') return 0xffb020;
   if (a.state === 'ready') return 0xff943b;
   if (a.kind === 'fighter') return 0x7ce8ff;
@@ -767,8 +799,18 @@ function labelAccentFor(a) {
   return 0x5be7ff;
 }
 
+// Neighbouring fuel stands are closer than a label is wide, so alternate
+// columns lift their labels clear of each other.
+function labelHeightFor(a) {
+  const base = a.kind === 'fighter' ? 9.5 : 13;
+  if (a.state !== 'refuelling') return base;
+  return base + (Math.round(a.position[0] / 16) % 2 === 0 ? 0 : 9);
+}
+
 function updateAircraftLabel(entry, a) {
-  const key = `${a.title || ''}|${a.state}|${a.topic || ''}|${a.callsign}`;
+  const fuel = a.state === 'refuelling' ? refuelStatus(a) : null;
+  const key = `${a.title || ''}|${a.state}|${a.topic || ''}|${a.callsign}`
+    + (fuel ? `|${fuel.short}|${Math.round(fuel.progress * 200)}` : '');
   if (entry.labelKey === key) return;
   entry.labelKey = key;
   const accent = labelAccentFor(a);
@@ -1341,7 +1383,7 @@ function applySnapshot(snapshot) {
     // Repaint when the thread switches model (new livery).
     if (meshes.has(a.id) && meshes.get(a.id).model !== (a.model ?? null)) disposeMesh(a.id);
     const entry = ensureMesh(a);
-    const onGround = ['landed', 'taxi', 'ready', 'parked'].includes(a.state);
+    const onGround = ['landed', 'taxi', 'ready', 'parked', 'refuelling'].includes(a.state);
     const groundY = onGround ? TARMAC_TOP_Y + entry.wheelDrop : 0;
     entry.target.set(a.position[0], a.position[2] + groundY, a.position[1]);
     entry.targetHeading = a.heading;
@@ -1353,6 +1395,7 @@ function applySnapshot(snapshot) {
     entry.state = a.state;
     setColor(entry, a);
     updateAircraftLabel(entry, a);
+    entry.label.position.y = labelHeightFor(a) / entry.scale;
     entry.ring.visible = a.state === 'holding';
   }
 
@@ -1401,6 +1444,13 @@ function handleStateChange(a, from, to) {
     else if (to === 'landed') addTickerLine(`${tag}: landed, off frequency.`);
     else if (to === 'taxi') addTickerLine(`${tag}: taxiing.`);
     else if (to === 'parked') addTickerLine(`${tag}: parked at the gate.`);
+    else if (to === 'refuelling') {
+      const fuel = refuelStatus(a);
+      const when = fuel.clock && !fuel.fuelled
+        ? (a.auto_resume ? `, auto take-off in ${fuel.clock}` : `, limit resets in ${fuel.clock}`)
+        : '';
+      addTickerLine(`${tag}: out of fuel (usage limit), refuelling on the fuel apron${when}.`);
+    }
     else if (to === 'ready') addTickerLine(`${tag}: lined up, ready for takeoff.`, true, a.id);
     else if (to === 'cruising' && from !== undefined) addTickerLine(`${tag}: cruising.`);
   }
@@ -1412,6 +1462,7 @@ function handleStateChange(a, from, to) {
       landed: 'landed',
       taxi: 'taxiing',
       parked: 'parked at the gate',
+      refuelling: 'refuelling (usage limit)',
       ready: 'ready for takeoff',
       cruising: 'cruising',
     }[to];
@@ -1545,6 +1596,13 @@ function animate() {
     const pulse = ap.online ? 0.85 + 0.3 * Math.sin(now * 3) : 0.7;
     ap.beacon.scale.setScalar(pulse);
     ap.lights.update(now);
+    if (ap.fuelApron) {
+      const occupied = [];
+      for (const a of currentSnapshot.values()) {
+        if (a.state === 'refuelling') occupied.push([a.position[0], a.position[1]]);
+      }
+      ap.fuelApron.update(now, occupied);
+    }
   }
 
   // Follow camera: track the selected aircraft while keeping OrbitControls active.
