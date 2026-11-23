@@ -1,3 +1,4 @@
+mod adapters;
 mod seed;
 mod world;
 mod ws;
@@ -35,7 +36,20 @@ async fn main() {
         Ok("0") | Ok("false") => false,
         _ => true,
     };
-    if demo_mode {
+
+    // T3 adapter: mirror recent T3 threads as aircraft. SKYWATCH_T3=0
+    // disables; when enabled it takes the adapter channel and the demo
+    // seed is skipped so the world shows real traffic only.
+    let t3_mode = match std::env::var("SKYWATCH_T3").as_deref() {
+        Ok("0") | Ok("false") => false,
+        _ => true,
+    };
+
+    if t3_mode {
+        let world = Arc::clone(&world);
+        tokio::spawn(adapters::t3::run(world, adapter_rx));
+        tracing::info!("t3 adapter enabled");
+    } else if demo_mode {
         {
             let mut w = world.lock().await;
             seed::seed(&mut w);
@@ -52,6 +66,9 @@ async fn main() {
                 tracing::debug!(?frame, "demo adapter: frame dropped");
             }
         });
+    } else {
+        // Neither adapter nor demo: drain the channel.
+        tokio::spawn(async move { while adapter_rx.recv().await.is_some() {} });
     }
 
     // Sim ticker: advance the world at 20 Hz and broadcast full snapshots.
@@ -74,7 +91,7 @@ async fn main() {
         });
     }
 
-    // TODO(Task 4): real adapters replace the demo drain above.
+    // T3 adapter relays messages via `t3 thread send` when enabled.
 
     // Serve the browser client; unknown paths fall back to index.html with 200.
     let web_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -47,6 +47,9 @@ pub struct Aircraft {
     /// Topic sector this aircraft works in (None = unassigned).
     #[serde(default)]
     pub topic: Option<String>,
+    /// Human-readable subject (thread title for T3 aircraft).
+    #[serde(default)]
+    pub title: Option<String>,
     /// Ground speed in m/s (serde default keeps old snapshots deserialisable).
     #[serde(default = "default_speed")]
     pub speed: f32,
@@ -129,6 +132,7 @@ impl Aircraft {
             altitude: CRUISE_ALTITUDE,
             hold_reason: None,
             topic: None,
+            title: None,
             speed,
         }
     }
@@ -174,8 +178,8 @@ impl Aircraft {
                     if let Some((_, centre, radius)) =
                         SECTORS.iter().find(|(name, _, _)| name == topic)
                     {
-                        let dist = (self.position[0] - centre[0])
-                            .hypot(self.position[1] - centre[1]);
+                        let dist =
+                            (self.position[0] - centre[0]).hypot(self.position[1] - centre[1]);
                         if dist > radius * 0.6 {
                             steer_toward(
                                 &mut self.heading,
@@ -247,6 +251,11 @@ impl World {
 
     pub fn get_mut(&mut self, callsign: &str) -> Option<&mut Aircraft> {
         self.aircraft.iter_mut().find(|a| a.callsign == callsign)
+    }
+
+    /// Remove an aircraft by callsign (adapter reconciliation).
+    pub fn remove_by_callsign(&mut self, callsign: &str) {
+        self.aircraft.retain(|a| a.callsign != callsign);
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Aircraft> {

@@ -65,7 +65,8 @@ export function updateRadio(aircraft) {
 
 function render(a) {
   selectedState = a.state;
-  callsignEl.textContent = a.callsign;
+  callsignEl.textContent = a.title || a.callsign;
+  callsignEl.title = a.title ? a.callsign : '';
   kindEl.textContent =
     (a.kind === 'drone' ? 'DRONE' : a.model_class === 'frontier' ? 'AGENT · FRONTIER JET' : 'AGENT · LOCAL PROP')
     + (a.topic ? ` · ${a.topic.toUpperCase()}` : '');
