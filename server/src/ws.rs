@@ -33,7 +33,9 @@ enum ClientMsg {
         #[serde(default)]
         text: String,
     },
-    Approve { aircraft_id: u64 },
+    Approve {
+        aircraft_id: u64,
+    },
 }
 
 /// State shared with all WS connections.
@@ -154,7 +156,11 @@ mod tests {
 
         let (deltas, _dr) = broadcast::channel(64);
         let (adapter_tx, mut adapter_rx) = mpsc::channel(64);
-        let state = HubState { world: Arc::clone(&world), deltas, adapter_tx };
+        let state = HubState {
+            world: Arc::clone(&world),
+            deltas,
+            adapter_tx,
+        };
 
         handle_frame(&state, ClientFrame::Approve { aircraft_id: id }).await;
 
@@ -180,7 +186,11 @@ mod tests {
 
         let (deltas, _dr) = broadcast::channel(64);
         let (adapter_tx, mut adapter_rx) = mpsc::channel(64);
-        let state = HubState { world: Arc::clone(&world), deltas, adapter_tx };
+        let state = HubState {
+            world: Arc::clone(&world),
+            deltas,
+            adapter_tx,
+        };
 
         handle_frame(&state, ClientFrame::Approve { aircraft_id: id }).await;
 

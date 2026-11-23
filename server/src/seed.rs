@@ -81,14 +81,38 @@ const SCRIPT_LEN: u32 = 6;
 
 const SCRIPT: [Step; 6] = [
     // SKY1: hold one cycle, then released.
-    Step { callsign: "SKY1", action: Action::Hold("requesting vector"), cycle: 1 },
-    Step { callsign: "SKY1", action: Action::Release, cycle: 2 },
+    Step {
+        callsign: "SKY1",
+        action: Action::Hold("requesting vector"),
+        cycle: 1,
+    },
+    Step {
+        callsign: "SKY1",
+        action: Action::Release,
+        cycle: 2,
+    },
     // SKY3: 2 landed cycles, then takeoff; cruises for a while, then lands.
-    Step { callsign: "SKY3", action: Action::Release, cycle: 3 },
-    Step { callsign: "SKY3", action: Action::Land, cycle: 5 },
+    Step {
+        callsign: "SKY3",
+        action: Action::Release,
+        cycle: 3,
+    },
+    Step {
+        callsign: "SKY3",
+        action: Action::Land,
+        cycle: 5,
+    },
     // A second SKY1 hold cycle keeps the sky busy near the end of the loop.
-    Step { callsign: "SKY1", action: Action::Hold("requesting vector"), cycle: 5 },
-    Step { callsign: "SKY1", action: Action::Release, cycle: 0 },
+    Step {
+        callsign: "SKY1",
+        action: Action::Hold("requesting vector"),
+        cycle: 5,
+    },
+    Step {
+        callsign: "SKY1",
+        action: Action::Release,
+        cycle: 0,
+    },
 ];
 
 /// Drones keep loitering on their own; no scripted steps for them.
@@ -155,10 +179,8 @@ mod tests {
     fn seed_creates_expected_cast() {
         let mut world = World::new();
         seed(&mut world);
-        let mut seen: Vec<(String, Kind)> = world
-            .iter()
-            .map(|a| (a.callsign.clone(), a.kind))
-            .collect();
+        let mut seen: Vec<(String, Kind)> =
+            world.iter().map(|a| (a.callsign.clone(), a.kind)).collect();
         seen.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
             seen,
@@ -183,7 +205,10 @@ mod tests {
         assert_eq!(state_of("REAP1"), State::Cruising);
         assert_eq!(state_of("REAP2"), State::Cruising);
         let sky2 = world.iter().find(|a| a.callsign == "SKY2").unwrap();
-        assert_eq!(sky2.hold_reason.as_deref(), Some("awaiting approval of refactor plan"));
+        assert_eq!(
+            sky2.hold_reason.as_deref(),
+            Some("awaiting approval of refactor plan")
+        );
     }
 
     #[test]

@@ -197,6 +197,10 @@ function disposeMesh(id) {
   scene.remove(entry.group);
   entry.group.traverse((o) => {
     if (o.geometry) o.geometry.dispose();
+    if (o.material && !entry.materials.includes(o.material)) {
+      if (o.material.map) o.material.map.dispose();
+      o.material.dispose();
+    }
   });
   for (const m of entry.materials) m.dispose();
   meshes.delete(id);
