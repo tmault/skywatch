@@ -8,9 +8,9 @@
 //! radio-panel messages back into the owning thread via `t3 thread send`.
 
 use crate::world::{
-    default_sectors, formation_position, Aircraft, Airport, Kind, ModelClass, Sector, State, World,
-    GATE_HEADING, HOME_GATES, PROJECT_SECTOR_RADIUS, PROJECT_SECTOR_SLOTS, RUNWAY_HEADING,
-    RUNWAY_THRESHOLD, SATELLITE_SLOTS, TAXIWAY_QUEUE,
+    default_sectors, formation_position, provider_info, Aircraft, Airport, Kind, ModelClass,
+    Sector, State, World, GATE_HEADING, HOME_GATES, PROJECT_SECTOR_RADIUS, PROJECT_SECTOR_SLOTS,
+    RUNWAY_HEADING, RUNWAY_THRESHOLD, SATELLITE_SLOTS, TAXIWAY_QUEUE,
 };
 use crate::ws::{ClientFrame, SharedWorld};
 use serde::Deserialize;
@@ -24,6 +24,10 @@ use tokio::sync::mpsc;
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// How many actively working threads to fly concurrently.
 const MAX_AIRCRAFT: usize = 6;
+/// How many token-limited threads can hold on aerial refuelling tankers concurrently.
+const MAX_REFUELING: usize = 8;
+/// Fallback window (seconds) for a usage-limit error that has no explicit reset time.
+const USAGE_LIMIT_FALLBACK_SECS: i64 = 15 * 60;
 /// How many recent (<24h) idle/waiting threads to queue along Taxiway Alpha.
 const MAX_TAXIWAY_QUEUE: usize = TAXIWAY_QUEUE.len();
 /// Threads untouched for longer than this park at the extended terminal gates.
@@ -34,6 +38,18 @@ const MAX_GATE_PARKED: usize = HOME_GATES.len();
 const MAX_WINGMEN_PER_PARENT: usize = 4;
 /// Recently finished sub-agents linger on the wing briefly before peeling off.
 const SUBAGENT_LINGER_SECS: i64 = 600;
+
+fn deserialize_opt_bool_ish<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    Ok(match val {
+        Some(serde_json::Value::Bool(b)) => Some(b),
+        Some(serde_json::Value::Number(n)) => Some(n.as_i64().unwrap_or(0) != 0),
+        _ => None,
+    })
+}
 
 #[derive(Deserialize)]
 struct ThreadListEntry {
@@ -53,6 +69,37 @@ struct ThreadListEntry {
     settled: bool,
     #[serde(rename = "settledAt", alias = "settled_at", default)]
     settled_at: Option<String>,
+    #[serde(default)]
+    latest_run_id: Option<String>,
+    #[serde(default)]
+    latest_run_provider: Option<String>,
+    #[serde(default)]
+    latest_run_model: Option<String>,
+    #[serde(default)]
+    latest_run_completed_at: Option<String>,
+    #[serde(default)]
+    limit_recovery_run_id: Option<String>,
+    #[serde(default)]
+    limit_recovery_reset_at: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_bool_ish")]
+    limit_recovery_auto_resume: Option<bool>,
+    #[serde(default)]
+    limit_recovery_model: Option<String>,
+    #[serde(default)]
+    limit_recovery_provider: Option<String>,
+    #[serde(default)]
+    usage_limit_reset_at: Option<String>,
+    #[serde(default)]
+    usage_limit_message: Option<String>,
+}
+
+/// Active token/usage-limit wait detected for a T3 thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TokenWait {
+    reason: String,
+    reset_at: Option<String>,
+    model_override: Option<String>,
+    provider_hint: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -188,6 +235,172 @@ fn parse_rfc3339(s: &str) -> Option<i64> {
     let mi = num(14, 2)?;
     let sec = num(17, 2)?;
     Some(days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec)
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn format_rfc3339(ts: i64) -> String {
+    let days = ts.div_euclid(86400);
+    let rem = ts.rem_euclid(86400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// Parse a relative reset duration like `"resets in 2h 56m"`, `"resets in 3h"`,
+/// or `"resets in 45m"` into seconds.
+fn parse_resets_in_secs(msg: &str) -> Option<i64> {
+    let lower = msg.to_lowercase();
+    let idx = lower.find("resets in ")?;
+    let rest = &lower[idx + "resets in ".len()..];
+    let mut total: i64 = 0;
+    let mut matched = false;
+    for tok in rest.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if tok.is_empty() {
+            continue;
+        }
+        if let Some(num) = tok.strip_suffix('h').and_then(|n| n.parse::<i64>().ok()) {
+            total += num * 3600;
+            matched = true;
+        } else if let Some(num) = tok.strip_suffix('m').and_then(|n| n.parse::<i64>().ok()) {
+            total += num * 60;
+            matched = true;
+        } else if let Some(num) = tok.strip_suffix('s').and_then(|n| n.parse::<i64>().ok()) {
+            total += num;
+            matched = true;
+        } else if matched {
+            break;
+        } else {
+            break;
+        }
+    }
+    if matched && total > 0 {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+/// Determine whether a T3 thread is currently waiting for provider tokens /
+/// usage-limit reset and should connect to its provider's aerial tanker.
+fn detect_token_wait(entry: &ThreadListEntry, now: i64) -> Option<TokenWait> {
+    if matches!(
+        entry.status.as_str(),
+        "completed" | "cancelled" | "interrupted" | "idle"
+    ) {
+        return None;
+    }
+
+    // 1. Latest run itself hit a usage limit (`failure.class = 'usage_limit'`
+    //    or a `usage-limit` system notice).
+    let has_latest_limit =
+        entry.usage_limit_reset_at.is_some() || entry.usage_limit_message.is_some();
+    if has_latest_limit {
+        let same_lr_run = entry.limit_recovery_run_id.is_some()
+            && entry.limit_recovery_run_id == entry.latest_run_id;
+        let explicit_reset_str = entry
+            .usage_limit_reset_at
+            .as_deref()
+            .or_else(|| {
+                if same_lr_run {
+                    entry.limit_recovery_reset_at.as_deref()
+                } else {
+                    None
+                }
+            });
+
+        let derived_reset = explicit_reset_str
+            .and_then(|s| parse_rfc3339(s).map(|ts| (ts, s.to_string())))
+            .or_else(|| {
+                let msg = entry.usage_limit_message.as_deref()?;
+                let delta = parse_resets_in_secs(msg)?;
+                let base_ts = entry
+                    .latest_run_completed_at
+                    .as_deref()
+                    .or(entry.updated_at.as_deref())
+                    .and_then(parse_rfc3339)?;
+                let ts = base_ts + delta;
+                Some((ts, format_rfc3339(ts)))
+            });
+
+        let still_waiting = match &derived_reset {
+            Some((reset_ts, _)) => *reset_ts > now,
+            None => {
+                // Mid-run usage limit pause, or very recent failure without a reset timestamp.
+                if entry.status != "failed" {
+                    true
+                } else {
+                    entry
+                        .latest_run_completed_at
+                        .as_deref()
+                        .or(entry.updated_at.as_deref())
+                        .and_then(parse_rfc3339)
+                        .map(|t| now - t < USAGE_LIMIT_FALLBACK_SECS)
+                        .unwrap_or(false)
+                }
+            }
+        };
+
+        if still_waiting {
+            let reason = entry
+                .usage_limit_message
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("usage limit reached — waiting for tokens")
+                .to_string();
+            return Some(TokenWait {
+                reason,
+                reset_at: derived_reset.map(|(_, s)| s),
+                model_override: entry.latest_run_model.clone().or_else(|| entry.model.clone()),
+                provider_hint: entry.latest_run_provider.clone(),
+            });
+        }
+    }
+
+    // 2. Thread has an armed `limitRecovery` with a future `resetAt` while its
+    //    latest run is still `failed` (has not yet resumed/completed).
+    if entry.status == "failed" && entry.limit_recovery_auto_resume == Some(true) {
+        if let Some(reset_str) = entry.limit_recovery_reset_at.as_deref() {
+            if let Some(reset_ts) = parse_rfc3339(reset_str) {
+                if reset_ts > now {
+                    return Some(TokenWait {
+                        reason: "usage limit reached — waiting for tokens".to_string(),
+                        reset_at: Some(reset_str.to_string()),
+                        model_override: entry
+                            .limit_recovery_model
+                            .clone()
+                            .or_else(|| entry.latest_run_model.clone())
+                            .or_else(|| entry.model.clone()),
+                        provider_hint: entry
+                            .limit_recovery_provider
+                            .clone()
+                            .or_else(|| entry.latest_run_provider.clone()),
+                    });
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// A thread is stale when its last update is older than 24 hours.
@@ -472,11 +685,48 @@ fn poll_threads() -> Option<(Vec<ThreadListEntry>, HashSet<String>)> {
     let active_sql = "SELECT t.thread_id, t.title, t.updated_at, \
                p.title AS project, \
                json_extract(t.payload_json, '$.modelSelection.model') AS model, \
+               (SELECT r.run_id FROM orchestration_v2_projection_runs r \
+                WHERE r.thread_id = t.thread_id \
+                ORDER BY (r.completed_at IS NULL) DESC, r.ordinal DESC LIMIT 1) AS latest_run_id, \
                COALESCE((SELECT r.status FROM orchestration_v2_projection_runs r \
                          WHERE r.thread_id = t.thread_id \
                          ORDER BY (r.completed_at IS NULL) DESC, r.ordinal DESC LIMIT 1), 'idle') AS status, \
+               (SELECT r.provider FROM orchestration_v2_projection_runs r \
+                WHERE r.thread_id = t.thread_id \
+                ORDER BY (r.completed_at IS NULL) DESC, r.ordinal DESC LIMIT 1) AS latest_run_provider, \
+               (SELECT json_extract(r.payload_json, '$.modelSelection.model') FROM orchestration_v2_projection_runs r \
+                WHERE r.thread_id = t.thread_id \
+                ORDER BY (r.completed_at IS NULL) DESC, r.ordinal DESC LIMIT 1) AS latest_run_model, \
+               (SELECT r.completed_at FROM orchestration_v2_projection_runs r \
+                WHERE r.thread_id = t.thread_id \
+                ORDER BY (r.completed_at IS NULL) DESC, r.ordinal DESC LIMIT 1) AS latest_run_completed_at, \
                (SELECT COUNT(*) FROM orchestration_v2_projection_runtime_requests q \
-                WHERE q.thread_id = t.thread_id AND q.resolved_at IS NULL) AS pending \
+                WHERE q.thread_id = t.thread_id AND q.resolved_at IS NULL) AS pending, \
+               json_extract(t.payload_json, '$.limitRecovery.runId') AS limit_recovery_run_id, \
+               json_extract(t.payload_json, '$.limitRecovery.resetAt') AS limit_recovery_reset_at, \
+               json_extract(t.payload_json, '$.limitRecovery.autoResume') AS limit_recovery_auto_resume, \
+               (SELECT json_extract(lr.payload_json, '$.modelSelection.model') \
+                FROM orchestration_v2_projection_runs lr \
+                WHERE lr.run_id = json_extract(t.payload_json, '$.limitRecovery.runId') LIMIT 1) AS limit_recovery_model, \
+               (SELECT lr.provider \
+                FROM orchestration_v2_projection_runs lr \
+                WHERE lr.run_id = json_extract(t.payload_json, '$.limitRecovery.runId') LIMIT 1) AS limit_recovery_provider, \
+               (SELECT json_extract(i.payload_json, '$.failure.resetAt') \
+                FROM orchestration_v2_projection_turn_items i \
+                WHERE i.run_id = (SELECT r.run_id FROM orchestration_v2_projection_runs r \
+                                  WHERE r.thread_id = t.thread_id \
+                                  ORDER BY (r.completed_at IS NULL) DESC, r.ordinal DESC LIMIT 1) \
+                  AND i.type = 'error' \
+                  AND json_extract(i.payload_json, '$.failure.class') = 'usage_limit' \
+                ORDER BY i.ordinal DESC LIMIT 1) AS usage_limit_reset_at, \
+               (SELECT COALESCE(json_extract(i.payload_json, '$.failure.message'), json_extract(i.payload_json, '$.message')) \
+                FROM orchestration_v2_projection_turn_items i \
+                WHERE i.run_id = (SELECT r.run_id FROM orchestration_v2_projection_runs r \
+                                  WHERE r.thread_id = t.thread_id \
+                                  ORDER BY (r.completed_at IS NULL) DESC, r.ordinal DESC LIMIT 1) \
+                  AND ((i.type = 'error' AND json_extract(i.payload_json, '$.failure.class') = 'usage_limit') \
+                       OR (i.type = 'system_notice' AND i.payload_json LIKE '%usage-limit%')) \
+                ORDER BY i.ordinal DESC LIMIT 1) AS usage_limit_message \
                FROM orchestration_v2_projection_threads t \
                LEFT JOIN projection_projects p ON p.project_id = t.project_id \
                WHERE t.deleted_at IS NULL \
@@ -553,7 +803,7 @@ fn poll_done_or_archived_ids() -> Option<HashSet<String>> {
 /// 20 Hz simulation tick or WebSocket connections.
 struct PollData {
     airports: Vec<Airport>,
-    /// Actively working threads (flying or holding).
+    /// Actively working or token-waiting threads (flying, holding, or refueling).
     flying: Vec<(ThreadListEntry, i64)>,
     /// Recent (<24h) non-running threads queued on Taxiway Alpha waiting for takeoff.
     taxiway: Vec<ThreadListEntry>,
@@ -576,13 +826,22 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>) -> Opt
         .unwrap_or(0);
 
     let mut flying = Vec::new();
+    let mut working_count = 0usize;
+    let mut refuel_count = 0usize;
     let mut taxiway = Vec::new();
     let mut stale = Vec::new();
     for e in entries {
-        if is_working_status(&e.status) {
-            if flying.len() < MAX_AIRCRAFT {
+        if detect_token_wait(&e, now).is_some() {
+            if refuel_count < MAX_REFUELING {
                 let pending = e.pending;
                 flying.push((e, pending));
+                refuel_count += 1;
+            }
+        } else if is_working_status(&e.status) {
+            if working_count < MAX_AIRCRAFT {
+                let pending = e.pending;
+                flying.push((e, pending));
+                working_count += 1;
             }
         } else if is_stale(&e.updated_at, now) {
             if stale.len() < MAX_GATE_PARKED {
@@ -607,6 +866,17 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>) -> Opt
     })
 }
 
+struct KeepInfo {
+    state: State,
+    reason: Option<String>,
+    title: Option<String>,
+    model_class: ModelClass,
+    model: Option<String>,
+    provider: Option<String>,
+    reset_at: Option<String>,
+    zone: String,
+}
+
 /// Reconcile the world in-memory from already-fetched `PollData`.
 fn apply_poll(
     world: &mut World,
@@ -619,39 +889,55 @@ fn apply_poll(
     runway: &mut RunwayOps,
 ) -> Vec<(String, String)> {
     world.airports = data.airports;
-    let _ = data.now;
+    let now = data.now;
 
-    let mut keep: HashMap<String, (State, Option<String>, Option<String>, ModelClass, String)> =
-        HashMap::new();
+    let mut keep: HashMap<String, KeepInfo> = HashMap::new();
     let mut new_threads: Vec<(String, String, ModelClass)> = Vec::new();
     let mut active_projects: Vec<String> = Vec::new();
-    let mut models: HashMap<String, Option<String>> = HashMap::new();
 
     for (entry, pending) in &data.flying {
-        models.insert(entry.thread_id.clone(), entry.model.clone());
-        let (state, reason) = flight_state(&entry.status, *pending);
+        let token_wait = detect_token_wait(entry, now);
+        let (state, reason, reset_at, eff_model, prov_hint) = if let Some(tw) = token_wait {
+            (
+                State::Refueling,
+                Some(tw.reason),
+                tw.reset_at,
+                tw.model_override.or_else(|| entry.model.clone()),
+                tw.provider_hint,
+            )
+        } else {
+            let (st, r) = flight_state(&entry.status, *pending);
+            (
+                st,
+                r,
+                None,
+                entry.model.clone(),
+                entry.latest_run_provider.clone(),
+            )
+        };
+        let (prov_key, _, _, _) = provider_info(eff_model.as_deref(), prov_hint.as_deref());
+        let mc = model_class(&eff_model);
         let (zone, is_project) = classify_zone(entry.project.as_deref(), &entry.title);
         if is_project && !active_projects.contains(&zone) {
             active_projects.push(zone.clone());
         }
         keep.insert(
             entry.thread_id.clone(),
-            (
+            KeepInfo {
                 state,
                 reason,
-                Some(entry.title.clone()),
-                model_class(&entry.model),
+                title: Some(entry.title.clone()),
+                model_class: mc,
+                model: eff_model,
+                provider: Some(prov_key.to_string()),
+                reset_at,
                 zone,
-            ),
+            },
         );
         if callsigns.by_thread.contains_key(&entry.thread_id) {
             continue;
         }
-        new_threads.push((
-            entry.thread_id.clone(),
-            entry.title.clone(),
-            model_class(&entry.model),
-        ));
+        new_threads.push((entry.thread_id.clone(), entry.title.clone(), mc));
     }
 
     // A thread that starts working again mid-arrival goes around and keeps its callsign.
@@ -735,29 +1021,45 @@ fn apply_poll(
     order.extend(new_threads.iter().map(|(id, _, _)| id.clone()));
 
     for thread_id in &order {
-        let Some((state, reason, title, _model_class, zone)) = keep.get(thread_id) else {
+        let Some(info) = keep.get(thread_id) else {
             continue;
         };
         let cs = callsigns.get(thread_id);
         if let Some(a) = world.get_mut(&cs) {
             // Let takeoffs and go-arounds finish; the steady state applies after.
             if !a.in_runway_sequence() {
-                if a.state != *state {
+                if a.state != info.state {
                     radio_events.push((
                         cs.clone(),
-                        match state {
+                        match info.state {
                             State::Holding => "entering hold".to_string(),
+                            State::Refueling => "connecting to aerial tanker — waiting for tokens".to_string(),
                             State::Cruising => "cruising".to_string(),
                             _ => "updating".to_string(),
                         },
                     ));
                 }
-                a.state = *state;
+                if info.state == State::Refueling {
+                    a.refuel(
+                        info.reason
+                            .as_deref()
+                            .unwrap_or("usage limit reached — waiting for tokens"),
+                        info.reset_at.clone(),
+                    );
+                } else {
+                    if a.state == State::Refueling && info.state == State::Cruising {
+                        a.release();
+                    }
+                    a.state = info.state;
+                    a.refuel_reset_at = None;
+                }
             }
-            a.hold_reason = reason.clone();
-            a.title = title.clone();
-            a.topic = Some(zone.clone());
-            a.model = models.get(thread_id).cloned().flatten();
+            a.hold_reason = info.reason.clone();
+            a.title = info.title.clone();
+            a.topic = Some(info.zone.clone());
+            a.model = info.model.clone();
+            a.model_class = info.model_class;
+            a.provider = info.provider.clone();
             a.device = Some(home_name.to_string());
         } else if let Some((_, t, mc)) = new_threads.iter().find(|(id, _, _)| id == thread_id) {
             // Woken from the taxiway queue or a gate: the same airframe taxis
@@ -770,29 +1072,31 @@ fn apply_poll(
             if let Some(gcs) = ground_cs {
                 if world.rename(&gcs, &cs) {
                     if let Some(a) = world.get_mut(&cs) {
-                        a.title = title.clone();
-                        a.model = models.get(thread_id).cloned().flatten();
+                        a.title = info.title.clone();
+                        a.model = info.model.clone();
                         a.model_class = *mc;
-                        a.assign(zone);
+                        a.provider = info.provider.clone();
+                        a.assign(&info.zone);
                         a.release();
-                        a.hold_reason = reason.clone();
+                        a.hold_reason = info.reason.clone();
+                        a.refuel_reset_at = info.reset_at.clone();
                     }
                     radio_events.push((cs.clone(), "cleared for takeoff, Runway 36".to_string()));
                     continue;
                 }
             }
             let mut a = Aircraft::with_model(&cs, Kind::Agent, *mc);
-            a.title = Some(t.clone());
-            a.model = models.get(thread_id).cloned().flatten();
+            a.title = info.title.clone().or_else(|| Some(t.clone()));
+            a.model = info.model.clone();
+            a.provider = info.provider.clone();
             a.device = Some(home_name.to_string());
-            if let Some((_, reason, title, _, zone)) = keep.get(thread_id) {
-                a.hold_reason = reason.clone();
-                a.title = title.clone();
-                a.assign(zone);
-            }
-            a.state = *state;
+            a.hold_reason = info.reason.clone();
+            a.refuel_reset_at = info.reset_at.clone();
+            a.assign(&info.zone);
+            a.state = info.state;
             let a_reason = a.hold_reason.clone();
-            if runway.primed {
+            let a_reset = a.refuel_reset_at.clone();
+            if runway.primed && info.state != State::Refueling {
                 // Brand-new thread: line up on Runway 36 and take off.
                 a.position = [RUNWAY_THRESHOLD[0], RUNWAY_THRESHOLD[1], 0.0];
                 a.altitude = 0.0;
@@ -800,6 +1104,7 @@ fn apply_poll(
                 a.state = State::Ready;
                 a.release();
                 a.hold_reason = a_reason;
+                a.refuel_reset_at = a_reset;
                 radio_events.push((cs.clone(), "lined up, Runway 36".to_string()));
             }
             world.add(a);
@@ -1023,6 +1328,13 @@ fn apply_poll(
         }
     }
 
+    // Reconcile provider aerial refuelling tankers for any waiting threads.
+    if !runway.primed {
+        world.snap_refueling_to_tankers();
+    } else {
+        world.sync_tankers();
+    }
+
     runway.primed = true;
     radio_events
 }
@@ -1206,19 +1518,6 @@ mod tests {
         assert!(!is_stale(&None, now));
     }
 
-    fn civil_from_days(z: i64) -> (i64, i64, i64) {
-        let z = z + 719468;
-        let era = if z >= 0 { z } else { z - 146096 } / 146097;
-        let doe = z - era * 146097;
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-        let y = yoe + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 };
-        (if m <= 2 { y + 1 } else { y }, m, d)
-    }
-
     #[test]
     fn home_gates_are_spaced_along_terminal() {
         let g0 = home_gate_slot(0);
@@ -1275,6 +1574,17 @@ mod tests {
             pending: 0,
             settled: false,
             settled_at: None,
+            latest_run_id: Some(format!("run:{id}:1")),
+            latest_run_provider: Some("claudeAgent".to_string()),
+            latest_run_model: Some("claude-opus-5-5".to_string()),
+            latest_run_completed_at: None,
+            limit_recovery_run_id: None,
+            limit_recovery_reset_at: None,
+            limit_recovery_auto_resume: None,
+            limit_recovery_model: None,
+            limit_recovery_provider: None,
+            usage_limit_reset_at: None,
+            usage_limit_message: None,
         }
     }
 
@@ -1534,5 +1844,111 @@ mod tests {
         assert_eq!(a.state, State::Ready);
         assert_eq!([a.position[0], a.position[1]], RUNWAY_THRESHOLD);
         assert!(a.in_runway_sequence());
+    }
+
+    #[test]
+    fn parses_relative_reset_durations() {
+        assert_eq!(
+            parse_resets_in_secs("OpenCode Go usage limit reached (5-hour, resets in 2h 56m)."),
+            Some(2 * 3600 + 56 * 60)
+        );
+        assert_eq!(parse_resets_in_secs("resets in 3h"), Some(3 * 3600));
+        assert_eq!(parse_resets_in_secs("resets in 45m"), Some(45 * 60));
+        assert_eq!(parse_resets_in_secs("no timer here"), None);
+    }
+
+    #[test]
+    fn token_limited_threads_spawn_provider_tanker_and_despawn_when_resumed() {
+        let mut world = World::new();
+        let mut callsigns = Callsigns::default();
+        let mut taxiway_cs = TaxiwayCallsigns::default();
+        let mut gates = GateCallsigns::default();
+        let mut wingmen = Wingmen::default();
+        let mut runway = RunwayOps::default();
+
+        let now = parse_rfc3339("2026-11-23T22:15:00Z").unwrap();
+        let mut limited = make_entry("t-claude", "Refuel Me", "failed");
+        limited.usage_limit_reset_at = Some("2026-11-24T02:00:00.000Z".to_string());
+        limited.usage_limit_message = Some("Claude API rate limit reached.".to_string());
+
+        // Completed thread with stale limitRecovery must NOT trigger refueling.
+        let mut completed = make_entry("t-done", "Recovered", "completed");
+        completed.limit_recovery_auto_resume = Some(true);
+        completed.limit_recovery_reset_at = Some("2026-11-24T02:00:00.000Z".to_string());
+        assert!(detect_token_wait(&completed, now).is_none());
+
+        let poll1 = PollData {
+            airports: vec![Airport::home("local", "omarchy")],
+            flying: vec![(limited, 0)],
+            taxiway: vec![completed],
+            stale: vec![],
+            done_or_archived: HashSet::new(),
+            subagents: vec![],
+            now,
+        };
+        apply_poll(
+            &mut world,
+            "omarchy",
+            poll1,
+            &mut callsigns,
+            &mut taxiway_cs,
+            &mut gates,
+            &mut wingmen,
+            &mut runway,
+        );
+
+        let sky1 = world.iter().find(|a| a.callsign == "SKY1").unwrap();
+        assert_eq!(sky1.state, State::Refueling);
+        assert_eq!(sky1.refuel_reset_at.as_deref(), Some("2026-11-24T02:00:00.000Z"));
+        let tankers: Vec<_> = world.iter().filter(|a| a.kind == Kind::Tanker).collect();
+        assert_eq!(tankers.len(), 1);
+        assert_eq!(tankers[0].callsign, "KC-CLAUDE");
+        assert_eq!(sky1.tanker_id, Some(tankers[0].id));
+
+        // Thread resumes running -> disconnects from tanker and tanker disappears!
+        let resumed = make_entry("t-claude", "Refuel Me", "running");
+        let poll2 = PollData {
+            airports: vec![Airport::home("local", "omarchy")],
+            flying: vec![(resumed, 0)],
+            taxiway: vec![],
+            stale: vec![],
+            done_or_archived: HashSet::new(),
+            subagents: vec![],
+            now: now + 60,
+        };
+        apply_poll(
+            &mut world,
+            "omarchy",
+            poll2,
+            &mut callsigns,
+            &mut taxiway_cs,
+            &mut gates,
+            &mut wingmen,
+            &mut runway,
+        );
+        let sky1 = world.iter().find(|a| a.callsign == "SKY1").unwrap();
+        assert_eq!(sky1.state, State::Cruising);
+        assert!(sky1.tanker_id.is_none());
+        assert_eq!(world.iter().filter(|a| a.kind == Kind::Tanker).count(), 0);
+    }
+
+    #[test]
+    fn armed_limit_recovery_with_future_reset_uses_limit_model_tanker() {
+        let now = parse_rfc3339("2026-11-23T22:15:00Z").unwrap();
+        let mut entry = make_entry("t-lr", "Armed Recovery", "failed");
+        entry.model = Some("gemini-4-neon".to_string());
+        entry.latest_run_model = Some("gemini-4-neon".to_string());
+        entry.limit_recovery_auto_resume = Some(true);
+        entry.limit_recovery_reset_at = Some("2026-11-24T02:00:00.000Z".to_string());
+        entry.limit_recovery_model = Some("claude-opus-5-5".to_string());
+        entry.limit_recovery_provider = Some("claudeAgent".to_string());
+
+        let tw = detect_token_wait(&entry, now).expect("should detect armed limitRecovery");
+        assert_eq!(tw.model_override.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(tw.reset_at.as_deref(), Some("2026-11-24T02:00:00.000Z"));
+
+        // Past reset time -> no longer waiting.
+        let after = parse_rfc3339("2026-11-24T02:05:00Z").unwrap();
+        assert!(detect_token_wait(&entry, after).is_none());
     }
 }

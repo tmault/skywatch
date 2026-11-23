@@ -1,14 +1,16 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-/// What kind of entity this is: a piloted agent, an autonomous drone, or a
-/// sub-agent fighter jet escorting a parent aircraft.
+/// What kind of entity this is: a piloted agent, an autonomous drone, a
+/// sub-agent fighter jet escorting a parent aircraft, or a provider aerial
+/// refuelling tanker orbiting high above the airspace zones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Agent,
     Drone,
     Fighter,
+    Tanker,
 }
 
 /// Lifecycle state of an aircraft in the simulation.
@@ -17,6 +19,9 @@ pub enum Kind {
 pub enum State {
     Cruising,
     Holding,
+    /// Waiting for provider tokens/quota: flying in formation behind the
+    /// provider's aerial refuelling tanker with a hose connected.
+    Refueling,
     Landed,
     /// Rolling on the ground between runway and parking gate.
     Taxi,
@@ -124,6 +129,23 @@ pub struct Aircraft {
     /// Wingman formation slot: 0 = left wing, 1 = right wing, 2 = outer left, ...
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wing_slot: Option<usize>,
+    /// Canonical provider key (e.g. "anthropic", "openai", "google") for
+    /// tankers and refuelling aircraft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Tanker aircraft id this aircraft is connected to while `State::Refueling`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tanker_id: Option<u64>,
+    /// Refuelling hose/formation slot behind the tanker:
+    /// 0 = center boom, 1 = port wing pod, 2 = starboard wing pod, 3+ = echelon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refuel_slot: Option<usize>,
+    /// Optional RFC3339 timestamp when provider tokens/quota reset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refuel_reset_at: Option<String>,
+    /// Tanker flight-level slot index (assigned dynamically when multiple providers are active).
+    #[serde(skip)]
+    tanker_orbit_idx: usize,
     /// Holding-orbit centre (derived on entry, not serialised).
     #[serde(skip)]
     orbit_center: Option<[f32; 2]>,
@@ -178,6 +200,11 @@ fn default_speed() -> f32 {
 
 /// Sim area is 820x820; positions wrap around at the edges.
 const AREA_SIZE: f32 = 820.0;
+const TANKER_BASE_ALTITUDE: f32 = 235.0; // high-altitude refuelling tracks above all zones
+const TANKER_ALT_STEP: f32 = 24.0;       // vertical separation between provider tankers
+const TANKER_SPEED: f32 = 11.5;          // m/s, stately steady refuelling orbit speed
+const TANKER_ORBIT_RX: f32 = 255.0;      // wide ellipse sweeping over the zones without wrapping
+const TANKER_ORBIT_RZ: f32 = 205.0;
 const FRONTIER_ALTITUDE: f32 = 148.0; // high-altitude jet flight levels (148..198)
 const LOCAL_ALTITUDE: f32 = 88.0;     // mid-altitude private prop levels (88..128)
 const DRONE_ALTITUDE: f32 = 56.0;     // low-mid surveillance drone levels (56..72)
@@ -281,6 +308,116 @@ pub const PROJECT_SECTOR_RADIUS: f32 = 74.0;
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Canonical provider metadata derived from a model id (and optional T3 provider
+/// fallback), matching the livery rules in `web/livery.js`.
+/// Returns `(provider_key, display_name, livery_model_hint, callsign)`.
+pub fn provider_info(
+    model: Option<&str>,
+    fallback_provider: Option<&str>,
+) -> (&'static str, &'static str, &'static str, &'static str) {
+    let raw = model.unwrap_or("").to_lowercase();
+    let has_any = |s: &str, needles: &[&str]| needles.iter().any(|n| s.contains(n));
+
+    let key = if has_any(&raw, &["claude", "anthropic", "opus", "sonnet", "haiku", "fable"]) {
+        "anthropic"
+    } else if has_any(&raw, &["gemini", "gemma", "google", "palm", "bard"]) {
+        "google"
+    } else if has_any(&raw, &["gpt", "codex", "chatgpt", "openai", "davinci"])
+        || is_openai_o_series(&raw)
+    {
+        "openai"
+    } else if raw.contains("deepseek") {
+        "deepseek"
+    } else if has_any(&raw, &["glm", "zhipu", "z-ai", "zai"]) {
+        "zhipu"
+    } else if has_any(&raw, &["qwen", "qwq", "alibaba"]) {
+        "qwen"
+    } else if has_any(&raw, &["mistral", "mixtral", "codestral", "devstral", "magistral"]) {
+        "mistral"
+    } else if has_any(&raw, &["grok", "xai"]) {
+        "xai"
+    } else if has_any(&raw, &["llama", "meta"]) {
+        "meta"
+    } else if has_any(&raw, &["kimi", "moonshot"]) {
+        "moonshot"
+    } else {
+        match fallback_provider.unwrap_or("").to_lowercase().as_str() {
+            "claudeagent" | "claude" | "anthropic" => "anthropic",
+            "codex" | "openai" => "openai",
+            "antigravity" | "google" | "gemini" => "google",
+            "deepseek" => "deepseek",
+            "zhipu" | "glm" => "zhipu",
+            "qwen" => "qwen",
+            "mistral" => "mistral",
+            "xai" | "grok" => "xai",
+            "meta" | "llama" => "meta",
+            "moonshot" | "kimi" => "moonshot",
+            _ => "generic",
+        }
+    };
+
+    provider_descriptor(key)
+}
+
+fn is_openai_o_series(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'o'
+            && i + 1 < bytes.len()
+            && (b'1'..=b'9').contains(&bytes[i + 1])
+            && (i == 0 || !bytes[i - 1].is_ascii_alphabetic())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Look up `(provider_key, display_name, livery_model_hint, tanker_callsign)`
+/// from a canonical provider key.
+pub fn provider_descriptor(key: &str) -> (&'static str, &'static str, &'static str, &'static str) {
+    match key {
+        "anthropic" => ("anthropic", "Claude", "claude", "KC-CLAUDE"),
+        "openai" => ("openai", "OpenAI", "openai", "KC-OPENAI"),
+        "google" => ("google", "Gemini", "gemini", "KC-GEMINI"),
+        "deepseek" => ("deepseek", "DeepSeek", "deepseek", "KC-DEEPSEEK"),
+        "zhipu" => ("zhipu", "Z.ai", "glm", "KC-ZAI"),
+        "qwen" => ("qwen", "Qwen", "qwen", "KC-QWEN"),
+        "mistral" => ("mistral", "Mistral", "mistral", "KC-MISTRAL"),
+        "xai" => ("xai", "Grok", "grok", "KC-GROK"),
+        "meta" => ("meta", "Llama", "llama", "KC-LLAMA"),
+        "moonshot" => ("moonshot", "Kimi", "kimi", "KC-KIMI"),
+        _ => ("generic", "Token", "generic", "KC-TOKEN"),
+    }
+}
+
+/// Deterministic orbit rotation and initial phase for a provider tanker so
+/// multiple active provider tankers trace staggered tracks above the zones.
+fn tanker_orbit_params(provider_key: &str) -> (f32, f32) {
+    let mut hash: u32 = 2166136261;
+    for b in provider_key.bytes() {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    let rot = ((hash % 360) as f32).to_radians();
+    let phase = (((hash >> 8) % 360) as f32).to_radians();
+    (rot, phase)
+}
+
+/// Evaluate `[x, z, heading]` along a tanker's sweeping elliptical orbit above the zones.
+fn tanker_orbit_point(t: f32, rot: f32) -> ([f32; 2], f32) {
+    let (cr, sr) = (rot.cos(), rot.sin());
+    let u = TANKER_ORBIT_RX * t.cos();
+    let v = TANKER_ORBIT_RZ * t.sin();
+    let du = -TANKER_ORBIT_RX * t.sin();
+    let dv = TANKER_ORBIT_RZ * t.cos();
+    let x = u * cr - v * sr;
+    let z = u * sr + v * cr;
+    let vx = du * cr - dv * sr;
+    let vz = du * sr + dv * cr;
+    ([x, z], vz.atan2(vx))
+}
+
 impl Aircraft {
     /// New aircraft with a random-ish start position, cruising.
     #[cfg(test)]
@@ -292,6 +429,9 @@ impl Aircraft {
     /// with 6 distinct RVSM flight-level slots per class so aircraft naturally stack).
     pub fn cruise_altitude(&self) -> f32 {
         match (self.kind, self.model_class) {
+            (Kind::Tanker, _) => {
+                TANKER_BASE_ALTITUDE + (self.tanker_orbit_idx as f32) * TANKER_ALT_STEP
+            }
             (Kind::Drone, _) => DRONE_ALTITUDE + (self.id % 3) as f32 * 8.0,
             (Kind::Agent, ModelClass::Frontier) => {
                 FRONTIER_ALTITUDE + (self.id % 6) as f32 * 10.0
@@ -306,12 +446,14 @@ impl Aircraft {
         let mut rng = rand::thread_rng();
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let speed = match (kind, model_class) {
+            (Kind::Tanker, _) => TANKER_SPEED,
             (Kind::Fighter, _) => FIGHTER_SPEED,
             (Kind::Agent, ModelClass::Frontier) => FRONTIER_SPEED,
             (Kind::Agent, ModelClass::Local) => AGENT_SPEED,
             (Kind::Drone, _) => DRONE_SPEED,
         };
         let alt = match (kind, model_class) {
+            (Kind::Tanker, _) => TANKER_BASE_ALTITUDE,
             (Kind::Drone, _) => DRONE_ALTITUDE + (id % 3) as f32 * 8.0,
             (Kind::Agent, ModelClass::Frontier) => FRONTIER_ALTITUDE + (id % 6) as f32 * 10.0,
             (Kind::Agent, ModelClass::Local) => LOCAL_ALTITUDE + (id % 6) as f32 * 8.0,
@@ -337,6 +479,11 @@ impl Aircraft {
             device: None,
             parent_id: None,
             wing_slot: None,
+            provider: None,
+            tanker_id: None,
+            refuel_slot: None,
+            refuel_reset_at: None,
+            tanker_orbit_idx: 0,
             orbit_center: None,
             patrol_angle: rng.gen_range(0.0..std::f32::consts::TAU),
             taxi_waypoints: Vec::new(),
@@ -354,9 +501,30 @@ impl Aircraft {
         }
     }
 
+    /// Spawn a provider aerial refuelling tanker orbiting high above the airspace zones.
+    pub fn tanker(provider_key: &str, orbit_idx: usize) -> Self {
+        let (key, display, livery_hint, callsign) = provider_descriptor(provider_key);
+        let (rot, phase) = tanker_orbit_params(key);
+        let ([x, z], heading) = tanker_orbit_point(phase, rot);
+        let alt = TANKER_BASE_ALTITUDE + (orbit_idx as f32) * TANKER_ALT_STEP;
+        let mut a = Self::with_model(callsign, Kind::Tanker, ModelClass::Frontier);
+        a.model = Some(livery_hint.to_string());
+        a.provider = Some(key.to_string());
+        a.title = Some(format!("{display} Tanker"));
+        a.state = State::Refueling;
+        a.position = [x, z, alt];
+        a.altitude = alt;
+        a.heading = heading;
+        a.patrol_angle = phase;
+        a.tanker_orbit_idx = orbit_idx;
+        a.speed = TANKER_SPEED;
+        a
+    }
+
     /// Nominal cruise speed for this airframe class.
     pub fn cruise_speed(&self) -> f32 {
         match (self.kind, self.model_class) {
+            (Kind::Tanker, _) => TANKER_SPEED,
             (Kind::Fighter, _) => FIGHTER_SPEED,
             (Kind::Agent, ModelClass::Frontier) => FRONTIER_SPEED,
             (Kind::Agent, ModelClass::Local) => AGENT_SPEED,
@@ -398,8 +566,10 @@ impl Aircraft {
     /// Fly an approach to Runway 36, touch down, roll out and backtrack to
     /// `slot` (if any). Returns false if not airborne.
     pub fn begin_approach(&mut self, slot: Option<([f32; 2], f32)>) -> bool {
-        if !matches!(self.state, State::Cruising | State::Holding | State::Takeoff | State::Landing)
-            || (self.state == State::Takeoff && self.altitude <= 0.0)
+        if !matches!(
+            self.state,
+            State::Cruising | State::Holding | State::Refueling | State::Takeoff | State::Landing
+        ) || (self.state == State::Takeoff && self.altitude <= 0.0)
         {
             return false;
         }
@@ -409,6 +579,9 @@ impl Aircraft {
         self.state = State::Landing;
         self.hold_reason = None;
         self.orbit_center = None;
+        self.tanker_id = None;
+        self.refuel_slot = None;
+        self.refuel_reset_at = None;
         self.joining = false;
         self.cleared_for_takeoff = false;
         self.arrival_slot = slot;
@@ -576,6 +749,28 @@ impl Aircraft {
         }
         self.state = State::Holding;
         self.hold_reason = Some(reason.to_string());
+        self.tanker_id = None;
+        self.refuel_slot = None;
+        self.refuel_reset_at = None;
+    }
+
+    /// Connect to the provider's aerial refuelling tanker while waiting for
+    /// tokens / quota to replenish.
+    pub fn refuel(&mut self, reason: &str, reset_at: Option<String>) {
+        self.state = State::Refueling;
+        self.hold_reason = Some(reason.to_string());
+        self.refuel_reset_at = reset_at;
+        self.orbit_center = None;
+        self.joining = false;
+        self.on_final = false;
+        self.arrival_slot = None;
+        self.cleared_for_takeoff = false;
+        self.taxi_waypoints.clear();
+        self.taxi_next = None;
+        if self.provider.is_none() {
+            let (key, _, _, _) = provider_info(self.model.as_deref(), None);
+            self.provider = Some(key.to_string());
+        }
     }
 
     /// Start taxiing to `dest` via the yellow taxiway centerline so aircraft
@@ -609,6 +804,9 @@ impl Aircraft {
     pub fn release(&mut self) {
         self.orbit_center = None;
         self.hold_reason = None;
+        self.tanker_id = None;
+        self.refuel_slot = None;
+        self.refuel_reset_at = None;
         self.cleared_for_takeoff = true;
         self.arrival_slot = None;
         match self.state {
@@ -624,6 +822,12 @@ impl Aircraft {
                 } else {
                     self.route_to_runway(State::Ready);
                 }
+            }
+            // Refuelling high above the zones: disconnect and smoothly join patrol.
+            State::Refueling => {
+                self.cleared_for_takeoff = false;
+                self.state = State::Cruising;
+                self.joining = true;
             }
             // Airborne hold: climb straight out.
             _ => self.state = State::Takeoff,
@@ -670,6 +874,9 @@ impl Aircraft {
         self.position[2] = 0.0;
         self.hold_reason = None;
         self.orbit_center = None;
+        self.tanker_id = None;
+        self.refuel_slot = None;
+        self.refuel_reset_at = None;
         self.cleared_for_takeoff = false;
         self.departing_forever = false;
         self.departure_heading = None;
@@ -696,6 +903,9 @@ impl Aircraft {
         self.departing_forever = true;
         self.hold_reason = None;
         self.orbit_center = None;
+        self.tanker_id = None;
+        self.refuel_slot = None;
+        self.refuel_reset_at = None;
         self.cleared_for_takeoff = false;
         self.topic = None;
         self.taxi_waypoints.clear();
@@ -711,7 +921,7 @@ impl Aircraft {
                 self.state = State::Departing;
                 self.ground_timer = 0.0;
             }
-            State::Cruising | State::Holding | State::Takeoff | State::Landing => {
+            State::Cruising | State::Holding | State::Refueling | State::Takeoff | State::Landing => {
                 // Already airborne: bank outward away from the island and climb into the horizon.
                 let radial = if self.position[0].hypot(self.position[1]) > 20.0 {
                     self.position[1].atan2(self.position[0])
@@ -761,7 +971,35 @@ impl Aircraft {
 
     /// Advance the simulation by `dt` seconds using the current world sectors.
     pub fn tick_with_sectors(&mut self, dt: f32, sectors: &[Sector]) {
+        if self.kind == Kind::Tanker {
+            // Provider aerial refuelling tanker: smooth, stately elliptical track
+            // high above all airspace zones, never wrapping across map edges.
+            let key = self.provider.as_deref().unwrap_or("generic");
+            let (rot, _) = tanker_orbit_params(key);
+            let t = self.patrol_angle;
+            let du = -TANKER_ORBIT_RX * t.sin();
+            let dv = TANKER_ORBIT_RZ * t.cos();
+            let ds_dt = du.hypot(dv).max(1.0);
+            self.patrol_angle =
+                (self.patrol_angle + (TANKER_SPEED / ds_dt) * dt) % std::f32::consts::TAU;
+            let ([x, z], heading) = tanker_orbit_point(self.patrol_angle, rot);
+            let target_alt = self.cruise_altitude();
+            self.altitude += (target_alt - self.altitude).clamp(-10.0 * dt, 10.0 * dt);
+            self.position = [x, z, self.altitude];
+            self.heading = heading;
+            self.speed = TANKER_SPEED;
+            return;
+        }
+
         match self.state {
+            State::Refueling => {
+                // Driven in formation by `World::tick` once linked to a provider tanker;
+                // if ticked standalone (e.g. in unit tests), hold a calm high orbit.
+                let target_alt = TANKER_BASE_ALTITUDE - 10.0;
+                self.altitude += (target_alt - self.altitude).clamp(-10.0 * dt, 10.0 * dt);
+                self.position[2] = self.altitude;
+                self.advance(dt);
+            }
             State::Holding => {
                 if self.orbit_center.is_none() {
                     let r = HOLD_TURN_RADIUS;
@@ -1099,6 +1337,44 @@ pub fn formation_position(
     [wrap_centered(raw[0]), wrap_centered(raw[1]), raw[2]]
 }
 
+/// Compute the target `[x, z, alt]` for a refuelling receiver aircraft trailing
+/// behind its provider tanker in formation slot `slot`:
+/// - `0`: center tail boom directly aft & slightly below
+/// - `1`: port (left) underwing drogue pod
+/// - `2`: starboard (right) underwing drogue pod
+/// - `3+`: wider/deeper V-echelon behind the outer pods
+pub fn refuel_formation_position(
+    tanker_pos: [f32; 3],
+    tanker_heading: f32,
+    slot: usize,
+) -> [f32; 3] {
+    let (aft, lateral, alt_offset) = match slot {
+        0 => (-44.0_f32, 0.0_f32, -10.0_f32),
+        1 => (-38.0, -22.0, -9.0),
+        2 => (-38.0, 22.0, -9.0),
+        _ => {
+            let side = if slot % 2 == 1 { -1.0_f32 } else { 1.0_f32 };
+            let tier = ((slot - 1) / 2) as f32;
+            (
+                -38.0 - tier * 20.0,
+                side * (22.0 + tier * 14.0),
+                -9.0 - tier * 5.0,
+            )
+        }
+    };
+
+    let fwd_x = tanker_heading.cos();
+    let fwd_z = tanker_heading.sin();
+    // Starboard (+right) unit vector in top-down XZ plane.
+    let right_x = -tanker_heading.sin();
+    let right_z = tanker_heading.cos();
+
+    let x = tanker_pos[0] + fwd_x * aft + right_x * lateral;
+    let z = tanker_pos[1] + fwd_z * aft + right_z * lateral;
+    let alt = (tanker_pos[2] + alt_offset).max(60.0);
+    [wrap_centered(x), wrap_centered(z), alt]
+}
+
 /// Snapshot of the whole world, ready to serialise over the wire.
 #[derive(Clone, Debug, Serialize)]
 pub struct WorldSnapshot {
@@ -1241,10 +1517,119 @@ impl World {
         None
     }
 
+    /// Reconcile provider aerial refuelling tankers so there is exactly one
+    /// tanker per provider currently in use (1+ aircraft in `State::Refueling`),
+    /// and zero tankers for providers with no waiting aircraft.
+    pub fn sync_tankers(&mut self) {
+        use std::collections::BTreeMap;
+
+        // Collect all non-tanker refuelling aircraft grouped by canonical provider key.
+        let mut by_provider: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for a in &mut self.aircraft {
+            if a.kind == Kind::Tanker {
+                continue;
+            }
+            if a.state == State::Refueling {
+                let key = a
+                    .provider
+                    .as_deref()
+                    .map(|p| provider_descriptor(p).0)
+                    .unwrap_or_else(|| provider_info(a.model.as_deref(), None).0);
+                a.provider = Some(key.to_string());
+                by_provider.entry(key.to_string()).or_default().push(a.id);
+            } else {
+                a.tanker_id = None;
+                a.refuel_slot = None;
+                a.refuel_reset_at = None;
+            }
+        }
+
+        // Remove any tanker whose provider no longer has waiting aircraft.
+        self.aircraft.retain(|a| {
+            a.kind != Kind::Tanker
+                || a.provider
+                    .as_deref()
+                    .map(|p| by_provider.contains_key(p))
+                    .unwrap_or(false)
+        });
+
+        // Ensure exactly one tanker per active provider and assign receiver slots.
+        let mut assignments: std::collections::HashMap<u64, (u64, usize)> =
+            std::collections::HashMap::new();
+
+        for (orbit_idx, (prov_key, receiver_ids)) in by_provider.iter().enumerate() {
+            let count = receiver_ids.len();
+            let reason = if count == 1 {
+                "refuelling 1 aircraft waiting for tokens".to_string()
+            } else {
+                format!("refuelling {count} aircraft waiting for tokens")
+            };
+
+            let tanker_id = if let Some(t) = self
+                .aircraft
+                .iter_mut()
+                .find(|a| a.kind == Kind::Tanker && a.provider.as_deref() == Some(prov_key.as_str()))
+            {
+                t.tanker_orbit_idx = orbit_idx;
+                t.hold_reason = Some(reason);
+                t.state = State::Refueling;
+                t.id
+            } else {
+                let mut t = Aircraft::tanker(prov_key, orbit_idx);
+                t.hold_reason = Some(reason);
+                let tid = t.id;
+                self.aircraft.push(t);
+                tid
+            };
+
+            // Symmetric slot layout:
+            // - 1 plane: center boom [0]
+            // - 2 planes: symmetric port & starboard wing pods [1, 2]
+            // - 3+ planes: center boom + both wing pods + outer echelon [0, 1, 2, 3, ...]
+            for (i, &rid) in receiver_ids.iter().enumerate() {
+                let slot = if count == 2 { i + 1 } else { i };
+                assignments.insert(rid, (tanker_id, slot));
+            }
+        }
+
+        for a in &mut self.aircraft {
+            if let Some(&(tid, slot)) = assignments.get(&a.id) {
+                a.tanker_id = Some(tid);
+                a.refuel_slot = Some(slot);
+            }
+        }
+    }
+
+    /// Place all currently refuelling aircraft directly into formation behind
+    /// their assigned provider tanker (used at startup / demo seeding).
+    pub fn snap_refueling_to_tankers(&mut self) {
+        self.sync_tankers();
+        let tankers: std::collections::HashMap<u64, ([f32; 3], f32)> = self
+            .aircraft
+            .iter()
+            .filter(|a| a.kind == Kind::Tanker)
+            .map(|a| (a.id, (a.position, a.heading)))
+            .collect();
+        for a in &mut self.aircraft {
+            if a.kind == Kind::Tanker || a.state != State::Refueling {
+                continue;
+            }
+            let Some(tid) = a.tanker_id else { continue };
+            let Some(&(t_pos, t_hdg)) = tankers.get(&tid) else { continue };
+            let pos = refuel_formation_position(t_pos, t_hdg, a.refuel_slot.unwrap_or(0));
+            a.position = pos;
+            a.altitude = pos[2];
+            a.heading = t_hdg;
+            a.speed = TANKER_SPEED;
+        }
+    }
+
     /// Advance every aircraft by `dt` seconds. Non-wingman aircraft move first,
-    /// landed aircraft claim an unoccupied gate before taxiing, and fighter
-    /// wingmen smoothly track their parent's wing formation.
+    /// landed aircraft claim an unoccupied gate before taxiing, refuelling
+    /// receivers track their provider tanker, and fighter wingmen smoothly
+    /// track their parent's wing formation.
     pub fn tick(&mut self, dt: f32) {
+        self.sync_tankers();
         let sectors = self.sectors.clone();
 
         // Runway occupancy: hold departures short while anyone else is rolling,
@@ -1259,9 +1644,70 @@ impl World {
             a.runway_hold = runway_users.iter().any(|&id| id != a.id);
         }
 
+        // Advance tankers and all non-wingman, non-refueling-receiver aircraft first.
         for a in &mut self.aircraft {
-            if a.parent_id.is_none() {
+            let is_refuel_receiver =
+                a.kind != Kind::Tanker && a.state == State::Refueling && a.tanker_id.is_some();
+            if a.parent_id.is_none() && !is_refuel_receiver {
                 a.tick_with_sectors(dt, &sectors);
+            }
+        }
+
+        // Snapshot tanker telemetry so refuelling receivers can dock and hold formation.
+        let tankers: std::collections::HashMap<u64, ([f32; 3], f32)> = self
+            .aircraft
+            .iter()
+            .filter(|a| a.kind == Kind::Tanker)
+            .map(|a| (a.id, (a.position, a.heading)))
+            .collect();
+
+        let refuel_blend = (5.0 * dt).min(1.0);
+        for a in &mut self.aircraft {
+            if a.kind == Kind::Tanker || a.state != State::Refueling {
+                continue;
+            }
+            let Some(tid) = a.tanker_id else { continue };
+            let Some(&(t_pos, t_hdg)) = tankers.get(&tid) else { continue };
+            let target = refuel_formation_position(t_pos, t_hdg, a.refuel_slot.unwrap_or(0));
+
+            let mut dx = target[0] - a.position[0];
+            let mut dz = target[1] - a.position[1];
+            if dx > AREA_SIZE * 0.5 {
+                dx -= AREA_SIZE;
+            } else if dx < -AREA_SIZE * 0.5 {
+                dx += AREA_SIZE;
+            }
+            if dz > AREA_SIZE * 0.5 {
+                dz -= AREA_SIZE;
+            } else if dz < -AREA_SIZE * 0.5 {
+                dz += AREA_SIZE;
+            }
+            let dist = dx.hypot(dz);
+            let dalt = target[2] - a.altitude;
+
+            if dist > 22.0 {
+                // Fly a smooth intercept & climb up to join the tanker's hose.
+                let intercept_speed = (a.cruise_speed() * 2.2).max(26.0);
+                a.speed += (intercept_speed - a.speed).clamp(-8.0 * dt, 8.0 * dt);
+                a.turn_toward(dz.atan2(dx), (0.85 + 24.0 / dist) * dt);
+                a.advance(dt);
+                a.altitude += dalt.clamp(-18.0 * dt, 18.0 * dt);
+                a.position[2] = a.altitude;
+            } else {
+                // Close in: lock smoothly onto the refuelling slot and match tanker heading.
+                a.position[0] = wrap_centered(a.position[0] + dx * refuel_blend);
+                a.position[1] = wrap_centered(a.position[1] + dz * refuel_blend);
+                a.altitude += dalt * refuel_blend;
+                a.position[2] = a.altitude;
+                a.speed = TANKER_SPEED;
+                let mut dh = t_hdg - a.heading;
+                while dh > std::f32::consts::PI {
+                    dh -= std::f32::consts::TAU;
+                }
+                while dh < -std::f32::consts::PI {
+                    dh += std::f32::consts::TAU;
+                }
+                a.heading += dh * refuel_blend;
             }
         }
 
@@ -1396,11 +1842,15 @@ impl World {
     fn enforce_air_separation(&mut self, dt: f32) {
         // Takeoffs and approaches are sequenced by the tower, not TCAS (its
         // 30u altitude floor would yank them off the glidepath).
-        let is_airborne = |s: State| matches!(s, State::Cruising | State::Holding);
+        let is_airborne =
+            |s: State| matches!(s, State::Cruising | State::Holding | State::Refueling);
         let is_formation_pair = |a: &Aircraft, b: &Aircraft| {
             a.parent_id == Some(b.id)
                 || b.parent_id == Some(a.id)
                 || (a.parent_id.is_some() && a.parent_id == b.parent_id)
+                || a.tanker_id == Some(b.id)
+                || b.tanker_id == Some(a.id)
+                || (a.tanker_id.is_some() && a.tanker_id == b.tanker_id)
         };
 
         // Gently relax previous TCAS offsets back toward zero when clear.
@@ -1737,5 +2187,91 @@ mod tests {
             assert_eq!(a.speed, 0.0);
             assert!(a.position[1] > -70.0, "overran the runway: {:?}", a.position);
         }
+    }
+
+    #[test]
+    fn tanker_spawns_only_when_provider_has_refueling_planes_and_despawns_when_empty() {
+        let mut world = World::new();
+        let mut a = Aircraft::with_model("SKY1", Kind::Agent, ModelClass::Frontier);
+        a.model = Some("claude-opus-5-5".to_string());
+        world.add(a);
+
+        // No refueling planes -> no tanker in the sky.
+        world.tick(0.05);
+        assert!(world.iter().all(|x| x.kind != Kind::Tanker));
+
+        // Plane enters refueling -> exactly one Claude tanker spawns above the zones.
+        world
+            .get_mut("SKY1")
+            .unwrap()
+            .refuel("Claude usage limit reached", None);
+        world.tick(0.05);
+        let tankers: Vec<_> = world.iter().filter(|x| x.kind == Kind::Tanker).collect();
+        assert_eq!(tankers.len(), 1);
+        assert_eq!(tankers[0].callsign, "KC-CLAUDE");
+        assert_eq!(tankers[0].provider.as_deref(), Some("anthropic"));
+        assert!(tankers[0].altitude >= TANKER_BASE_ALTITUDE - 0.5);
+
+        let sky1 = world.iter().find(|x| x.callsign == "SKY1").unwrap();
+        assert_eq!(sky1.tanker_id, Some(tankers[0].id));
+        assert_eq!(sky1.refuel_slot, Some(0));
+
+        // Second Claude plane connects -> still only ONE Claude tanker, symmetric wing pods [1, 2].
+        let mut b = Aircraft::with_model("SKY2", Kind::Agent, ModelClass::Frontier);
+        b.model = Some("claude-sonnet-5-5".to_string());
+        b.refuel("Claude usage limit reached", None);
+        world.add(b);
+        world.tick(0.05);
+        assert_eq!(world.iter().filter(|x| x.kind == Kind::Tanker).count(), 1);
+        let s1 = world.iter().find(|x| x.callsign == "SKY1").unwrap().refuel_slot;
+        let s2 = world.iter().find(|x| x.callsign == "SKY2").unwrap().refuel_slot;
+        assert_eq!((s1, s2), (Some(1), Some(2)));
+
+        // OpenAI plane connects -> a second tanker spawns at a separate flight level!
+        let mut c = Aircraft::with_model("SKY3", Kind::Agent, ModelClass::Frontier);
+        c.model = Some("gpt-6.1-sol".to_string());
+        c.refuel("OpenAI usage limit reached", None);
+        world.add(c);
+        world.tick(0.05);
+        let tankers: Vec<_> = world.iter().filter(|x| x.kind == Kind::Tanker).collect();
+        assert_eq!(tankers.len(), 2);
+        assert!(
+            (tankers[0].cruise_altitude() - tankers[1].cruise_altitude()).abs() >= TANKER_ALT_STEP - 0.1
+        );
+
+        // Release both Claude planes -> Claude tanker disappears, OpenAI tanker remains.
+        world.get_mut("SKY1").unwrap().release();
+        world.get_mut("SKY2").unwrap().release();
+        world.tick(0.05);
+        let tankers: Vec<_> = world.iter().filter(|x| x.kind == Kind::Tanker).collect();
+        assert_eq!(tankers.len(), 1);
+        assert_eq!(tankers[0].callsign, "KC-OPENAI");
+
+        // Release OpenAI plane -> zero tankers in the sky.
+        world.get_mut("SKY3").unwrap().release();
+        world.tick(0.05);
+        assert_eq!(world.iter().filter(|x| x.kind == Kind::Tanker).count(), 0);
+    }
+
+    #[test]
+    fn refueling_planes_converge_and_hold_formation_behind_tanker() {
+        let mut world = World::new();
+        let mut a = Aircraft::with_model("SKY1", Kind::Agent, ModelClass::Frontier);
+        a.model = Some("claude-opus-5-5".to_string());
+        a.position = [0.0, 0.0, 150.0];
+        a.altitude = 150.0;
+        a.refuel("waiting for tokens", None);
+        world.add(a);
+
+        // Simulate 45 seconds so SKY1 flies up and locks onto the tanker's center boom.
+        for _ in 0..900 {
+            world.tick(0.05);
+        }
+        let tanker = world.iter().find(|x| x.kind == Kind::Tanker).unwrap();
+        let sky1 = world.iter().find(|x| x.callsign == "SKY1").unwrap();
+        let expected = refuel_formation_position(tanker.position, tanker.heading, 0);
+        let hdist = (sky1.position[0] - expected[0]).hypot(sky1.position[1] - expected[1]);
+        let vdist = (sky1.altitude - expected[2]).abs();
+        assert!(hdist < 6.0 && vdist < 4.0, "SKY1 should hold formation behind tanker: h={hdist:.2}, v={vdist:.2}");
     }
 }

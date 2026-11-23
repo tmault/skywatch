@@ -10,6 +10,7 @@ const holdReasonEl = document.getElementById('radio-hold-reason');
 const logEl = document.getElementById('radio-log');
 const textEl = document.getElementById('radio-text');
 const sendBtn = document.getElementById('radio-send');
+const inputRowEl = document.getElementById('radio-input-row');
 const actionsEl = document.getElementById('radio-actions');
 const approveBtn = document.getElementById('radio-approve');
 const rejectBtn = document.getElementById('radio-reject');
@@ -42,11 +43,23 @@ export function appendHistory(id, who, text) {
   if (id === selectedId) renderLog();
 }
 
+export function formatCountdown(iso) {
+  if (!iso) return '';
+  const ms = Date.parse(iso) - Date.now();
+  if (!Number.isFinite(ms) || ms <= 0) return 'resetting soon';
+  const totalMins = Math.ceil(ms / 60000);
+  const h = Math.floor(totalMins / 60);
+  const m = totalMins % 60;
+  if (h > 0 && m > 0) return `resets in ${h}h ${m}m`;
+  if (h > 0) return `resets in ${h}h`;
+  return `resets in ${m}m`;
+}
+
 export function openRadio(aircraft) {
   selectedId = aircraft.id;
   render(aircraft);
   panel.hidden = false;
-  textEl.focus();
+  if (aircraft.kind !== 'tanker') textEl.focus();
 }
 
 export function closeRadio(note) {
@@ -69,7 +82,8 @@ function render(a) {
   callsignEl.title = a.title ? a.callsign : '';
 
   let airframe;
-  if (a.kind === 'fighter') airframe = 'FIGHTER · SUB-AGENT';
+  if (a.kind === 'tanker') airframe = 'AERIAL TANKER';
+  else if (a.kind === 'fighter') airframe = 'FIGHTER · SUB-AGENT';
   else if (a.kind === 'drone') airframe = 'REAPER DRONE';
   else if (a.model_class === 'frontier') airframe = 'AGENT · FRONTIER JET';
   else airframe = 'AGENT · LOCAL PROP';
@@ -78,23 +92,39 @@ function render(a) {
   if (a.model) {
     // Generic liveries use the model name as their title; don't repeat it.
     const { title, variant } = liveryFor(a.model);
-    const name = title === variant ? title : [title, variant].filter(Boolean).join(' ');
-    parts.push(name.toUpperCase());
+    const name = a.kind === 'tanker'
+      ? (title || variant || '')
+      : (title === variant ? title : [title, variant].filter(Boolean).join(' '));
+    if (name) parts.push(name.toUpperCase());
   }
   if (a.device) parts.push(a.device.toUpperCase());
   if (a.topic) parts.push(a.topic.toUpperCase());
   kindEl.textContent = parts.join(' · ');
 
-  stateEl.textContent = a.state === 'parked'
-    ? 'at gate'
-    : a.state === 'ready'
-      ? 'taxiway queue'
-      : a.state === 'departing'
-        ? 'departing (done)'
-        : a.state;
+  stateEl.textContent = a.kind === 'tanker'
+    ? 'on hold · refuelling'
+    : a.state === 'refueling'
+      ? 'refuelling (token hold)'
+      : a.state === 'parked'
+        ? 'at gate'
+        : a.state === 'ready'
+          ? 'taxiway queue'
+          : a.state === 'departing'
+            ? 'departing (done)'
+            : a.state;
   stateEl.style.color = stateColor(a.state);
 
-  if (a.state === 'holding' && a.hold_reason) {
+  if (a.kind === 'tanker') {
+    holdReasonEl.textContent = a.hold_reason
+      ? `AERIAL REFUEL: ${a.hold_reason} — orbiting above airspace zones`
+      : 'AERIAL REFUEL: orbiting above airspace zones';
+    holdReasonEl.hidden = false;
+  } else if (a.state === 'refueling') {
+    const cd = formatCountdown(a.refuel_reset_at);
+    const base = a.hold_reason || 'waiting for provider tokens';
+    holdReasonEl.textContent = cd ? `TOKEN HOLD: ${base} (${cd})` : `TOKEN HOLD: ${base}`;
+    holdReasonEl.hidden = false;
+  } else if (a.state === 'holding' && a.hold_reason) {
     holdReasonEl.textContent = `HOLD: ${a.hold_reason}`;
     holdReasonEl.hidden = false;
   } else if (a.state === 'ready') {
@@ -112,6 +142,7 @@ function render(a) {
     holdReasonEl.hidden = true;
   }
 
+  if (inputRowEl) inputRowEl.hidden = a.kind === 'tanker';
   actionsEl.hidden = a.state !== 'holding';
   renderLog();
 }
@@ -167,7 +198,8 @@ closeBtn.addEventListener('click', () => closeRadio());
 
 export function stateColor(state) {
   switch (state) {
-    case 'holding': return '#ffb020';
+    case 'holding':
+    case 'refueling': return '#ffb020';
     case 'landed': return '#8a8f98';
     case 'parked': return '#7b8794';
     case 'taxi': return '#ffd54a';

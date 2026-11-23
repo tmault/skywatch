@@ -6,7 +6,7 @@ import * as THREE from './vendor/three.module.js';
 import { OrbitControls } from './vendor/OrbitControls.js';
 import {
   setupRadio, openRadio, closeRadio, updateRadio, selectedAircraftId,
-  appendHistory, stateColor,
+  appendHistory, stateColor, formatCountdown,
 } from './radio.js';
 import {
   buildAlpineIsland, buildAlpineBackdrop, makeSwissFlag, updateAlpine, SWISS_RED,
@@ -14,7 +14,10 @@ import {
 } from './alpine.js';
 import { addRunwayLights } from './runway-lights.js';
 import { addLandingLights, createRunwayEvents } from './runway-events.js';
-import { makeAgentMesh, makeJetMesh, makeFighterMesh, makeDroneMesh } from './aircraft.js';
+import {
+  makeAgentMesh, makeJetMesh, makeFighterMesh, makeDroneMesh, makeTankerMesh,
+} from './aircraft.js';
+import { liveryFor } from './livery.js';
 
 const WORLD_SIZE = 820;
 const INTERP_RATE = 10; // exponential smoothing constant (per second)
@@ -753,15 +756,24 @@ function buildAircraftLabelTexture(a, accentHex) {
   ctx.fillText(taskText, 28, 37);
 
   // Secondary line: callsign + role/state.
-  const stateLabel = a.state === 'parked'
-    ? 'AT GATE · >24H'
-    : a.state === 'ready'
-      ? 'TAXIWAY · WAITING'
-      : a.state === 'departing'
-        ? 'DEPARTING · DONE'
-        : a.kind === 'fighter'
-          ? 'WINGMAN'
-          : a.state.toUpperCase();
+  let stateLabel;
+  if (a.kind === 'tanker') {
+    const match = (a.hold_reason || '').match(/(\d+)/);
+    stateLabel = match ? `TANKER · ON HOLD (${match[1]})` : 'TANKER · ON HOLD';
+  } else if (a.state === 'refueling') {
+    const cd = formatCountdown(a.refuel_reset_at).replace(/^resets in /i, '');
+    stateLabel = cd ? `REFUEL · ${cd.toUpperCase()}` : 'REFUELING · TOKEN HOLD';
+  } else if (a.state === 'parked') {
+    stateLabel = 'AT GATE · >24H';
+  } else if (a.state === 'ready') {
+    stateLabel = 'TAXIWAY · WAITING';
+  } else if (a.state === 'departing') {
+    stateLabel = 'DEPARTING · DONE';
+  } else if (a.kind === 'fighter') {
+    stateLabel = 'WINGMAN';
+  } else {
+    stateLabel = a.state.toUpperCase();
+  }
   const sub = `${a.callsign} · ${stateLabel}`;
   ctx.font = 'bold 21px "IBM Plex Mono", ui-monospace, monospace';
   ctx.fillStyle = accent;
@@ -773,6 +785,8 @@ function buildAircraftLabelTexture(a, accentHex) {
 }
 
 function labelAccentFor(a) {
+  if (a.kind === 'tanker') return 0xffb020;
+  if (a.state === 'refueling') return 0xffb020;
   if (a.state === 'departing') return 0x4dff9e;
   if (a.state === 'holding') return 0xffb020;
   if (a.state === 'ready') return 0xff943b;
@@ -784,7 +798,9 @@ function labelAccentFor(a) {
 }
 
 function updateAircraftLabel(entry, a) {
-  const key = `${a.title || ''}|${a.state}|${a.topic || ''}|${a.callsign}`;
+  const cd = a.state === 'refueling' ? formatCountdown(a.refuel_reset_at) : '';
+  const extra = a.kind === 'tanker' ? (a.hold_reason || '') : cd;
+  const key = `${a.title || ''}|${a.state}|${a.topic || ''}|${a.callsign}|${extra}`;
   if (entry.labelKey === key) return;
   entry.labelKey = key;
   const accent = labelAccentFor(a);
@@ -971,6 +987,18 @@ class ContrailRibbon {
 }
 
 function makeContrailsFor(a) {
+  if (a.kind === 'tanker') {
+    // Heavy 4-engine tanker: four crisp high-altitude contrails!
+    return [-10.2, -5.6, 5.6, 10.2].map((x) => new ContrailRibbon({
+      localOffset: [x, -1.65, -1.8],
+      maxPoints: 130,
+      sampleInterval: 0.14,
+      startWidth: 0.9,
+      endWidth: 5.4,
+      color: 0xf7fbff,
+      opacity: 0.65,
+    }));
+  }
   if (a.kind === 'fighter') {
     return [-0.62, 0.62].map((x) => new ContrailRibbon({
       localOffset: [x, -0.05, -8.5],
@@ -1018,6 +1046,219 @@ function makeContrailsFor(a) {
   }));
 }
 
+/* ----------------------------------------------- aerial refuelling pipes */
+
+// Dynamic 3D catenary refuelling hose + flared drogue basket + animated token
+// pulse beads connecting a provider tanker to each aircraft waiting for tokens.
+const PIPE_SEGS = 20;
+const PIPE_RADIAL = 6;
+const PIPE_RADIUS = 0.42;
+const PIPE_PULSES = 4;
+const PIPE_MAX_DIST = 105;
+
+const _pipeP0 = new THREE.Vector3();
+const _pipeP1 = new THREE.Vector3();
+const _pipeC1 = new THREE.Vector3();
+const _pipeC2 = new THREE.Vector3();
+const _pipeBack = new THREE.Vector3();
+const _pipeFwd = new THREE.Vector3();
+const _pipeTan = new THREE.Vector3();
+const _pipeN = new THREE.Vector3();
+const _pipeB = new THREE.Vector3();
+const _pipeUp = new THREE.Vector3(0, 1, 0);
+const _pipeAltUp = new THREE.Vector3(1, 0, 0);
+const _pipeQuat = new THREE.Quaternion();
+
+function cubicBezierPoint(out, p0, c1, c2, p1, t) {
+  const u = 1 - t;
+  const tt = t * t;
+  const uu = u * u;
+  const uuu = uu * u;
+  const ttt = tt * t;
+  out.set(
+    uuu * p0.x + 3 * uu * t * c1.x + 3 * u * tt * c2.x + ttt * p1.x,
+    uuu * p0.y + 3 * uu * t * c1.y + 3 * u * tt * c2.y + ttt * p1.y,
+    uuu * p0.z + 3 * uu * t * c1.z + 3 * u * tt * c2.z + ttt * p1.z,
+  );
+  return out;
+}
+
+class RefuelPipe {
+  constructor(accentColor) {
+    this.group = new THREE.Group();
+    this.group.visible = false;
+
+    const ringCount = PIPE_SEGS + 1;
+    const verts = new Float32Array(ringCount * PIPE_RADIAL * 3);
+    const indices = [];
+    for (let i = 0; i < PIPE_SEGS; i++) {
+      for (let j = 0; j < PIPE_RADIAL; j++) {
+        const j2 = (j + 1) % PIPE_RADIAL;
+        const a = i * PIPE_RADIAL + j;
+        const b = i * PIPE_RADIAL + j2;
+        const c = (i + 1) * PIPE_RADIAL + j;
+        const d = (i + 1) * PIPE_RADIAL + j2;
+        indices.push(a, c, b, b, c, d);
+      }
+    }
+    this.tubeGeo = new THREE.BufferGeometry();
+    this.tubeGeo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+    this.tubeGeo.setIndex(indices);
+    this.tubeMat = new THREE.MeshStandardMaterial({
+      color: 0x262c34,
+      emissive: new THREE.Color(accentColor),
+      emissiveIntensity: 0.35,
+      roughness: 0.45,
+      metalness: 0.4,
+    });
+    this.tubeMesh = new THREE.Mesh(this.tubeGeo, this.tubeMat);
+    this.tubeMesh.frustumCulled = false;
+    this.group.add(this.tubeMesh);
+
+    // Flared high-visibility drogue basket opening toward the receiver receptacle.
+    this.drogueGeo = new THREE.CylinderGeometry(1.38, 0.45, 2.4, 12, 1, true);
+    this.drogueMat = new THREE.MeshBasicMaterial({
+      color: 0xffa824,
+      side: THREE.DoubleSide,
+    });
+    this.drogue = new THREE.Mesh(this.drogueGeo, this.drogueMat);
+    this.group.add(this.drogue);
+    this.accent = accentColor;
+
+    // Glowing token-refuel pulse beads gliding down the hose toward the receiver.
+    this.pulseGeo = new THREE.SphereGeometry(0.72, 8, 6);
+    this.pulseMat = new THREE.MeshBasicMaterial({ color: 0xffd166 });
+    this.pulses = [];
+    for (let i = 0; i < PIPE_PULSES; i++) {
+      const m = new THREE.Mesh(this.pulseGeo, this.pulseMat);
+      this.group.add(m);
+      this.pulses.push(m);
+    }
+
+    this.pts = Array.from({ length: ringCount }, () => new THREE.Vector3());
+    scene.add(this.group);
+  }
+
+  update(tankerEntry, receiverEntry, slot, now) {
+    if (!tankerEntry || !receiverEntry || !tankerEntry.refuelAnchors) {
+      this.group.visible = false;
+      return;
+    }
+    tankerEntry.group.updateMatrixWorld();
+    receiverEntry.group.updateMatrixWorld();
+
+    const anchorKey = slot === 0 ? 'center' : (slot % 2 === 1 ? 'port' : 'starboard');
+    const localAnchor = tankerEntry.refuelAnchors[anchorKey] || tankerEntry.refuelAnchors.center;
+    _pipeP0.copy(localAnchor).applyMatrix4(tankerEntry.group.matrixWorld);
+
+    const localPort = receiverEntry.refuelPort || new THREE.Vector3(0, 1.5, 6);
+    _pipeP1.copy(localPort).applyMatrix4(receiverEntry.group.matrixWorld);
+
+    const dist = _pipeP0.distanceTo(_pipeP1);
+    if (dist < 1 || dist > PIPE_MAX_DIST) {
+      this.group.visible = false;
+      return;
+    }
+    this.group.visible = true;
+
+    // Tanker aft vector (-Z in model space) & receiver forward vector (+Z).
+    _pipeBack.set(0, 0, -1).transformDirection(tankerEntry.group.matrixWorld);
+    _pipeFwd.set(0, 0, 1).transformDirection(receiverEntry.group.matrixWorld);
+
+    const sag = Math.min(8.0, dist * 0.14);
+    _pipeC1.copy(_pipeP0).addScaledVector(_pipeBack, dist * 0.34);
+    _pipeC1.y -= sag;
+    _pipeC2.copy(_pipeP1).addScaledVector(_pipeFwd, dist * 0.28);
+    _pipeC2.y -= sag * 0.45;
+
+    for (let i = 0; i <= PIPE_SEGS; i++) {
+      cubicBezierPoint(this.pts[i], _pipeP0, _pipeC1, _pipeC2, _pipeP1, i / PIPE_SEGS);
+    }
+
+    const posAttr = this.tubeGeo.attributes.position;
+    for (let i = 0; i <= PIPE_SEGS; i++) {
+      const p = this.pts[i];
+      if (i === 0) _pipeTan.subVectors(this.pts[1], this.pts[0]);
+      else if (i === PIPE_SEGS) _pipeTan.subVectors(this.pts[PIPE_SEGS], this.pts[PIPE_SEGS - 1]);
+      else _pipeTan.subVectors(this.pts[i + 1], this.pts[i - 1]);
+      if (_pipeTan.lengthSq() < 1e-6) _pipeTan.set(0, 0, 1);
+      else _pipeTan.normalize();
+
+      const refUp = Math.abs(_pipeTan.y) > 0.92 ? _pipeAltUp : _pipeUp;
+      _pipeN.crossVectors(_pipeTan, refUp).normalize();
+      _pipeB.crossVectors(_pipeTan, _pipeN).normalize();
+
+      for (let j = 0; j < PIPE_RADIAL; j++) {
+        const ang = (j / PIPE_RADIAL) * Math.PI * 2;
+        const c = Math.cos(ang) * PIPE_RADIUS;
+        const s = Math.sin(ang) * PIPE_RADIUS;
+        posAttr.setXYZ(
+          i * PIPE_RADIAL + j,
+          p.x + _pipeN.x * c + _pipeB.x * s,
+          p.y + _pipeN.y * c + _pipeB.y * s,
+          p.z + _pipeN.z * c + _pipeB.z * s,
+        );
+      }
+    }
+    posAttr.needsUpdate = true;
+    this.tubeGeo.computeVertexNormals();
+
+    // Place flared drogue basket just ahead of the receiver's receptacle.
+    _pipeTan.subVectors(this.pts[PIPE_SEGS], this.pts[PIPE_SEGS - 1]).normalize();
+    this.drogue.position.copy(_pipeP1).addScaledVector(_pipeTan, -1.1);
+    _pipeQuat.setFromUnitVectors(_pipeUp, _pipeTan);
+    this.drogue.quaternion.copy(_pipeQuat);
+
+    // Animate glowing token pulses flowing from tanker (t=0) to waiting plane (t=1).
+    for (let i = 0; i < this.pulses.length; i++) {
+      const t = (now * 0.42 + i / this.pulses.length) % 1;
+      cubicBezierPoint(this.pulses[i].position, _pipeP0, _pipeC1, _pipeC2, _pipeP1, t);
+    }
+  }
+
+  dispose() {
+    scene.remove(this.group);
+    this.tubeGeo.dispose();
+    this.tubeMat.dispose();
+    this.drogueGeo.dispose();
+    this.drogueMat.dispose();
+    this.pulseGeo.dispose();
+    this.pulseMat.dispose();
+  }
+}
+
+const refuelPipes = new Map(); // receiverId -> RefuelPipe
+
+function updateRefuelPipes(now) {
+  const activeReceivers = new Set();
+  for (const a of currentSnapshot.values()) {
+    if (a.kind === 'tanker' || a.state !== 'refueling' || a.tanker_id == null) continue;
+    const tankerEntry = meshes.get(a.tanker_id);
+    const receiverEntry = meshes.get(a.id);
+    if (!tankerEntry || !receiverEntry) continue;
+
+    activeReceivers.add(a.id);
+    const liv = liveryFor(a.model);
+    const accent = liv.swoosh || '#ffb020';
+    let pipe = refuelPipes.get(a.id);
+    if (!pipe) {
+      pipe = new RefuelPipe(accent);
+      refuelPipes.set(a.id, pipe);
+    } else if (pipe.accent !== accent) {
+      pipe.accent = accent;
+      pipe.tubeMat.emissive.set(accent);
+    }
+    pipe.update(tankerEntry, receiverEntry, a.refuel_slot ?? 0, now);
+  }
+
+  for (const [id, pipe] of [...refuelPipes.entries()]) {
+    if (!activeReceivers.has(id)) {
+      pipe.dispose();
+      refuelPipes.delete(id);
+    }
+  }
+}
+
 function worldYForAircraft(a, wheelDrop) {
   const groundOffset = TARMAC_TOP_Y + wheelDrop;
   if (['landed', 'taxi', 'ready', 'parked'].includes(a.state)) {
@@ -1037,7 +1278,8 @@ function ensureMesh(a) {
 
   let built;
   // Each airframe is painted in its model provider's livery.
-  if (a.kind === 'fighter') built = makeFighterMesh(a.model);
+  if (a.kind === 'tanker') built = makeTankerMesh(a.model);
+  else if (a.kind === 'fighter') built = makeFighterMesh(a.model);
   else if (a.kind === 'drone') built = makeDroneMesh(a.model);
   else if (a.model_class === 'frontier') built = makeJetMesh(a.model);
   else built = makeAgentMesh(a.model);
@@ -1046,15 +1288,15 @@ function ensureMesh(a) {
   const s = built.scale;
   built.group.scale.setScalar(s);
   built.group.rotation.order = 'YXZ';
-  if (a.kind !== 'fighter') built.landingLights = addLandingLights(built);
+  if (a.kind !== 'fighter' && a.kind !== 'tanker') built.landingLights = addLandingLights(built);
 
   const label = new THREE.Sprite(new THREE.SpriteMaterial({
     transparent: true, depthTest: false,
   }));
-  const lw = a.kind === 'fighter' ? 28 : 38;
+  const lw = a.kind === 'tanker' ? 44 : (a.kind === 'fighter' ? 28 : 38);
   const lh = lw * (104 / 512);
   label.scale.set(lw / s, lh / s, 1);
-  label.position.y = (a.kind === 'fighter' ? 9.5 : 13) / s;
+  label.position.y = (a.kind === 'tanker' ? 16 : (a.kind === 'fighter' ? 9.5 : 13)) / s;
   label.renderOrder = 10;
   built.group.add(label);
   built.label = label;
@@ -1171,8 +1413,9 @@ let returnOverview = false; // smoothly glide back when exiting follow cam
 
 function chaseOffsetFor(entry) {
   // Position camera slightly behind-and-above the aircraft's tail/starboard quarter.
-  const dist = entry.kind === 'fighter' ? 40 : 54;
-  const lift = entry.kind === 'fighter' ? 18 : 24;
+  // Tankers get a wider vantage so the trailing pipes and waiting planes stay in frame.
+  const dist = entry.kind === 'tanker' ? 92 : (entry.kind === 'fighter' ? 40 : 54);
+  const lift = entry.kind === 'tanker' ? 38 : (entry.kind === 'fighter' ? 18 : 24);
   // Heading h moves along (cos h, sin h); tail is opposite (-cos h, -sin h),
   // starboard right is (-sin h, cos h).
   const h = entry.heading || 0;
@@ -1388,7 +1631,7 @@ function applySnapshot(snapshot) {
     entry.state = a.state;
     setColor(entry, a);
     updateAircraftLabel(entry, a);
-    entry.ring.visible = a.state === 'holding';
+    entry.ring.visible = a.state === 'holding' || a.kind === 'tanker';
   }
 
   for (const id of [...meshes.keys()]) {
@@ -1453,7 +1696,7 @@ if (eventBanner) {
 // Fire one-shot effects on takeoff roll, liftoff, approach and touchdown.
 // `from` is undefined the first time an aircraft is seen (no event then).
 function detectRunwayEvent(a, entry, from, prevAlt) {
-  if (from === undefined || a.kind === 'fighter') return;
+  if (from === undefined || a.kind === 'fighter' || a.kind === 'tanker') return;
   const [x, z, alt] = a.position;
   const rolling = a.state === 'takeoff' || a.state === 'departing';
 
@@ -1475,12 +1718,18 @@ function detectRunwayEvent(a, entry, from, prevAlt) {
 
 function handleStateChange(a, from, to) {
   const tag = a.title ? `${a.callsign} (${formatTaskTitle(a)})` : a.callsign;
+  if (a.kind === 'tanker' && from === undefined) {
+    addTickerLine(`${tag}: aerial refuelling tanker on station above airspace.`, true, a.id);
+    return;
+  }
   if (a.kind === 'fighter' && from === undefined) {
     addTickerLine(`${tag}: fighter wingman on station.`);
     return;
   }
   if (to === 'holding') {
     addTickerLine(`${tag}: entering hold — awaiting approval`, true, a.id);
+  } else if (to === 'refueling') {
+    addTickerLine(`${tag}: connecting to tanker — waiting for tokens`, true, a.id);
   } else {
     unpinHold(a.id);
     if (to === 'takeoff') addTickerLine(`${tag}: rolling, Runway 36.`, false, a.id, 'takeoff');
@@ -1490,11 +1739,13 @@ function handleStateChange(a, from, to) {
     else if (to === 'taxi') addTickerLine(`${tag}: taxiing.`);
     else if (to === 'parked') addTickerLine(`${tag}: parked at the gate.`);
     else if (to === 'ready') addTickerLine(`${tag}: lined up, ready for takeoff.`, true, a.id);
+    else if (to === 'cruising' && from === 'refueling') addTickerLine(`${tag}: refuel complete — resuming patrol.`);
     else if (to === 'cruising' && from !== undefined) addTickerLine(`${tag}: cruising.`);
   }
   if (selectedAircraftId() === a.id && from !== undefined) {
     const note = {
       holding: 'entering hold',
+      refueling: 'connecting to aerial tanker (waiting for tokens)',
       takeoff: 'taking off',
       departing: 'departing into the horizon',
       landing: 'landing',
@@ -1579,9 +1830,12 @@ function animate() {
 
     // Bank smoothly into turns when airborne; keep wings level on the ground.
     const departingAirborne = entry.state === 'departing' && (entry.altitude || 0) > 0.4;
-    const airborne = ['cruising', 'holding', 'takeoff', 'landing'].includes(entry.state) || departingAirborne;
+    const airborne = ['cruising', 'holding', 'refueling', 'takeoff', 'landing'].includes(entry.state)
+      || departingAirborne;
     const omega = dt > 0.001 ? stepH / dt : 0;
-    const maxBank = entry.kind === 'fighter' ? 0.52 : (entry.model_class === 'frontier' ? 0.32 : 0.4);
+    const maxBank = entry.kind === 'tanker'
+      ? 0.22
+      : (entry.kind === 'fighter' ? 0.52 : (entry.model_class === 'frontier' ? 0.32 : 0.4));
     const targetRoll = airborne
       ? Math.max(-maxBank, Math.min(maxBank, omega * 1.15))
       : 0;
@@ -1646,6 +1900,7 @@ function animate() {
       entry.gear.visible =
         entry.state !== 'cruising'
         && entry.state !== 'holding'
+        && entry.state !== 'refueling'
         && !((entry.state === 'departing' || entry.state === 'takeoff') && alt > 18)
         && !(entry.state === 'landing' && alt > 70);
     }
@@ -1665,11 +1920,14 @@ function animate() {
 
     if (entry.ring.visible) {
       const pulse = 1 + 0.25 * Math.sin(now * 4);
-      entry.ring.scale.setScalar(pulse);
+      const baseScale = entry.kind === 'tanker' ? 1.85 : 1;
+      entry.ring.scale.setScalar(pulse * baseScale);
       entry.ring.position.y = (0.8 - entry.group.position.y) / entry.scale;
       entry.ring.material.opacity = 0.5 + 0.35 * Math.sin(now * 4);
     }
   }
+
+  updateRefuelPipes(now);
 
   let approachActive = false;
   for (const entry of meshes.values()) {

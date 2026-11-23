@@ -115,6 +115,32 @@ pub fn seed(world: &mut World) {
         a.device = Some("omarchy".to_string());
         world.add(a);
     }
+
+    // Seed two Claude threads waiting for tokens — automatically spawns the
+    // Claude aerial refuelling tanker high above the zones with hoses connected!
+    for (cs, title, model, sector) in [
+        (
+            "SKY6",
+            "Migrate telemetry schema",
+            "claude-opus-5-5",
+            "Build",
+        ),
+        (
+            "SKY7",
+            "Review API rate-limiter PR",
+            "claude-sonnet-5-5",
+            "Skywatch",
+        ),
+    ] {
+        let mut a = Aircraft::with_model(cs, Kind::Agent, ModelClass::Frontier);
+        a.model = Some(model.to_string());
+        a.title = Some(title.to_string());
+        a.device = Some("omarchy".to_string());
+        a.assign(sector);
+        a.refuel("Claude usage limit reached — waiting for tokens", None);
+        world.add(a);
+    }
+    world.snap_refueling_to_tankers();
 }
 
 /// One scripted action: apply it to the world at a given cycle.
@@ -240,8 +266,13 @@ mod tests {
         assert_eq!(state_of("SKY2"), State::Holding);
         assert_eq!(state_of("SKY3"), State::Landed);
         assert_eq!(state_of("SKY4"), State::Parked);
+        assert_eq!(state_of("SKY6"), State::Refueling);
+        assert_eq!(state_of("SKY7"), State::Refueling);
         assert_eq!(state_of("REAP1"), State::Cruising);
         assert_eq!(state_of("REAP2"), State::Cruising);
+        let tankers: Vec<_> = world.iter().filter(|a| a.kind == Kind::Tanker).collect();
+        assert_eq!(tankers.len(), 1);
+        assert_eq!(tankers[0].callsign, "KC-CLAUDE");
     }
 
     #[test]

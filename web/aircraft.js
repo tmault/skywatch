@@ -325,12 +325,13 @@ function navLights(group, kit, tip, tail) {
 
 // Distance from the group origin to its lowest point (world units after
 // scaling), so aircraft sit exactly on the apron.
-function finish(group, scale, kit) {
+function finish(group, scale, kit, extra = {}) {
   const box = new THREE.Box3().setFromObject(group);
   return {
     group, scale,
     tintMaterials: [kit.beacon], disposeMaterials: kit.all,
     wheelDrop: -box.min.y * scale,
+    ...extra,
   };
 }
 
@@ -446,7 +447,9 @@ export function makeAgentMesh(model) {
   group.add(dot(kit.white, 0, 0.47 * 1.5, Z(8.12) * 1.5, 0.13));
   group.add(dot(kit.beacon, 0, (finBase + finH + 0.05) * 1.5, Z(7.95) * 1.5, 0.15));
 
-  return finish(group, 0.92, kit);
+  return finish(group, 0.92, kit, {
+    refuelPort: new THREE.Vector3(0, 1.56 * 1.5, Z(2.3) * 1.5),
+  });
 }
 
 /* -------------------------------------------- twin-engine jet (frontier) */
@@ -610,7 +613,9 @@ export function makeJetMesh(model) {
   group.add(dot(kit.beacon, 0, 1.86, 0.5, 0.24));
   group.add(dot(kit.beacon, 0, -1.86, 4.5, 0.24));
 
-  return finish(group, 0.74, kit);
+  return finish(group, 0.74, kit, {
+    refuelPort: new THREE.Vector3(0, 1.82, 8.4),
+  });
 }
 
 /* --------------------------------------------- fighter (sub-agent wingman) */
@@ -744,7 +749,9 @@ export function makeFighterMesh(model) {
   navLights(group, kit, [6.5, 0.05, -3.3], [0, 0.0, -6.5]);
   group.add(dot(kit.beacon, 0, 0.93, -1.2, 0.18));
 
-  return finish(group, 0.72, kit);
+  return finish(group, 0.72, kit, {
+    refuelPort: new THREE.Vector3(0, 0.92, 5.2),
+  });
 }
 
 /* ------------------------------------------- drone (monitoring / jobs) */
@@ -809,5 +816,167 @@ export function makeDroneMesh(model) {
   navLights(group, kit, [12.4, 0.75, 0.6], [0, 0.0, -6.9]);
   group.add(dot(kit.beacon, 0, 1.4, 2.0, 0.2));
 
-  return finish(group, 0.76, kit);
+  return finish(group, 0.76, kit, {
+    refuelPort: new THREE.Vector3(0, 1.25, 5.0),
+  });
+}
+
+/* ------------------------------------ aerial refuelling tanker (provider) */
+
+// Heavy 4-engine widebody aerial refuelling tanker (KC-135 / A330-MRTT class)
+// painted in the provider's livery, with an aft flying boom and twin underwing
+// hose-and-drogue pods for threads waiting on tokens.
+export function makeTankerMesh(model) {
+  const group = new THREE.Group();
+  const warp = (z) => (z < -7.2 ? (-7.2 - z) * 0.14 : 0) - (z > 12.2 ? (z - 12.2) * 0.1 : 0);
+  const body = fuselage([
+    [-16.4, 0.16], [-15.0, 0.72], [-12.2, 1.48], [-8.4, 2.08], [-5.0, 2.22],
+    [10.2, 2.22], [12.6, 2.04], [14.4, 1.6], [15.8, 1.0], [16.6, 0.44], [17.0, 0.0001],
+  ], { sy: 1.06, warp, segments: 36 });
+  const kit = paintKit(model, 'tanker', {
+    zmin: body.zmin, zmax: body.zmax, circ: body.circ,
+    bellyA: 2.02, stripeA: 1.46, stripeW: 0.13, stripeZ1: 14.5, swooshZ: -6.5,
+    cockpit: { z0: 13.5, z1: 14.35, a: 0.78 },
+    titles: { a: 0.74, z: 3.6, size: 1.55 },
+    operator: { a: 0.86, z: 10.6, size: 0.44 },
+  });
+  group.add(new THREE.Mesh(body.geo, kit.body));
+
+  // Dorsal SATCOM & fuel-control fairing hump along the upper spine.
+  const satcom = new THREE.Mesh(fuselage([
+    [-3.2, 0.0001], [-1.8, 0.46], [1.4, 0.56], [4.2, 0.42], [5.8, 0.0001],
+  ], { sx: 1.35, sy: 0.75, segments: 18 }).geo, kit.plain);
+  satcom.position.set(0, 2.18, 1.2);
+  group.add(satcom);
+
+  // APU exhaust in the tail cone.
+  const apu = new THREE.Mesh(new THREE.CircleGeometry(0.16, 12), kit.dark);
+  apu.rotation.y = Math.PI;
+  apu.position.set(0, warp(-16.4), -16.42);
+  group.add(apu);
+
+  // Broad swept wings with inboard crank, belly wing-box fairing, and branded winglets.
+  const wingY = -1.1;
+  const wingSpan = 17.5;
+  const kinkX = 6.2;
+  const wingDihedral = 0.08;
+  const rise = Math.tan(wingDihedral);
+  const kink = { le: 1.0, chord: 4.8, t: 0.125 };
+  const tip = { le: -4.8, chord: 1.75, t: 0.1 };
+  for (const w of surfacePair(kit.wingSkin, {
+    span: kinkX, dihedral: wingDihedral,
+    root: { le: 4.4, chord: 8.4, y: wingY, t: 0.15 }, tip: kink,
+  })) group.add(w);
+  for (const w of surfacePair(kit.wingSkin, {
+    span: wingSpan - kinkX, x0: kinkX, dihedral: wingDihedral,
+    root: { ...kink, y: wingY + rise * kinkX }, tip,
+  })) group.add(w);
+
+  const wingYAt = (x) => wingY + rise * x;
+  const kinkTe = kink.le - kink.chord;
+  const tipTe = tip.le - tip.chord;
+  const leAt = (x) => (x < kinkX
+    ? 4.4 + (kink.le - 4.4) * (x / kinkX)
+    : kink.le + (tip.le - kink.le) * ((x - kinkX) / (wingSpan - kinkX)));
+  const teAt = (x) => (x < kinkX
+    ? -4.0 + (kinkTe + 4.0) * (x / kinkX)
+    : kinkTe + (tipTe - kinkTe) * ((x - kinkX) / (wingSpan - kinkX)));
+
+  // Winglets.
+  const tipY = wingYAt(wingSpan);
+  for (const side of [1, -1]) {
+    group.add(finMesh(kit.fin, {
+      height: 1.9, thickness: 0.08, base: [side * wingSpan, tipY], cant: 0.32, side,
+      root: { le: tip.le, chord: tip.chord }, tip: { le: -6.1, chord: 0.72 },
+    }));
+  }
+
+  // Belly wing-box fairing.
+  group.add(new THREE.Mesh(fuselage([
+    [-4.8, 0.28], [-3.2, 1.15], [2.0, 1.25], [4.6, 0.68], [5.2, 0.0001],
+  ], { sx: 1.8, sy: 0.65, warp: () => -1.35 }).geo, kit.wing));
+
+  // Four underwing turbofan engines (inboard + outboard on each wing).
+  const engineXs = [5.6, 10.2];
+  for (const side of [1, -1]) {
+    for (const ex of engineXs) {
+      const ey = wingYAt(ex) - 1.32;
+      const ez = leAt(ex) + 0.55;
+      const engine = turbofan(kit);
+      engine.scale.setScalar(0.92);
+      engine.position.set(side * ex, ey, ez);
+      group.add(engine);
+      group.add(finMesh(kit.wing, {
+        height: 0.65, thickness: 0.16, base: [side * ex, wingYAt(ex) + 0.05], cant: Math.PI,
+        root: { le: leAt(ex) + 0.1, chord: 2.5 }, tip: { le: ez + 1.5, chord: 3.3 },
+      }));
+    }
+  }
+
+  // Twin underwing hose-and-drogue refuelling pods outboard of the outer engines.
+  const podX = 13.4;
+  const podY = wingYAt(podX) - 0.85;
+  const podZ = (leAt(podX) + teAt(podX)) * 0.5 - 0.5;
+  const amberMat = new THREE.MeshBasicMaterial({ color: 0xffb020 });
+  kit.all.push(amberMat);
+  for (const side of [1, -1]) {
+    const pod = new THREE.Mesh(fuselage([
+      [-2.3, 0.36], [-1.5, 0.48], [0.6, 0.5], [1.9, 0.32], [2.4, 0.0001],
+    ], { segments: 16 }).geo, kit.engine);
+    pod.position.set(side * podX, podY, podZ);
+    group.add(pod);
+    // Strut attaching pod to wing underside.
+    group.add(rod(kit.wing, [side * podX, wingYAt(podX), podZ + 0.3], [side * podX, podY + 0.35, podZ + 0.2], 0.16));
+    // Dark drogue housing rim at the rear of the pod.
+    const rim = new THREE.Mesh(new THREE.RingGeometry(0.18, 0.38, 16), kit.dark);
+    rim.rotation.y = Math.PI;
+    rim.position.set(side * podX, podY, podZ - 2.32);
+    group.add(rim);
+    // Amber status light on pod belly.
+    group.add(dot(amberMat, side * podX, podY - 0.5, podZ - 0.6, 0.18));
+  }
+
+  // Swept horizontal stabilisers and tall branded tail fin with provider logo.
+  const tailY = warp(-13.2);
+  for (const t of surfacePair(kit.tailSkin, {
+    span: 6.4, dihedral: 0.1,
+    root: { le: -10.8, chord: 3.8, y: tailY, t: 0.11 }, tip: { le: -14.2, chord: 1.55, t: 0.09 },
+  })) group.add(t);
+  group.add(finMesh(kit.fin, {
+    height: 6.4, thickness: 0.11, base: [0, tailY + 1.15],
+    root: { le: -8.6, chord: 5.8 }, tip: { le: -13.6, chord: 2.3 },
+    logo: kit.logo, logoAt: 0.44, logoScale: 0.78,
+  }));
+  group.add(finMesh(kit.fin, {
+    height: 0.75, thickness: 0.12, base: [0, 2.0],
+    root: { le: -5.8, chord: 3.2 }, tip: { le: -8.6, chord: 1.0 },
+  }));
+
+  // Iconic aft flying refuelling boom with V-shaped ruddervators and high-vis tip.
+  const boomRoot = [0, -0.7, -11.2];
+  const boomMid = [0, -2.5, -16.8];
+  const boomTip = [0, -3.4, -19.6];
+  group.add(rod(kit.metal, boomRoot, boomMid, 0.24, 10));
+  group.add(rod(amberMat, boomMid, boomTip, 0.15, 10));
+  group.add(dot(amberMat, boomTip[0], boomTip[1], boomTip[2], 0.24));
+  for (const side of [1, -1]) {
+    group.add(finMesh(kit.engine, {
+      height: 1.55, thickness: 0.08, base: [side * 0.18, boomMid[1] + 0.08], cant: 0.82, side,
+      root: { le: boomMid[2] + 0.55, chord: 1.1 }, tip: { le: boomMid[2] - 0.15, chord: 0.55 },
+    }));
+  }
+
+  // Nav lights, belly refuelling director lights, and spine/belly beacons.
+  navLights(group, kit, [wingSpan - 0.2, tipY + 0.12, -5.1], [0, tailY + 0.28, -16.5]);
+  group.add(dot(kit.beacon, 0, 2.55, 1.4, 0.32));
+  group.add(dot(kit.beacon, 0, -2.3, 6.2, 0.3));
+  group.add(dot(amberMat, 0, -2.3, 9.6, 0.22));
+
+  return finish(group, 0.85, kit, {
+    refuelAnchors: {
+      center: new THREE.Vector3(...boomTip),
+      port: new THREE.Vector3(podX, podY, podZ - 2.35),
+      starboard: new THREE.Vector3(-podX, podY, podZ - 2.35),
+    },
+  });
 }
