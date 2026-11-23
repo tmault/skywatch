@@ -16,6 +16,12 @@ pub enum State {
     Cruising,
     Holding,
     Landed,
+    /// Rolling on the ground between runway and parking.
+    Taxi,
+    /// Parked at a stand, engines off.
+    Parked,
+    /// Lined up on the runway, holding short for takeoff clearance.
+    Ready,
     Takeoff,
     Landing,
 }
@@ -56,6 +62,15 @@ pub struct Aircraft {
     /// Patrol orbit angle for sector-bound aircraft.
     #[serde(default)]
     patrol_angle: f32,
+    /// Ground-movement target (taxiing), not serialised.
+    #[serde(skip)]
+    taxi_target: Option<[f32; 2]>,
+    /// Where taxiing leads next (Ready at the runway, Parked at the stand).
+    #[serde(skip)]
+    taxi_next: Option<State>,
+    /// Ground timer: auto-taxi after landing, hold-short before takeoff.
+    #[serde(skip)]
+    ground_timer: f32,
     /// Ground speed in m/s (serde default keeps old snapshots deserialisable).
     #[serde(default = "default_speed")]
     pub speed: f32,
@@ -75,6 +90,15 @@ const DRONE_SPEED: f32 = 6.0; // m/s, drones always slow loiter
 const ORBIT_RADIUS: f32 = 40.0;
 const HOLD_TURN_RADIUS: f32 = 60.0; // m, holding orbit radius
 const HOLD_DRIFT_SPEED: f32 = 12.0; // m/s along the holding orbit
+
+/// Airport geometry (matches the client's island rendering).
+const RUNWAY_MID: [f32; 2] = [88.0, -28.0];
+const RUNWAY_THRESHOLD: [f32; 2] = [88.0, -70.0];
+const RUNWAY_HEADING: f32 = -std::f32::consts::FRAC_PI_2; // rolling north
+const PARKING_STANDS: [[f32; 2]; 3] = [[106.0, -4.0], [106.0, 16.0], [72.0, 14.0]];
+const TAXI_SPEED: f32 = 5.0; // m/s on the ground
+const TAXI_DELAY_AFTER_LANDING: f32 = 6.0; // s parked on runway, then taxi
+const HOLD_SHORT_TIME: f32 = 5.0; // s lined up before rolling
 
 /// Wrap a coordinate into [-AREA_SIZE/2, AREA_SIZE/2) so the world is
 /// centred on the origin (where the island sits).
@@ -124,6 +148,9 @@ impl Aircraft {
             title: None,
             orbit_center: None,
             patrol_angle: 0.0,
+            taxi_target: None,
+            taxi_next: None,
+            ground_timer: 0.0,
             speed,
         }
     }
@@ -142,22 +169,40 @@ impl Aircraft {
         self.hold_reason = Some(reason.to_string());
     }
 
-    /// Cleared for takeoff: climb until reaching cruise altitude.
+    /// Cleared for takeoff: taxi out, hold short, then roll.
     pub fn release(&mut self) {
-        if self.state != State::Cruising {
-            self.orbit_center = None;
-            self.patrol_angle = (self.position[1]).atan2(self.position[0]);
-        }
-        self.state = State::Takeoff;
+        self.orbit_center = None;
         self.hold_reason = None;
+        match self.state {
+            // On the ground: taxi to the runway threshold first.
+            State::Parked | State::Landed | State::Taxi => {
+                self.state = State::Taxi;
+                self.taxi_target = Some(RUNWAY_THRESHOLD);
+                self.taxi_next = Some(State::Ready);
+                self.ground_timer = 0.0;
+            }
+            // Already lined up: roll now.
+            State::Ready => {
+                self.state = State::Takeoff;
+                self.heading = RUNWAY_HEADING;
+            }
+            // Airborne hold: climb straight out.
+            _ => self.state = State::Takeoff,
+        }
     }
 
-    /// Touch down: sit still at ground level.
+    /// Touch down: roll out, then taxi to the parking stand.
     pub fn land(&mut self) {
         self.state = State::Landed;
         self.altitude = 0.0;
+        self.position[2] = 0.0;
         self.hold_reason = None;
         self.orbit_center = None;
+        // Touch down mid-runway, rolling north.
+        self.position[0] = RUNWAY_MID[0];
+        self.position[1] = RUNWAY_MID[1];
+        self.heading = RUNWAY_HEADING;
+        self.ground_timer = 0.0;
     }
 
     /// Advance the simulation by `dt` seconds.
@@ -228,7 +273,70 @@ impl Aircraft {
                 }
             }
             State::Landed => {
-                // Sit still at ground level.
+                // Rolled out on the runway; after a short pause, taxi to the stand.
+                self.ground_timer += dt;
+                if self.ground_timer >= TAXI_DELAY_AFTER_LANDING {
+                    let stand = PARKING_STANDS[(self.id as usize) % PARKING_STANDS.len()];
+                    self.taxi_target = Some(stand);
+                    self.taxi_next = Some(State::Parked);
+                    self.state = State::Taxi;
+                }
+            }
+            State::Taxi => {
+                if let Some(target) = self.taxi_target {
+                    let dx = target[0] - self.position[0];
+                    let dy = target[1] - self.position[1];
+                    let dist = dx.hypot(dy);
+                    let step = (TAXI_SPEED * dt).min(dist);
+                    if step >= dist {
+                        // Arrived: Parked at the stand, or Ready at the threshold.
+                        self.position[0] = target[0];
+                        self.position[1] = target[1];
+                        self.state = self.taxi_next.unwrap_or(State::Parked);
+                        self.taxi_target = None;
+                        self.ground_timer = 0.0;
+                        if self.state == State::Ready {
+                            self.heading = RUNWAY_HEADING;
+                        }
+                    } else {
+                        self.heading = dy.atan2(dx);
+                        self.position[0] += dx / dist * step;
+                        self.position[1] += dy / dist * step;
+                    }
+                } else {
+                    self.state = State::Parked;
+                }
+            }
+            State::Ready => {
+                // Lined up, holding short for clearance.
+                self.ground_timer += dt;
+                if self.ground_timer >= HOLD_SHORT_TIME {
+                    self.state = State::Takeoff;
+                }
+            }
+            State::Takeoff => {
+                self.altitude += TAKEOFF_RATE * dt;
+                self.position[2] = self.altitude;
+                // Roll forward along the runway while climbing.
+                let dx = self.heading.cos() * self.speed * dt;
+                let dy = self.heading.sin() * self.speed * dt;
+                self.position[0] = wrap_centered(self.position[0] + dx);
+                self.position[1] = wrap_centered(self.position[1] + dy);
+                if self.altitude >= CRUISE_ALTITUDE {
+                    self.altitude = self.altitude.min(CRUISE_ALTITUDE);
+                    self.position[2] = self.altitude;
+                    self.state = State::Cruising;
+                }
+            }
+            State::Landing => {
+                self.altitude = (self.altitude - TAKEOFF_RATE * dt).max(0.0);
+                self.position[2] = self.altitude;
+                if self.altitude <= 0.0 {
+                    self.state = State::Landed;
+                }
+            }
+            State::Parked => {
+                // Engines off at the stand until clearance arrives.
                 self.altitude = 0.0;
                 self.position[2] = 0.0;
             }

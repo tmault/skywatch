@@ -137,6 +137,9 @@ export function stateColor(state) {
   switch (state) {
     case 'holding': return '#ffb020';
     case 'landed': return '#8a8f98';
+    case 'parked': return '#6b757d';
+    case 'taxi': return '#ffd54a';
+    case 'ready': return '#ff8c42';
     case 'takeoff':
     case 'landing': return '#35d6e8';
     default: return '#ffffff';

@@ -626,6 +626,9 @@ function handleStateChange(a, from, to) {
     if (to === 'takeoff') addTickerLine(`${cs}: departing.`);
     else if (to === 'landing') addTickerLine(`${cs}: on approach.`);
     else if (to === 'landed') addTickerLine(`${cs}: landed, off frequency.`);
+    else if (to === 'taxi') addTickerLine(`${cs}: taxiing.`);
+    else if (to === 'parked') addTickerLine(`${cs}: parked at the stand.`);
+    else if (to === 'ready') addTickerLine(`${cs}: lined up, ready for takeoff.`, true, a.id);
     else if (to === 'cruising' && from !== undefined) addTickerLine(`${cs}: cruising.`);
   }
   // Local note in radio history for visible state changes.
@@ -635,6 +638,9 @@ function handleStateChange(a, from, to) {
       takeoff: 'taking off',
       landing: 'landing',
       landed: 'landed',
+      taxi: 'taxiing',
+      parked: 'parked at the stand',
+      ready: 'ready for takeoff',
       cruising: 'cruising',
     }[to];
     if (note && to !== 'holding') appendHistory(a.id, '·', `${a.callsign} ${note}`);

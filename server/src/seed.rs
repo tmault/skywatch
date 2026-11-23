@@ -235,15 +235,26 @@ mod tests {
         seed(&mut world);
         run_cycle(&mut world, 3);
         let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
-        assert_eq!(a.state, State::Takeoff);
-        // Climb to cruise altitude (~24s of sim at 5 m/s), still cruising later.
+        // Ground release now taxis to the threshold first.
+        assert_eq!(a.state, State::Taxi);
+        // Taxi (~42 m at 5 m/s), hold short, then roll and climb to cruise.
+        world.tick(10.0);
+        let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
+        assert_eq!(a.state, State::Ready);
+        world.tick(6.0);
         world.tick(30.0);
-        run_cycle(&mut world, 4);
         let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
         assert_eq!(a.state, State::Cruising);
         // ...then lands again.
         run_cycle(&mut world, 5);
         let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
         assert_eq!(a.state, State::Landed);
+        // And after the ground pause it taxis to its parking stand.
+        world.tick(8.0);
+        let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
+        assert_eq!(a.state, State::Taxi);
+        world.tick(10.0);
+        let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
+        assert_eq!(a.state, State::Parked);
     }
 }
