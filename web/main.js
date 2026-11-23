@@ -18,6 +18,7 @@ import {
   makeAgentMesh, makeJetMesh, makeFighterMesh, makeDroneMesh, makeTankerMesh,
 } from './aircraft.js';
 import { liveryFor } from './livery.js';
+import { createLocalFlair } from './local-flair.js';
 
 const WORLD_SIZE = 820;
 const INTERP_RATE = 10; // exponential smoothing constant (per second)
@@ -1300,6 +1301,7 @@ function ensureMesh(a) {
   label.renderOrder = 10;
   built.group.add(label);
   built.label = label;
+  built.labelBaseY = label.position.y;
   built.labelKey = null;
   updateAircraftLabel(built, a);
 
@@ -1313,17 +1315,23 @@ function ensureMesh(a) {
   built.target = built.group.position.clone();
   built.heading = a.heading;
   built.targetHeading = a.heading;
+  built.snapX = a.position[0];
+  built.snapZ = a.position[1];
   built.altitude = a.position[2];
   built.speed = a.speed ?? 0;
   built.dustClock = 0;
   built.roll = 0;
   built.pitch = 0;
+  built.flightPitch = 0;
   built.group.rotation.y = Math.PI / 2 - a.heading;
   built.state = a.state;
   built.kind = a.kind;
   built.model_class = a.model_class;
   built.ring = ring;
   built.contrails = makeContrailsFor(a);
+  if (a.kind === 'agent' && a.model_class === 'local') {
+    built.localFlair = createLocalFlair(scene, a);
+  }
   built.prop = built.group.getObjectByName('prop');
   built.gear = built.group.getObjectByName('gear');
 
@@ -1359,6 +1367,9 @@ function disposeMesh(id) {
   for (const m of entry.disposeMaterials) m.dispose();
   if (entry.contrails) {
     for (const c of entry.contrails) c.dispose();
+  }
+  if (entry.localFlair) {
+    entry.localFlair.dispose();
   }
   meshes.delete(id);
 }
@@ -1614,13 +1625,30 @@ function applySnapshot(snapshot) {
 
   for (const a of aircraft) {
     seen.add(a.id);
-    // Repaint when the thread switches model (new livery).
-    if (meshes.has(a.id) && meshes.get(a.id).model !== (a.model ?? null)) disposeMesh(a.id);
+    // Repaint when the thread switches model or airframe class (new livery / flair).
+    if (meshes.has(a.id) && (
+      meshes.get(a.id).model !== (a.model ?? null)
+      || meshes.get(a.id).model_class !== a.model_class
+    )) disposeMesh(a.id);
     const entry = ensureMesh(a);
     const y = worldYForAircraft(a, entry.wheelDrop);
     entry.target.set(a.position[0], y, a.position[1]);
     entry.targetHeading = a.heading;
     detectRunwayEvent(a, entry, lastStates.get(a.id), entry.altitude);
+    const snapDx = a.position[0] - entry.snapX;
+    const snapDz = a.position[1] - entry.snapZ;
+    const snapDh = Math.hypot(snapDx, snapDz);
+    const snapDAlt = a.position[2] - entry.altitude;
+    const onGround = ['parked', 'ready', 'taxi', 'landed'].includes(a.state)
+      || ((a.state === 'takeoff' || a.state === 'departing') && a.position[2] <= 0);
+    if (onGround) {
+      entry.flightPitch = 0;
+    } else if (snapDh >= 0.05 && snapDh < 200 && Math.abs(snapDAlt) < 25) {
+      // Negative rotation.x pitches the +Z nose UP; positive pitches nose DOWN.
+      entry.flightPitch = -Math.atan2(snapDAlt, snapDh);
+    }
+    entry.snapX = a.position[0];
+    entry.snapZ = a.position[1];
     entry.altitude = a.position[2];
     entry.speed = a.speed ?? 0;
 
@@ -1817,6 +1845,7 @@ function animate() {
     if (wrapped) {
       entry.group.position.copy(entry.target);
       if (entry.contrails) for (const c of entry.contrails) c.clear();
+      if (entry.localFlair) entry.localFlair.reset();
     } else {
       entry.group.position.lerp(entry.target, k);
     }
@@ -1829,9 +1858,11 @@ function animate() {
     entry.group.rotation.y = Math.PI / 2 - entry.heading;
 
     // Bank smoothly into turns when airborne; keep wings level on the ground.
-    const departingAirborne = entry.state === 'departing' && (entry.altitude || 0) > 0.4;
-    const airborne = ['cruising', 'holding', 'refueling', 'takeoff', 'landing'].includes(entry.state)
-      || departingAirborne;
+    const alt = entry.altitude || 0;
+    const takeoffAirborne = entry.state === 'takeoff' && alt > 0;
+    const departingAirborne = entry.state === 'departing' && alt > 0;
+    const airborne = ['cruising', 'holding', 'refueling', 'landing'].includes(entry.state)
+      || takeoffAirborne || departingAirborne;
     const omega = dt > 0.001 ? stepH / dt : 0;
     const maxBank = entry.kind === 'tanker'
       ? 0.22
@@ -1840,20 +1871,46 @@ function animate() {
       ? Math.max(-maxBank, Math.min(maxBank, omega * 1.15))
       : 0;
     entry.roll += (targetRoll - entry.roll) * (1 - Math.exp(-5 * dt));
-    entry.group.rotation.z = entry.roll;
 
-    // Pitch nose up smoothly during takeoff rotation and climb-out (negative X pitches +Z nose up).
+    const stunt = entry.localFlair ? entry.localFlair.updateStunt(entry, dt, airborne) : null;
+    const totalRoll = entry.roll + (stunt ? stunt.roll : 0);
+    entry.group.rotation.z = totalRoll;
+
+    // Pitch along the actual climb/descent flight path (negative X pitches +Z nose up,
+    // positive X pitches nose down), with pre-liftoff rotation and a short touchdown flare.
+    const maxClimb = entry.kind === 'fighter' ? 0.5 : (entry.model_class === 'frontier' ? 0.38 : 0.42);
+    const maxDescent = entry.kind === 'fighter' ? 0.44 : (entry.model_class === 'frontier' ? 0.34 : 0.36);
     let targetPitch = 0;
-    const alt = entry.altitude || 0;
-    if (departingAirborne) {
-      targetPitch = alt < 480 ? -0.24 : -0.08;
-    } else if (entry.state === 'takeoff' && alt > 0) {
-      targetPitch = -0.22; // rotate at liftoff, not during the roll
-    } else if (entry.state === 'landing') {
-      targetPitch = alt < 10 ? -0.12 : -0.04; // flare just before touchdown
+    if (airborne) {
+      targetPitch = THREE.MathUtils.clamp((entry.flightPitch || 0) * 1.15, -maxClimb, maxDescent);
+      if (entry.state === 'landing' && alt < 6 && targetPitch > 0) {
+        // Flare gently out of the nose-down glideslope over the threshold so main gear touches first.
+        const f = Math.max(0, alt / 6);
+        targetPitch = -0.05 * (1 - f) + targetPitch * f;
+      }
+    } else if ((entry.state === 'takeoff' || entry.state === 'departing') && alt <= 0) {
+      // Begin rotating nose up at the end of the takeoff roll just before liftoff.
+      const rotateSpeed = (entry.model_class === 'frontier' ? 34 : 25) * 0.82;
+      if (entry.speed >= rotateSpeed) {
+        targetPitch = entry.kind === 'drone' ? -0.06 : -0.11;
+      }
     }
-    entry.pitch = (entry.pitch || 0) + (targetPitch - (entry.pitch || 0)) * (1 - Math.exp(-3.5 * dt));
-    entry.group.rotation.x = entry.pitch;
+    const pitchRate = (entry.state === 'takeoff' || entry.state === 'departing' || entry.state === 'landing' || entry.state === 'landed')
+      ? 5.5
+      : 4.0;
+    entry.pitch = (entry.pitch || 0) + (targetPitch - (entry.pitch || 0)) * (1 - Math.exp(-pitchRate * dt));
+    entry.group.rotation.x = entry.pitch + (stunt ? stunt.pitch : 0);
+
+    // Keep floating label hovering upright above the fuselage during barrel rolls.
+    if (stunt && stunt.roll !== 0) {
+      entry.label.position.set(
+        Math.sin(totalRoll) * entry.labelBaseY,
+        Math.cos(totalRoll) * entry.labelBaseY,
+        0,
+      );
+    } else if (entry.label.position.x !== 0 || entry.label.position.y !== entry.labelBaseY) {
+      entry.label.position.set(0, entry.labelBaseY, 0);
+    }
 
     // Fade the floating label smoothly as a departing aircraft vanishes into the distant haze.
     if (entry.state === 'departing') {
@@ -1889,6 +1946,11 @@ function animate() {
       for (const c of entry.contrails) {
         c.update(entry.group, dt, emit);
       }
+    }
+
+    // Update local-model towed sky-banner & coloured airshow smoke bursts.
+    if (entry.localFlair) {
+      entry.localFlair.updateVisuals(entry, dt, now, airborne);
     }
 
     if (entry.prop && entry.state !== 'parked' && entry.state !== 'landed') {
