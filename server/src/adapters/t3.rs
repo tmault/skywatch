@@ -8,8 +8,8 @@
 //! radio-panel messages back into the owning thread via `t3 thread send`.
 
 use crate::world::{
-    formation_position, Aircraft, Airport, Kind, ModelClass, State, World, GATE_HEADING,
-    HOME_GATES, SATELLITE_SLOTS,
+    default_sectors, formation_position, Aircraft, Airport, Kind, ModelClass, Sector, State, World,
+    GATE_HEADING, HOME_GATES, PROJECT_SECTOR_RADIUS, PROJECT_SECTOR_SLOTS, SATELLITE_SLOTS,
 };
 use crate::ws::{ClientFrame, SharedWorld};
 use serde::Deserialize;
@@ -37,6 +37,8 @@ struct ThreadListEntry {
     #[serde(rename = "threadId", alias = "thread_id")]
     thread_id: String,
     title: String,
+    #[serde(default)]
+    project: Option<String>,
     #[serde(default)]
     status: String,
     model: Option<String>,
@@ -167,6 +169,107 @@ fn local_device_name() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "local".to_string())
+}
+
+/// Hybrid zone classifier:
+/// - Named T3 projects (anything other than "No project") get their own dynamic project zone.
+/// - "No project" threads are routed into Build, Homelab, AI & Models, or Research by title keywords.
+/// Returns `(zone_name, is_project_zone)`.
+fn classify_zone(project: Option<&str>, title: &str) -> (String, bool) {
+    if let Some(proj) = project.map(str::trim).filter(|p| !p.is_empty()) {
+        if !proj.eq_ignore_ascii_case("no project") {
+            return (proj.to_string(), true);
+        }
+    }
+
+    let t = title.to_lowercase();
+    let has_any = |words: &[&str]| words.iter().any(|w| t.contains(w));
+
+    if has_any(&[
+        "tower",
+        "docker",
+        "homelab",
+        "backup",
+        "hdd",
+        "ssd",
+        "nas",
+        "amd cpu",
+        "cpu upgrade",
+        "lancool",
+        "calibre",
+        "searxng",
+        "trmnl",
+        "rpi",
+        "haos",
+        "home assistant",
+        "tailscale",
+        "devbox",
+        "cron",
+        "mount",
+        "4tb",
+        "240gb",
+    ]) {
+        return ("Homelab".to_string(), false);
+    }
+
+    if has_any(&[
+        "vllm",
+        "llama",
+        "ollama",
+        "qwen",
+        "glm",
+        "kimi",
+        "gemini",
+        "claude",
+        "gpt",
+        "opencode",
+        "radiance",
+        "inkling",
+        "maya",
+        "model",
+        "prompt",
+        "mcp",
+        "skill",
+        "antigravity",
+        "llm",
+        "benchmark",
+        "strata",
+        "gpu",
+        "token",
+    ]) {
+        return ("AI & Models".to_string(), false);
+    }
+
+    if has_any(&[
+        "repo",
+        "site",
+        "web",
+        "app",
+        "rust",
+        "three",
+        "mesh",
+        "plane",
+        "aeroplane",
+        "island",
+        "flight",
+        "visuali",
+        "geometry",
+        "graveyard",
+        "airport",
+        "code",
+        "refactor",
+        "build",
+        "deploy",
+        "frontend",
+        "blog",
+        "flashcard",
+        "nightshift",
+        "skywatch",
+    ]) {
+        return ("Build".to_string(), false);
+    }
+
+    ("Research".to_string(), false)
 }
 
 fn model_class(model: &Option<String>) -> ModelClass {
@@ -326,6 +429,7 @@ fn poll_subagents(parent_thread_ids: &HashSet<String>, now: i64) -> Vec<Subagent
 /// `t3 thread list --json` for the current directory's project.
 fn poll_threads() -> Option<Vec<ThreadListEntry>> {
     let sql = "SELECT t.thread_id, t.title, t.updated_at, \
+               p.title AS project, \
                json_extract(t.payload_json, '$.modelSelection.model') AS model, \
                COALESCE((SELECT r.status FROM orchestration_v2_projection_runs r \
                          WHERE r.thread_id = t.thread_id \
@@ -333,6 +437,7 @@ fn poll_threads() -> Option<Vec<ThreadListEntry>> {
                (SELECT COUNT(*) FROM orchestration_v2_projection_runtime_requests q \
                 WHERE q.thread_id = t.thread_id AND q.resolved_at IS NULL) AS pending \
                FROM orchestration_v2_projection_threads t \
+               LEFT JOIN projection_projects p ON p.project_id = t.project_id \
                WHERE t.deleted_at IS NULL AND t.archived_at IS NULL \
                  AND (json_extract(t.payload_json, '$.lineage.relationshipToParent') IS NULL \
                       OR json_extract(t.payload_json, '$.lineage.relationshipToParent') != 'subagent') \
@@ -424,12 +529,17 @@ fn apply_poll(
     world.airports = data.airports;
     let _ = data.now;
 
-    let mut keep: HashMap<String, (State, Option<String>, Option<String>, ModelClass)> =
+    let mut keep: HashMap<String, (State, Option<String>, Option<String>, ModelClass, String)> =
         HashMap::new();
     let mut new_threads: Vec<(String, String, ModelClass)> = Vec::new();
+    let mut active_projects: Vec<String> = Vec::new();
 
     for (entry, pending) in &data.recent {
         let (state, reason) = flight_state(&entry.status, *pending);
+        let (zone, is_project) = classify_zone(entry.project.as_deref(), &entry.title);
+        if is_project && !active_projects.contains(&zone) {
+            active_projects.push(zone.clone());
+        }
         keep.insert(
             entry.thread_id.clone(),
             (
@@ -437,6 +547,7 @@ fn apply_poll(
                 reason,
                 Some(entry.title.clone()),
                 model_class(&entry.model),
+                zone,
             ),
         );
         if callsigns.by_thread.contains_key(&entry.thread_id) {
@@ -448,6 +559,22 @@ fn apply_poll(
             model_class(&entry.model),
         ));
     }
+
+    // Rebuild sectors: 4 fixed domain zones + dynamic zones for active named projects.
+    let mut sectors = default_sectors();
+    for (idx, proj_name) in active_projects
+        .iter()
+        .take(PROJECT_SECTOR_SLOTS.len())
+        .enumerate()
+    {
+        sectors.push(Sector {
+            name: proj_name.clone(),
+            center: PROJECT_SECTOR_SLOTS[idx],
+            radius: PROJECT_SECTOR_RADIUS,
+            kind: "project".to_string(),
+        });
+    }
+    world.sectors = sectors;
 
     // Remove aircraft whose threads dropped out of the recent set.
     let drop: Vec<String> = callsigns
@@ -467,7 +594,7 @@ fn apply_poll(
     let mut radio_events = Vec::new();
 
     for thread_id in &order {
-        let Some((state, reason, title, _model_class)) = keep.get(thread_id) else {
+        let Some((state, reason, title, _model_class, zone)) = keep.get(thread_id) else {
             continue;
         };
         let cs = callsigns.get(thread_id);
@@ -507,14 +634,16 @@ fn apply_poll(
             }
             a.hold_reason = reason.clone();
             a.title = title.clone();
+            a.topic = Some(zone.clone());
             a.device = Some(home_name.to_string());
         } else if let Some((_, t, mc)) = new_threads.iter().find(|(id, _, _)| id == thread_id) {
             let mut a = Aircraft::with_model(&cs, Kind::Agent, *mc);
             a.title = Some(t.clone());
             a.device = Some(home_name.to_string());
-            if let Some((_, reason, title, _)) = keep.get(thread_id) {
+            if let Some((_, reason, title, _, zone)) = keep.get(thread_id) {
                 a.hold_reason = reason.clone();
                 a.title = title.clone();
+                a.assign(zone);
             }
             a.state = *state;
             if a.state == State::Landed {
@@ -523,8 +652,6 @@ fn apply_poll(
                 let offset = (callsigns.next as f32 % 4.0) * 14.0 - 14.0;
                 a.position[1] = (a.position[1] + offset).clamp(-45.0, 28.0);
             }
-            let names = ["Deploy", "Refactor", "Monitor"];
-            a.assign(names[callsigns.next % names.len()]);
             world.add(a);
         }
     }
@@ -839,5 +966,29 @@ mod tests {
         assert_eq!(flight_state("interrupted", 0).0, State::Landed);
         assert_eq!(flight_state("completed", 0).0, State::Parked);
         assert_eq!(flight_state("idle", 0).0, State::Parked);
+    }
+
+    #[test]
+    fn hybrid_zone_classifier_routes_projects_and_domains() {
+        assert_eq!(
+            classify_zone(Some("Skywatch"), "anything"),
+            ("Skywatch".to_string(), true)
+        );
+        assert_eq!(
+            classify_zone(Some("No project"), "Check Tower Docker Auto-Updates"),
+            ("Homelab".to_string(), false)
+        );
+        assert_eq!(
+            classify_zone(None, "Qwen vLLM GFX1201 Launcher Setup"),
+            ("AI & Models".to_string(), false)
+        );
+        assert_eq!(
+            classify_zone(Some("No project"), "Rust Agent Flight Visualization"),
+            ("Build".to_string(), false)
+        );
+        assert_eq!(
+            classify_zone(None, "Download Classic Literature on Shelfmark"),
+            ("Research".to_string(), false)
+        );
     }
 }

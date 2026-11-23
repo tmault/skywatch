@@ -8,8 +8,11 @@ import {
   setupRadio, openRadio, closeRadio, updateRadio, selectedAircraftId,
   appendHistory, stateColor,
 } from './radio.js';
+import {
+  buildAlpineIsland, buildAlpineBackdrop, makeSwissFlag, updateAlpine, SWISS_RED,
+} from './alpine.js';
 
-const WORLD_SIZE = 700;
+const WORLD_SIZE = 820;
 const INTERP_RATE = 10; // exponential smoothing constant (per second)
 const TARMAC_TOP_Y = 3.2; // elevated runway/apron deck height (well above sand y=2.0)
 
@@ -30,19 +33,21 @@ const scene = new THREE.Scene();
   skyCanvas.height = 256;
   const ctx = skyCanvas.getContext('2d');
   const grad = ctx.createLinearGradient(0, 0, 0, 256);
-  grad.addColorStop(0, '#09132b');
-  grad.addColorStop(0.58, '#123a5c');
-  grad.addColorStop(1, '#2b6e8c');
+  // Crisp alpine day: deep zenith blue fading to a pale haze at the horizon.
+  grad.addColorStop(0, '#2f6fb8');
+  grad.addColorStop(0.45, '#6fa9dc');
+  grad.addColorStop(0.8, '#b9d9ef');
+  grad.addColorStop(1, '#dcecf6');
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, 1, 256);
   const tex = new THREE.CanvasTexture(skyCanvas);
   tex.colorSpace = THREE.SRGBColorSpace;
   scene.background = tex;
 }
-scene.fog = new THREE.Fog(0x123a5c, 500, 1550);
+scene.fog = new THREE.Fog(0xc9e0ee, 760, 2300);
 
 const camera = new THREE.PerspectiveCamera(
-  50, window.innerWidth / window.innerHeight, 2, 3000,
+  50, window.innerWidth / window.innerHeight, 2, 4000,
 );
 camera.position.set(0, 410, 355);
 camera.lookAt(0, 20, 0);
@@ -53,66 +58,39 @@ controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.maxPolarAngle = Math.PI / 2 - 0.05;
 controls.minDistance = 18;
-controls.maxDistance = 950;
+controls.maxDistance = 900;
 
-// Three-point sky/sea lighting so curved aircraft fuselages and wings pop.
-scene.add(new THREE.HemisphereLight(0x9ad4ff, 0x16384a, 0.85));
-scene.add(new THREE.AmbientLight(0x556b84, 0.35));
-const sun = new THREE.DirectionalLight(0xfff7ea, 1.55);
+// Alpine daylight: cool sky fill, meadow-green bounce, warm low sun.
+scene.add(new THREE.HemisphereLight(0xcfe6ff, 0x3f5a34, 0.9));
+scene.add(new THREE.AmbientLight(0x8094a8, 0.3));
+const sun = new THREE.DirectionalLight(0xfff1dc, 1.75);
 sun.position.set(280, 480, 220);
 scene.add(sun);
-const rim = new THREE.DirectionalLight(0x58b8e8, 0.45);
+const rim = new THREE.DirectionalLight(0x9cc8f0, 0.4);
 rim.position.set(-260, 180, -240);
 scene.add(rim);
 
-// Sea + radar grid.
+// Alpine lake, a faint Swiss-style layout grid, and the mountains around it.
 {
-  const sea = new THREE.Mesh(
-    new THREE.PlaneGeometry(WORLD_SIZE + 260, WORLD_SIZE + 260),
-    new THREE.MeshStandardMaterial({ color: 0x0c2938, roughness: 0.75, metalness: 0.15 }),
+  const lake = new THREE.Mesh(
+    new THREE.CircleGeometry(1300, 96),
+    new THREE.MeshStandardMaterial({ color: 0x1f6f8c, roughness: 0.32, metalness: 0.18 }),
   );
-  sea.rotation.x = -Math.PI / 2;
-  sea.position.y = 0;
-  scene.add(sea);
+  lake.rotation.x = -Math.PI / 2;
+  lake.position.y = 0;
+  scene.add(lake);
 
-  const grid = new THREE.GridHelper(WORLD_SIZE, 35, 0x1f6f8f, 0x14455c);
+  const grid = new THREE.GridHelper(WORLD_SIZE, 35, 0xffffff, 0xffffff);
+  grid.material.transparent = true;
+  grid.material.opacity = 0.1;
+  grid.material.depthWrite = false;
   grid.position.y = 0.35;
   scene.add(grid);
+
+  buildAlpineBackdrop(scene, 620, 1500);
 }
 
 /* ----------------------------------------------------------- airports */
-
-function coastRadius(angle, base, noise, seed = 0) {
-  const a1 = Math.sin(angle * 3 + 1.7 + seed) * noise;
-  const a2 = Math.sin(angle * 5 + 4.2 + seed * 1.3) * noise * 0.5;
-  const a3 = Math.sin(angle * 8 + 2.9 + seed * 0.7) * noise * 0.25;
-  return base + a1 + a2 + a3;
-}
-
-function coastShape(base, noise, seed = 0) {
-  const shape = new THREE.Shape();
-  const steps = 64;
-  for (let i = 0; i <= steps; i++) {
-    const a = (i / steps) * Math.PI * 2;
-    const r = coastRadius(a, base, noise, seed);
-    const x = Math.cos(a) * r;
-    const y = Math.sin(a) * r;
-    if (i === 0) shape.moveTo(x, y);
-    else shape.lineTo(x, y);
-  }
-  shape.closePath();
-  return shape;
-}
-
-function extrudeFlat(shape, thickness, topY, mat) {
-  const geo = new THREE.ExtrudeGeometry(shape, {
-    depth: thickness, bevelEnabled: false, curveSegments: 48,
-  });
-  geo.rotateX(-Math.PI / 2);
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.position.y = topY - thickness;
-  return mesh;
-}
 
 // Raised concrete/asphalt deck slab whose top sits cleanly at `topY` —
 // zero Z-fighting against the island sand (y=2.0) and guaranteed above terrain.
@@ -130,33 +108,11 @@ function makeMarking(w, l, x, z, y, mat) {
   return mesh;
 }
 
-function makePalm(seed) {
-  const trunkMat = new THREE.MeshStandardMaterial({ color: 0x6b4f2f, roughness: 0.9 });
-  const leafMat = new THREE.MeshStandardMaterial({ color: 0x2f8f4a, roughness: 0.8 });
-  const palm = new THREE.Group();
-  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.85, 14, 6), trunkMat);
-  trunk.position.y = 7;
-  trunk.rotation.z = Math.sin(seed * 7.3) * 0.14;
-  palm.add(trunk);
-  for (let i = 0; i < 6; i++) {
-    const leaf = new THREE.Mesh(new THREE.ConeGeometry(1.0, 7.5, 4), leafMat);
-    const la = (i / 6) * Math.PI * 2;
-    leaf.position.set(Math.cos(la) * 3.1, 14, Math.sin(la) * 3.1);
-    leaf.rotation.z = Math.cos(la) * 1.25;
-    leaf.rotation.x = -Math.sin(la) * 1.25;
-    palm.add(leaf);
-  }
-  return palm;
-}
-
 const airportGroups = new Map();
 const radars = [];
 
 function buildHomeAirport(ap) {
   const island = new THREE.Group();
-  const sandMat = new THREE.MeshStandardMaterial({ color: 0xd6c084, roughness: 0.95 });
-  const grassMat = new THREE.MeshStandardMaterial({ color: 0x3f7a45, roughness: 0.9 });
-  const grassDarkMat = new THREE.MeshStandardMaterial({ color: 0x35683b, roughness: 0.9 });
   const shoulderMat = new THREE.MeshStandardMaterial({ color: 0x565d65, roughness: 0.9 });
   const asphaltMat = new THREE.MeshStandardMaterial({ color: 0x262b32, roughness: 0.85 });
   const apronMat = new THREE.MeshStandardMaterial({ color: 0x394049, roughness: 0.85 });
@@ -169,30 +125,35 @@ function buildHomeAirport(ap) {
     color: 0xffc857, polygonOffset: true, polygonOffsetFactor: -2,
   });
 
-  // Broad sandy island plateau centered at (16, -6) with radius ~136 so the
-  // runway, apron, and terminal sit 100% on dry land with wide beach margins.
-  const beach = extrudeFlat(coastShape(136, 10, 0), 10, 2.0, sandMat);
-  beach.position.x = 16;
-  beach.position.z = -6;
-  island.add(beach);
+  // Alpine island: pebble shore, meadows and fir forest, the Tower on a
+  // flat-topped summit (west), a snowy horn behind it, and the airfield
+  // footprint (runway + apron foundation) flattened to y = 2.0 in the east.
+  const towerSpot = { x: -38, z: -4 };
+  const flagSpot = { x: -27, z: 7 };
+  const terrain = buildAlpineIsland(island, {
+    seed: 1.3,
+    center: [10, -6],
+    radius: 128,
+    hilliness: 4.5,
+    snowLine: 17,
+    pads: [{ x: 84, z: -7, hw: 37, hl: 67 }],
+    peaks: [
+      { ...towerSpot, h: 15, r: 46, flat: 7, crag: 0.25 },
+      { x: -84, z: 50, h: 32, r: 36, crag: 0.55 },
+      { x: -72, z: -62, h: 19, r: 30, crag: 0.45 },
+    ],
+    keepClear: [{ ...towerSpot, r: 11 }, { ...flagSpot, r: 3 }],
+    trees: 280,
+    chalets: 6,
+    rocks: 70,
+  });
 
-  // Grass plateau + tower hill strictly on the west side (x <= 26), leaving
-  // 30 full units of clearance before the runway west edge (x = 56).
-  const grass1 = extrudeFlat(coastShape(56, 7, 0), 4, 3.4, grassMat);
-  grass1.position.set(-38, 0, -4);
-  island.add(grass1);
-
-  const grass2 = extrudeFlat(coastShape(36, 5, 0), 3, 4.6, grassDarkMat);
-  grass2.position.set(-38, 0, -4);
-  island.add(grass2);
-
-  const hill = new THREE.Mesh(
-    new THREE.SphereGeometry(30, 24, 12, 0, Math.PI * 2, 0, Math.PI / 2),
-    grassDarkMat,
-  );
-  hill.scale.y = 0.35;
-  hill.position.set(-38, 5.9, -4);
-  island.add(hill);
+  const flag = makeSwissFlag(6, 13);
+  flag.position.set(flagSpot.x, terrain.heightAt(flagSpot.x, flagSpot.z) - 0.3, flagSpot.z);
+  island.add(flag);
+  const apronFlag = makeSwissFlag(5, 12);
+  apronFlag.position.set(118, 3.0, -68);
+  island.add(apronFlag);
 
   // Control Tower on the hill.
   const towerMat = new THREE.MeshStandardMaterial({ color: 0x25333d, roughness: 0.6, metalness: 0.25 });
@@ -220,14 +181,6 @@ function buildHomeAirport(ap) {
   const beacon = new THREE.Mesh(new THREE.SphereGeometry(1.4, 10, 10), beaconMat);
   beacon.position.set(-38, 51.5, -4);
   island.add(beacon);
-
-  // Palms strictly on the grass half (x <= 0).
-  const palmSpots = [[-78, 14], [-72, -32], [-18, 36], [-20, -42], [-50, 42], [-84, -8]];
-  palmSpots.forEach(([px, pz], idx) => {
-    const palm = makePalm(idx + 1);
-    palm.position.set(px, 3.4, pz);
-    island.add(palm);
-  });
 
   // Raised concrete foundation pad under runway + taxiways + apron (y top = 3.0).
   const foundation = makeDeckSlab(74, 134, 3.0, 1.4, shoulderMat);
@@ -288,7 +241,7 @@ function buildHomeAirport(ap) {
   }
 
   // Airport name banner above the tower.
-  const label = makeBannerLabel(ap.name.toUpperCase(), 0x5be7ff);
+  const label = makeBannerLabel(ap.name.toUpperCase(), 0xffffff, SWISS_RED);
   label.position.set(-38, 63, -4);
   label.scale.set(42, 10.5, 1);
   island.add(label);
@@ -301,8 +254,6 @@ function buildSatelliteAirport(ap, idx) {
   const island = new THREE.Group();
   const [cx, cz] = ap.center;
   const seed = (idx + 1) * 2.17;
-  const sandMat = new THREE.MeshStandardMaterial({ color: 0xcab67c, roughness: 0.95 });
-  const grassMat = new THREE.MeshStandardMaterial({ color: 0x3b7243, roughness: 0.9 });
   const shoulderMat = new THREE.MeshStandardMaterial({ color: 0x565d65, roughness: 0.9 });
   const asphaltMat = new THREE.MeshStandardMaterial({ color: 0x262b32, roughness: 0.85 });
   const apronMat = new THREE.MeshStandardMaterial({ color: 0x394049, roughness: 0.85 });
@@ -315,17 +266,30 @@ function buildSatelliteAirport(ap, idx) {
     color: 0xffc857, polygonOffset: true, polygonOffsetFactor: -2,
   });
 
-  // Generous sandy island (min radius >= 66) so runway, apron, and terminal
-  // stay 100% on solid land with beach margins on every side.
-  const beach = extrudeFlat(coastShape(74, 5, seed), 8, 2.0, sandMat);
-  beach.position.set(2, 0, 0);
-  island.add(beach);
+  // Alpine islet: the tower on a grassy knoll west of the runway, a small
+  // rocky peak (snow-dusted) to one side, firs and a chalet or two.
+  const knollZ = (idx % 2 === 0 ? 1 : -1) * 36;
+  const flagSpot = { x: -26, z: -knollZ * 0.3 };
+  const terrain = buildAlpineIsland(island, {
+    seed,
+    center: [2, 0],
+    radius: 72,
+    hilliness: 3,
+    snowLine: 11,
+    pads: [{ x: 17, z: 0, hw: 25, hl: 41 }],
+    peaks: [
+      { x: -36, z: 0, h: 4.6, r: 20, flat: 5, crag: 0.15 },
+      { x: -34, z: knollZ, h: 14, r: 24, crag: 0.5 },
+    ],
+    keepClear: [{ x: -36, z: 0, r: 8 }, { ...flagSpot, r: 3 }],
+    trees: 80,
+    chalets: 2,
+    rocks: 30,
+  });
 
-  // Grass cap strictly west of the runway (center x = -36, max radius ~22 ->
-  // eastern edge x <= -14, well clear of runway foundation left edge x = -6).
-  const grass = extrudeFlat(coastShape(19, 2.5, seed), 3, 3.1, grassMat);
-  grass.position.set(-36, 0, 0);
-  island.add(grass);
+  const flag = makeSwissFlag(4.5, 10);
+  flag.position.set(flagSpot.x, terrain.heightAt(flagSpot.x, flagSpot.z) - 0.3, flagSpot.z);
+  island.add(flag);
 
   // Mini control tower on the grass hillock.
   const towerMat = new THREE.MeshStandardMaterial({ color: 0x25333d, roughness: 0.6, metalness: 0.25 });
@@ -384,9 +348,10 @@ function buildSatelliteAirport(ap, idx) {
   }
 
   // Device name banner (green-cyan when online, muted red when offline).
-  const tint = ap.online ? 0x6ef3c5 : 0xd97373;
   const suffix = ap.online ? '' : ' (OFF)';
-  const label = makeBannerLabel(`${ap.name.toUpperCase()}${suffix}`, tint);
+  const label = makeBannerLabel(
+    `${ap.name.toUpperCase()}${suffix}`, 0xffffff, ap.online ? SWISS_RED : 0x5d6166,
+  );
   label.position.set(0, 38, 0);
   label.scale.set(44, 11, 1);
   island.add(label);
@@ -418,46 +383,95 @@ function ensureAirports(airports) {
 /* ------------------------------------------------------------- sectors */
 
 const TOPIC_COLORS = {
-  Deploy: 0x35c4d6,
-  Refactor: 0x7fd635,
-  Monitor: 0xb07fd6,
+  Build: 0x35c4d6,
+  Homelab: 0xf59e0b,
+  'AI & Models': 0xa855f7,
+  Research: 0x34d399,
 };
-let sectorsBuilt = false;
+const PROJECT_PALETTE = [0x60a5fa, 0xf472b6, 0x38bdf8, 0xa3e635, 0xfbbf24];
+const sectorMeshes = new Map(); // sector.name -> { group, key }
 
 function topicColor(name) {
-  return TOPIC_COLORS[name] || 0x88aacc;
+  if (TOPIC_COLORS[name]) return TOPIC_COLORS[name];
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
+  return PROJECT_PALETTE[hash % PROJECT_PALETTE.length];
+}
+
+function buildSectorGroup(s) {
+  const group = new THREE.Group();
+  const color = topicColor(s.name);
+  const isProject = s.kind === 'project';
+
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(s.radius - 1.5, s.radius, 56),
+    new THREE.MeshBasicMaterial({
+      color, transparent: true, opacity: isProject ? 0.55 : 0.35, side: THREE.DoubleSide,
+    }),
+  );
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.set(s.center[0], 0.72, s.center[1]);
+  group.add(ring);
+
+  // Project zones get an inner accent ring so they stand out from base domains.
+  if (isProject) {
+    const inner = new THREE.Mesh(
+      new THREE.RingGeometry(s.radius - 5.5, s.radius - 4.4, 56),
+      new THREE.MeshBasicMaterial({
+        color, transparent: true, opacity: 0.32, side: THREE.DoubleSide,
+      }),
+    );
+    inner.rotation.x = -Math.PI / 2;
+    inner.position.set(s.center[0], 0.71, s.center[1]);
+    group.add(inner);
+  }
+
+  const fill = new THREE.Mesh(
+    new THREE.CircleGeometry(s.radius, 56),
+    new THREE.MeshBasicMaterial({
+      color, transparent: true, opacity: isProject ? 0.08 : 0.05, side: THREE.DoubleSide,
+    }),
+  );
+  fill.rotation.x = -Math.PI / 2;
+  fill.position.set(s.center[0], 0.6, s.center[1]);
+  group.add(fill);
+
+  const tag = isProject ? `PROJECT · ${s.name.toUpperCase()}` : s.name.toUpperCase();
+  const label = makeBannerLabel(tag, color);
+  label.position.set(s.center[0], 20, s.center[1]);
+  label.scale.set(isProject ? 44 : 38, isProject ? 8.5 : 8.5, 1);
+  group.add(label);
+
+  scene.add(group);
+  return group;
+}
+
+function disposeSectorGroup(group) {
+  scene.remove(group);
+  group.traverse((o) => {
+    if (o.geometry) o.geometry.dispose();
+    if (o.material) {
+      if (o.material.map) o.material.map.dispose();
+      o.material.dispose();
+    }
+  });
 }
 
 function ensureSectors(sectors) {
-  if (sectorsBuilt || sectors.length === 0) return;
-  sectorsBuilt = true;
+  const seen = new Set();
   for (const s of sectors) {
-    const color = topicColor(s.name);
-
-    const ring = new THREE.Mesh(
-      new THREE.RingGeometry(s.radius - 1.4, s.radius, 48),
-      new THREE.MeshBasicMaterial({
-        color, transparent: true, opacity: 0.35, side: THREE.DoubleSide,
-      }),
-    );
-    ring.rotation.x = -Math.PI / 2;
-    ring.position.set(s.center[0], 0.7, s.center[1]);
-    scene.add(ring);
-
-    const fill = new THREE.Mesh(
-      new THREE.CircleGeometry(s.radius, 48),
-      new THREE.MeshBasicMaterial({
-        color, transparent: true, opacity: 0.05, side: THREE.DoubleSide,
-      }),
-    );
-    fill.rotation.x = -Math.PI / 2;
-    fill.position.set(s.center[0], 0.6, s.center[1]);
-    scene.add(fill);
-
-    const label = makeBannerLabel(s.name.toUpperCase(), color);
-    label.position.set(s.center[0], 20, s.center[1]);
-    label.scale.set(36, 9, 1);
-    scene.add(label);
+    seen.add(s.name);
+    const key = `${s.center[0]},${s.center[1]},${s.radius},${s.kind || ''}`;
+    const existing = sectorMeshes.get(s.name);
+    if (existing && existing.key === key) continue;
+    if (existing) disposeSectorGroup(existing.group);
+    sectorMeshes.set(s.name, { group: buildSectorGroup(s), key });
+  }
+  for (const [name, entry] of [...sectorMeshes.entries()]) {
+    if (!seen.has(name)) {
+      disposeSectorGroup(entry.group);
+      sectorMeshes.delete(name);
+    }
   }
 }
 
@@ -938,15 +952,18 @@ function makeDroneMesh() {
 
 /* --------------------------------------------------------------- labels */
 
-// Clean banner sprite for airport and sector names.
-function makeBannerLabel(text, tint = 0xe8ffff) {
+// Clean banner sprite for airport and sector names. Airports pass a solid
+// `fill` (Swiss red); sectors keep the translucent charcoal plate.
+function makeBannerLabel(text, tint = 0xe8ffff, fill = null) {
   const c = document.createElement('canvas');
   c.width = 384;
   c.height = 72;
   const ctx = c.getContext('2d');
-  ctx.fillStyle = 'rgba(4, 18, 28, 0.68)';
+  ctx.fillStyle = fill === null
+    ? 'rgba(20, 22, 24, 0.66)'
+    : '#' + new THREE.Color(fill).getHexString();
   ctx.fillRect(0, 0, c.width, c.height);
-  ctx.font = 'bold 34px "IBM Plex Mono", monospace';
+  ctx.font = 'bold 34px "Helvetica Neue", Helvetica, Arial, sans-serif';
   ctx.fillStyle = '#' + new THREE.Color(tint).getHexString();
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
@@ -1463,6 +1480,7 @@ function animate() {
   for (const radar of radars) {
     radar.rotation.y = now * 0.8;
   }
+  updateAlpine(now);
 
   for (const ap of airportGroups.values()) {
     const pulse = ap.online ? 0.85 + 0.3 * Math.sin(now * 3) : 0.7;

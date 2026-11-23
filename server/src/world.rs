@@ -142,8 +142,8 @@ fn default_speed() -> f32 {
     AGENT_SPEED
 }
 
-/// Sim area is 700x700; positions wrap around at the edges.
-const AREA_SIZE: f32 = 700.0;
+/// Sim area is 820x820; positions wrap around at the edges.
+const AREA_SIZE: f32 = 820.0;
 const TAKEOFF_RATE: f32 = 5.0; // m/s climb
 const CRUISE_ALTITUDE: f32 = 100.0;
 const AGENT_SPEED: f32 = 20.0; // m/s, local models
@@ -177,11 +177,11 @@ const HOLD_SHORT_TIME: f32 = 4.0; // s lined up before rolling
 
 /// Satellite device airport coordinates placed in open water clear of sectors.
 pub const SATELLITE_SLOTS: [[f32; 2]; 5] = [
-    [-235.0, -210.0], // NW
-    [235.0, -205.0],  // NE
-    [-10.0, 245.0],   // S
-    [-245.0, 240.0],  // SW
-    [245.0, 240.0],   // SE
+    [-280.0, -250.0], // NW
+    [280.0, -245.0],  // NE
+    [0.0, 285.0],     // S
+    [-285.0, 265.0],  // SW
+    [285.0, 265.0],   // SE
 ];
 
 /// Wrap a coordinate into [-AREA_SIZE/2, AREA_SIZE/2) so the world is
@@ -190,13 +190,22 @@ fn wrap_centered(v: f32) -> f32 {
     (v + AREA_SIZE / 2.0).rem_euclid(AREA_SIZE) - AREA_SIZE / 2.0
 }
 
-/// Topic sectors: (name, centre [x, z], radius). Client renders these from
-/// the snapshot; cruising aircraft patrol inside their sector.
-pub const SECTORS: &[(&str, [f32; 2], f32)] = &[
-    ("Deploy", [-230.0, 55.0], 100.0),
-    ("Refactor", [225.0, 95.0], 100.0),
-    ("Monitor", [15.0, -245.0], 100.0),
+/// Base domain sectors always present on the map: (name, centre [x, z], radius).
+pub const BASE_SECTORS: &[(&str, [f32; 2], f32)] = &[
+    ("Build", [-275.0, 20.0], 86.0),
+    ("Homelab", [0.0, -275.0], 86.0),
+    ("AI & Models", [285.0, 30.0], 86.0),
+    ("Research", [230.0, 245.0], 86.0),
 ];
+
+/// Open-water slots for dynamic named T3 project zones (radius 74).
+pub const PROJECT_SECTOR_SLOTS: [[f32; 2]; 4] = [
+    [-225.0, 245.0],  // SW open pocket
+    [-145.0, -165.0], // inner NW pocket
+    [155.0, -165.0],  // inner NE pocket
+    [-145.0, 165.0],  // inner SW pocket
+];
+pub const PROJECT_SECTOR_RADIUS: f32 = 74.0;
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -336,7 +345,13 @@ impl Aircraft {
     }
 
     /// Advance the simulation by `dt` seconds (for non-wingman aircraft).
+    #[cfg(test)]
     pub fn tick(&mut self, dt: f32) {
+        self.tick_with_sectors(dt, &default_sectors());
+    }
+
+    /// Advance the simulation by `dt` seconds using the current world sectors.
+    pub fn tick_with_sectors(&mut self, dt: f32, sectors: &[Sector]) {
         match self.state {
             State::Holding => {
                 if self.orbit_center.is_none() {
@@ -369,14 +384,12 @@ impl Aircraft {
                 self.position[2] = target_alt;
 
                 if let Some(topic) = &self.topic {
-                    if let Some((_, centre, radius)) =
-                        SECTORS.iter().find(|(name, _, _)| name == topic)
-                    {
-                        let r = (self.id as f32 * 23.7 % 24.0) + radius * 0.48;
+                    if let Some(sec) = sectors.iter().find(|s| s.name == *topic) {
+                        let r = (self.id as f32 * 21.3 % 20.0) + sec.radius * 0.46;
                         let omega = self.speed / r;
                         self.patrol_angle += omega * dt;
-                        let nx = centre[0] + self.patrol_angle.cos() * r;
-                        let ny = centre[1] + self.patrol_angle.sin() * r;
+                        let nx = sec.center[0] + self.patrol_angle.cos() * r;
+                        let ny = sec.center[1] + self.patrol_angle.sin() * r;
                         self.heading = self.patrol_angle + std::f32::consts::FRAC_PI_2;
                         self.position[0] = wrap_centered(nx);
                         self.position[1] = wrap_centered(ny);
@@ -500,18 +513,34 @@ pub struct WorldSnapshot {
     pub airports: Vec<Airport>,
 }
 
-/// A topic sector, serialised for the client to render.
+/// A topic or project airspace sector, serialised for the client to render.
 #[derive(Clone, Debug, Serialize)]
 pub struct Sector {
     pub name: String,
     pub center: [f32; 2],
     pub radius: f32,
+    /// `"domain"` for the 4 fixed life/work zones, `"project"` for dynamic T3 projects.
+    pub kind: String,
+}
+
+/// Build the 4 default domain sectors.
+pub fn default_sectors() -> Vec<Sector> {
+    BASE_SECTORS
+        .iter()
+        .map(|(name, centre, radius)| Sector {
+            name: (*name).to_string(),
+            center: *centre,
+            radius: *radius,
+            kind: "domain".to_string(),
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
 pub struct World {
     pub aircraft: Vec<Aircraft>,
     pub airports: Vec<Airport>,
+    pub sectors: Vec<Sector>,
 }
 
 impl Default for World {
@@ -519,6 +548,7 @@ impl Default for World {
         Self {
             aircraft: Vec::new(),
             airports: vec![Airport::home("local", "Tower")],
+            sectors: default_sectors(),
         }
     }
 }
@@ -579,9 +609,10 @@ impl World {
     /// landed aircraft claim an unoccupied gate before taxiing, and fighter
     /// wingmen smoothly track their parent's wing formation.
     pub fn tick(&mut self, dt: f32) {
+        let sectors = self.sectors.clone();
         for a in &mut self.aircraft {
             if a.parent_id.is_none() {
-                a.tick(dt);
+                a.tick_with_sectors(dt, &sectors);
             }
         }
 
@@ -618,7 +649,7 @@ impl World {
             let Some(pid) = a.parent_id else { continue };
             let Some(&(p_pos, p_heading, p_state)) = parents.get(&pid) else {
                 // Parent vanished: cruise independently until reconciled.
-                a.tick(dt);
+                a.tick_with_sectors(dt, &sectors);
                 continue;
             };
             let on_ground = matches!(
@@ -667,14 +698,7 @@ impl World {
     pub fn snapshot(&self) -> WorldSnapshot {
         WorldSnapshot {
             aircraft: self.aircraft.clone(),
-            sectors: SECTORS
-                .iter()
-                .map(|(name, centre, radius)| Sector {
-                    name: name.to_string(),
-                    center: *centre,
-                    radius: *radius,
-                })
-                .collect(),
+            sectors: self.sectors.clone(),
             airports: self.airports.clone(),
         }
     }

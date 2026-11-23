@@ -8,17 +8,18 @@
 use std::time::Duration;
 
 use crate::world::{
-    formation_position, Aircraft, Airport, Kind, ModelClass, State, World, GATE_HEADING,
-    HOME_GATES, RUNWAY_MID, SATELLITE_SLOTS,
+    default_sectors, formation_position, Aircraft, Airport, Kind, ModelClass, Sector, State, World,
+    GATE_HEADING, HOME_GATES, PROJECT_SECTOR_RADIUS, PROJECT_SECTOR_SLOTS, RUNWAY_MID,
+    SATELLITE_SLOTS,
 };
 
 /// Starting `[x, z, alt]` positions for the 5 primary demo aircraft.
 const POSITIONS: [[f32; 3]; 5] = [
-    [-230.0, 55.0, 100.0],
-    [225.0, 95.0, 100.0],
+    [-225.0, 245.0, 100.0],
+    [285.0, 30.0, 100.0],
     [RUNWAY_MID[0], RUNWAY_MID[1], 0.0],
-    [15.0, -245.0, 65.0],
-    [95.0, -225.0, 65.0],
+    [0.0, -275.0, 65.0],
+    [60.0, -255.0, 65.0],
 ];
 
 const HEADINGS: [f32; 5] = [0.8, 2.4, 0.0, 3.9, 5.5];
@@ -33,12 +34,21 @@ pub fn seed(world: &mut World) {
         Airport::satellite("devbox", "devbox", SATELLITE_SLOTS[2], false),
     ];
 
+    let mut sectors = default_sectors();
+    sectors.push(Sector {
+        name: "Skywatch".to_string(),
+        center: PROJECT_SECTOR_SLOTS[0],
+        radius: PROJECT_SECTOR_RADIUS,
+        kind: "project".to_string(),
+    });
+    world.sectors = sectors;
+
     let callsigns = [
-        ("SKY1", Kind::Agent, ModelClass::Frontier, "Deploy"),
-        ("SKY2", Kind::Agent, ModelClass::Local, "Refactor"),
-        ("SKY3", Kind::Agent, ModelClass::Local, "Refactor"),
-        ("REAP1", Kind::Drone, ModelClass::Local, "Monitor"),
-        ("REAP2", Kind::Drone, ModelClass::Local, "Monitor"),
+        ("SKY1", Kind::Agent, ModelClass::Frontier, "Skywatch"),
+        ("SKY2", Kind::Agent, ModelClass::Local, "AI & Models"),
+        ("SKY3", Kind::Agent, ModelClass::Local, "Build"),
+        ("REAP1", Kind::Drone, ModelClass::Local, "Homelab"),
+        ("REAP2", Kind::Drone, ModelClass::Local, "Homelab"),
     ];
 
     let mut sky1_info = None;
