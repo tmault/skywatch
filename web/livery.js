@@ -157,7 +157,7 @@ function cachedTexture(key, draw, w, h) {
 
 // Layout of a fuselage, all in world units of the airframe:
 //   zmin/zmax  extent along the body, circ: circumference at the widest point
-//   windows:   { kind: 'row' | 'cabin', a, z0, z1, ... } (a = radians from top)
+//   windows:   { kind: 'row' | 'highwing', ... } (a = radians from top)
 //   cockpit:   { z0, z1, a } windscreen centred on the top
 //   titles:    { a, z, size }, nose: { a, z, size } for the variant name
 //   stripeA:   cheatline angle from top; bellyA: where the belly colour starts
@@ -226,13 +226,39 @@ export function fuselageTexture(livery, airframe, L) {
           ctx.fill();
         }
       }
-    } else if (wnd?.kind === 'cabin') {
-      for (const side of [1, -1]) {
-        const xa = X(side * (wnd.a - wnd.span / 2));
-        const xb = X(side * (wnd.a + wnd.span / 2));
-        roundRect(ctx, Math.min(xa, xb), Y(wnd.z1), Math.abs(xb - xa), wnd.z1 - wnd.z0, 0.12);
+    } else if (wnd?.kind === 'highwing') {
+      // Light high-wing cabin: windscreen wrapping round to a raked
+      // A-pillar, door window, tapering rear side window and a skylight
+      // behind the wing. Points are [angle from top, z].
+      const poly = (pts) => {
+        ctx.beginPath();
+        pts.forEach(([a, z]) => ctx.lineTo(X(a), Y(z)));
+        ctx.closePath();
         ctx.fill();
+        ctx.stroke(); // rounds the corners a touch
+      };
+      ctx.strokeStyle = ctx.fillStyle;
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = wnd.post * 0.6;
+      const { top, sill, post, front, pillarTop, pillarBottom, doorEnd, rearEnd, rearTaper } = wnd;
+      for (const s of [1, -1]) {
+        poly([[s * top, pillarTop - post], [s * top, doorEnd + post / 2],
+          [s * sill, doorEnd + post / 2], [s * sill, pillarBottom - post]]);
+        poly([[s * top, doorEnd - post / 2], [s * top, rearEnd],
+          [s * (sill - 0.08), rearEnd + rearTaper], [s * sill, doorEnd - post / 2]]);
       }
+      const wsA = top * 0.9;
+      poly([[-wsA, front], [wsA, front], [sill - 0.06, pillarBottom + post],
+        [top, pillarTop + post], [-top, pillarTop + post], [-(sill - 0.06), pillarBottom + post]]);
+      const [k0, k1, ka] = wnd.skylight;
+      poly([[-ka, k0], [ka, k0], [ka * 0.75, k1], [-ka * 0.75, k1]]);
+      // Windscreen centre strip.
+      ctx.strokeStyle = livery.body;
+      ctx.lineWidth = post * 0.7;
+      ctx.beginPath();
+      ctx.moveTo(X(0), Y(pillarTop + post));
+      ctx.lineTo(X(0), Y(front));
+      ctx.stroke();
     }
     if (L.cockpit) {
       const { z0, z1, a } = L.cockpit;
@@ -306,7 +332,54 @@ export function finTexture(livery) {
       ctx.fillStyle = g;
     }
     ctx.fillRect(0, 0, W, H);
+    // Rudder hinge (u is the chord fraction, see surfaceGeo).
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.05)';
+    ctx.fillRect(W * 0.7, 0, W * 0.3, H);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.28)';
+    ctx.fillRect(W * 0.7, 0, 1.5, H);
   }, 128, 256);
+}
+
+/* ------------------------------------------------ wing and tail skins */
+
+// Flying-surface skin over a base colour. u runs leading -> trailing edge
+// (chord fraction) and v root -> tip (canvas top is the tip). Wings get a
+// bare-metal leading edge, spoiler panels, flaps inboard and ailerons
+// outboard; tails get a single elevator hinge.
+export function surfaceTexture(livery, base, kind = 'wing') {
+  return cachedTexture(`surf|${kind}|${base}|${livery.key}`, (ctx, W, H) => {
+    const U = (u) => u * W;
+    const V = (v) => (1 - v) * H;
+    ctx.fillStyle = base;
+    ctx.fillRect(0, 0, W, H);
+    const line = 'rgba(0, 0, 0, 0.26)';
+    const hingeU = kind === 'wing' ? 0.74 : 0.7;
+
+    // Leading edge: brighter erosion strip.
+    ctx.fillStyle = 'rgba(200, 208, 216, 0.32)';
+    ctx.fillRect(0, 0, U(kind === 'wing' ? 0.08 : 0.06), H);
+
+    // Control surfaces, a shade darker behind the hinge line.
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.06)';
+    ctx.fillRect(U(hingeU), 0, W - U(hingeU), H);
+    ctx.fillStyle = line;
+    ctx.fillRect(U(hingeU), 0, 2, H);
+
+    if (kind === 'wing') {
+      // Flap / aileron splits.
+      for (const v of [0.08, 0.38, 0.66, 0.94]) ctx.fillRect(U(hingeU), V(v), W - U(hingeU), 2);
+      // Spoiler panels ahead of the flaps.
+      ctx.strokeStyle = 'rgba(0, 0, 0, 0.18)';
+      ctx.lineWidth = 1.5;
+      for (let i = 0; i < 5; i++) {
+        const v0 = 0.1 + i * 0.11;
+        ctx.strokeRect(U(0.6), V(v0 + 0.1), U(hingeU) - U(0.6), V(v0) - V(v0 + 0.1));
+      }
+      // Front spar / slat line.
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.12)';
+      ctx.fillRect(U(0.14), 0, 1.5, H);
+    }
+  }, 256, 256);
 }
 
 /* ------------------------------------------------------------- logos */
