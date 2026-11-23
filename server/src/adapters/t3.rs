@@ -454,10 +454,20 @@ fn apply_poll(
         };
         let cs = callsigns.get(thread_id);
         if let Some(a) = world.get_mut(&cs) {
-            if a.state != *state {
+            // If an aircraft is already on the ground for a blocked/failed run,
+            // let it finish taxiing off the runway to a gate instead of stomping
+            // its state back to Landed on every poll.
+            let target_state = if *state == State::Landed
+                && matches!(a.state, State::Landed | State::Taxi | State::Parked)
+            {
+                a.state
+            } else {
+                *state
+            };
+            if a.state != target_state {
                 radio_events.push((
                     cs.clone(),
-                    match state {
+                    match target_state {
                         State::Holding => "entering hold".to_string(),
                         State::Landed => "landing — blocked".to_string(),
                         State::Cruising => "cruising".to_string(),
@@ -465,7 +475,11 @@ fn apply_poll(
                     },
                 ));
             }
-            a.state = *state;
+            if target_state == State::Landed && a.state != State::Landed {
+                a.land();
+            } else {
+                a.state = target_state;
+            }
             a.hold_reason = reason.clone();
             a.title = title.clone();
             a.device = Some(home_name.to_string());
@@ -480,6 +494,9 @@ fn apply_poll(
             a.state = *state;
             if a.state == State::Landed {
                 a.land();
+                // Stagger initial runway position slightly if multiple threads start landed.
+                let offset = (callsigns.next as f32 % 4.0) * 14.0 - 14.0;
+                a.position[1] = (a.position[1] + offset).clamp(-45.0, 28.0);
             }
             let names = ["Deploy", "Refactor", "Monitor"];
             a.assign(names[callsigns.next % names.len()]);
