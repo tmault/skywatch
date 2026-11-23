@@ -98,6 +98,7 @@ function render(a) {
     if (name) parts.push(name.toUpperCase());
   }
   if (a.device) parts.push(a.device.toUpperCase());
+  if (a.data_stale) parts.push("OFFLINE · LAST KNOWN STATE");
   if (a.topic) parts.push(a.topic.toUpperCase());
   kindEl.textContent = parts.join(' · ');
 

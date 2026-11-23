@@ -123,6 +123,12 @@ pub struct Aircraft {
     /// Owning device / airport name (e.g. "omarchy", "Tom's M5 Air").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub data_stale: bool,
     /// Parent aircraft id for escorting fighter wingmen (sub-agents).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<u64>,
@@ -477,6 +483,9 @@ impl Aircraft {
             topic: None,
             title: None,
             device: None,
+            environment_id: None,
+            thread_id: None,
+            data_stale: false,
             parent_id: None,
             wing_slot: None,
             provider: None,
@@ -1381,6 +1390,7 @@ pub struct WorldSnapshot {
     pub aircraft: Vec<Aircraft>,
     pub sectors: Vec<Sector>,
     pub airports: Vec<Airport>,
+    pub omitted_threads: usize,
 }
 
 /// A topic or project airspace sector, serialised for the client to render.
@@ -1410,6 +1420,7 @@ pub fn default_sectors() -> Vec<Sector> {
 pub struct World {
     pub aircraft: Vec<Aircraft>,
     pub airports: Vec<Airport>,
+    pub omitted_threads: usize,
     pub sectors: Vec<Sector>,
 }
 
@@ -1418,6 +1429,7 @@ impl Default for World {
         Self {
             aircraft: Vec::new(),
             airports: vec![Airport::home("local", "Tower")],
+            omitted_threads: 0,
             sectors: default_sectors(),
         }
     }
@@ -1962,6 +1974,7 @@ impl World {
             aircraft: self.aircraft.clone(),
             sectors: self.sectors.clone(),
             airports: self.airports.clone(),
+            omitted_threads: self.omitted_threads,
         }
     }
 }

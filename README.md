@@ -30,3 +30,17 @@ Open [http://localhost:8422](http://localhost:8422).
 cd server
 cargo test
 ```
+
+### Linked-device polling
+
+Skywatch uses a dedicated T3 MCP client to list linked devices across projects. With T3 running,
+run `python3 scripts/pair_t3.py` on the owning host. It uses T3's local scoped session and OAuth
+PKCE approval endpoints to create an approval-required client; it never starts a provider run.
+The credential is saved with mode 0600 at `~/.config/skywatch/t3-mcp-token`, outside the checkout.
+Re-run pairing when it expires or revoke the Skywatch client in T3 access settings.
+
+Override `SKYWATCH_T3_MCP_URL` and `SKYWATCH_T3_TOKEN_FILE` for containers. Mount only the
+Skywatch credential, rather than a whole provider home. Python 3 is required for the MCP transport.
+A failed device poll retains its last-known aircraft with an offline marker; absence from a page
+is not deletion. Confirmed settled threads depart normally. The status bar reports threads omitted
+by display capacity. Remote aircraft and actions carry both environment and thread identity.

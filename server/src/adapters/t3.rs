@@ -7,6 +7,7 @@
 //! sub-agents as delta-wing fighter jets on their parent's wing, and relays
 //! radio-panel messages back into the owning thread via `t3 thread send`.
 
+use super::remote;
 use crate::world::{
     default_sectors, formation_position, provider_info, Aircraft, Airport, Kind, ModelClass,
     Sector, State, World, GATE_HEADING, HOME_GATES, PROJECT_SECTOR_RADIUS, PROJECT_SECTOR_SLOTS,
@@ -51,7 +52,7 @@ where
     })
 }
 
-#[derive(Deserialize)]
+#[derive(serde::Serialize, Deserialize)]
 struct ThreadListEntry {
     #[serde(rename = "threadId", alias = "thread_id")]
     thread_id: String,
@@ -63,7 +64,7 @@ struct ThreadListEntry {
     model: Option<String>,
     #[serde(rename = "updatedAt", alias = "updated_at")]
     updated_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "pendingRequestCount")]
     pending: i64,
     #[serde(default)]
     settled: bool,
@@ -802,6 +803,7 @@ fn poll_done_or_archived_ids() -> Option<HashSet<String>> {
 /// All external data collected outside the world mutex so I/O never stalls the
 /// 20 Hz simulation tick or WebSocket connections.
 struct PollData {
+    omitted: usize,
     airports: Vec<Airport>,
     /// Actively working or token-waiting threads (flying, holding, or refueling).
     flying: Vec<(ThreadListEntry, i64)>,
@@ -816,38 +818,58 @@ struct PollData {
 }
 
 /// Fetch airports, threads, pending-request counts, and sub-agents off-lock.
-fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>) -> Option<PollData> {
-    let airports = discover_airports_fast(home_name, reachability);
-    let (entries, done_or_archived) = poll_threads()?;
+fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>, cache: &mut remote::Cache) -> Option<PollData> {
+    let mut airports = discover_airports_fast(home_name, reachability);
+    let local_poll = poll_threads();
+    if let Some(home) = airports.first_mut() { home.online = local_poll.is_some(); }
+    if let Some(ref result) = local_poll { cache.local = serde_json::to_value(result).ok(); }
+    let (mut entries, mut done_or_archived) = local_poll.or_else(|| cache.local.as_ref().and_then(|v| serde_json::from_value(v.clone()).ok())).unwrap_or_default();
+    let updates = remote::bridge(&serde_json::json!({"action":"poll"}))
+        .and_then(|v| serde_json::from_value::<Vec<remote::Peer>>(v).ok()).unwrap_or_default();
+    for peer in cache.merge(updates) {
+        if let Some(ap) = airports.iter_mut().find(|a| a.id == peer.environment_id) {
+            ap.online = peer.online;
+        }
+        for value in peer.threads.unwrap_or_default() {
+            if let Ok(mut entry) = serde_json::from_value::<ThreadListEntry>(value) {
+                entry.thread_id = remote::key(&peer.environment_id, &entry.thread_id);
+                if entry.settled || entry.settled_at.is_some() {
+                    done_or_archived.insert(entry.thread_id);
+                } else { entries.push(entry); }
+            }
+        }
+    }
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
+    let total_entries = entries.len();
     let mut flying = Vec::new();
-    let mut working_count = 0usize;
-    let mut refuel_count = 0usize;
+    let mut working_count = HashMap::<String, usize>::new();
+    let mut refuel_count = HashMap::<String, usize>::new();
     let mut taxiway = Vec::new();
     let mut stale = Vec::new();
     for e in entries {
+        let env = remote::owner(&e.thread_id).map(|o| o.0).unwrap_or_else(|| "local".into());
         if detect_token_wait(&e, now).is_some() {
-            if refuel_count < MAX_REFUELING {
+            if *refuel_count.entry(env.clone()).or_default() < MAX_REFUELING {
                 let pending = e.pending;
                 flying.push((e, pending));
-                refuel_count += 1;
+                *refuel_count.entry(env.clone()).or_default() += 1;
             }
         } else if is_working_status(&e.status) {
-            if working_count < MAX_AIRCRAFT {
+            if *working_count.entry(env.clone()).or_default() < MAX_AIRCRAFT {
                 let pending = e.pending;
                 flying.push((e, pending));
-                working_count += 1;
+                *working_count.entry(env.clone()).or_default() += 1;
             }
         } else if is_stale(&e.updated_at, now) {
-            if stale.len() < MAX_GATE_PARKED {
+            if stale.iter().filter(|e: &&ThreadListEntry| remote::owner(&e.thread_id).map(|o|o.0).unwrap_or_else(|| "local".into()) == env).count() < if env == "local" { MAX_GATE_PARKED } else { 4 } {
                 stale.push(e);
             }
-        } else if taxiway.len() < MAX_TAXIWAY_QUEUE {
+        } else if taxiway.iter().filter(|e: &&ThreadListEntry| remote::owner(&e.thread_id).map(|o|o.0).unwrap_or_else(|| "local".into()) == env).count() < if env == "local" { MAX_TAXIWAY_QUEUE } else { 4 } {
             taxiway.push(e);
         }
     }
@@ -856,6 +878,7 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>) -> Opt
     let subagents = poll_subagents(&flying_ids, now);
 
     Some(PollData {
+        omitted: total_entries.saturating_sub(flying.len() + taxiway.len() + stale.len()),
         airports,
         flying,
         taxiway,
@@ -864,6 +887,15 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>) -> Opt
         subagents,
         now,
     })
+}
+
+fn ground_slot(entries: &[ThreadListEntry], i: usize, airports: &[Airport], taxi: bool) -> ([f32;2], f32) {
+    let env = remote::owner(&entries[i].thread_id).map(|o| o.0);
+    let slot = entries[..i].iter().filter(|e| remote::owner(&e.thread_id).map(|o|o.0) == env).count();
+    if let Some(ap) = env.and_then(|id| airports.iter().find(|ap| ap.id == id)) {
+        return (ap.gates[slot % ap.gates.len()], GATE_HEADING);
+    }
+    if taxi { TAXIWAY_QUEUE[slot % TAXIWAY_QUEUE.len()] } else { (HOME_GATES[slot % HOME_GATES.len()], GATE_HEADING) }
 }
 
 struct KeepInfo {
@@ -888,6 +920,7 @@ fn apply_poll(
     wingmen: &mut Wingmen,
     runway: &mut RunwayOps,
 ) -> Vec<(String, String)> {
+    world.omitted_threads = data.omitted;
     world.airports = data.airports;
     let now = data.now;
 
@@ -1096,7 +1129,7 @@ fn apply_poll(
             a.state = info.state;
             let a_reason = a.hold_reason.clone();
             let a_reset = a.refuel_reset_at.clone();
-            if runway.primed && info.state != State::Refueling {
+            if runway.primed && info.state != State::Refueling && remote::owner(thread_id).is_none() {
                 // Brand-new thread: line up on Runway 36 and take off.
                 a.position = [RUNWAY_THRESHOLD[0], RUNWAY_THRESHOLD[1], 0.0];
                 a.altitude = 0.0;
@@ -1153,7 +1186,7 @@ fn apply_poll(
             }
             runway.arrivals.remove(&entry.thread_id);
         }
-        let (slot_pos, slot_hdg) = TAXIWAY_QUEUE[i % TAXIWAY_QUEUE.len()];
+        let (slot_pos, slot_hdg) = ground_slot(&data.taxiway, i, &world.airports, true);
         let (_, reason) = flight_state(&entry.status, entry.pending);
         let (zone, _) = classify_zone(entry.project.as_deref(), &entry.title);
         if let Some(a) = world.get_mut(&cs) {
@@ -1228,7 +1261,7 @@ fn apply_poll(
 
     for (i, entry) in data.stale.iter().enumerate() {
         let cs = gates.get(&entry.thread_id);
-        let slot = HOME_GATES[i % HOME_GATES.len()];
+        let (slot, _) = ground_slot(&data.stale, i, &world.airports, false);
         if let Some(a) = world.get_mut(&cs) {
             a.title = Some(entry.title.clone());
             a.state = State::Parked;
@@ -1328,6 +1361,18 @@ fn apply_poll(
         }
     }
 
+    // Ownership is independent of callsign changes during landing/taxi handoff.
+    for (key, cs) in callsigns.by_thread.iter().chain(taxiway_cs.by_thread.iter()).chain(gates.by_thread.iter()).chain(runway.arrivals.iter()) {
+        if let Some(a) = world.get_mut(cs) {
+            let (environment, thread) = remote::owner(key).unwrap_or_else(|| ("local".into(), key.clone()));
+            a.environment_id = Some(environment.clone());
+            a.thread_id = Some(thread);
+            if let Some(ap) = world.airports.iter().find(|ap| ap.id == environment).cloned() {
+                if let Some(a) = world.get_mut(cs) { a.device = Some(ap.name); a.data_stale = !ap.online; }
+            }
+        }
+    }
+
     // Reconcile provider aerial refuelling tankers for any waiting threads.
     if !runway.primed {
         world.snap_refueling_to_tankers();
@@ -1379,10 +1424,15 @@ pub async fn run(world: SharedWorld, mut rx: mpsc::Receiver<ClientFrame>) {
         let home_clone = home_name.clone();
         let reach = std::sync::Arc::clone(&reachability);
         tokio::spawn(async move {
+            let mut cache = remote::Cache::default();
             loop {
                 let hn = home_clone.clone();
                 let snap_reach = reach.read().map(|g| g.clone()).unwrap_or_default();
-                let res = tokio::task::spawn_blocking(move || fetch_poll_data(&hn, &snap_reach)).await;
+                let res = tokio::task::spawn_blocking(move || {
+                    let data = fetch_poll_data(&hn, &snap_reach, &mut cache);
+                    (data, cache)
+                }).await;
+                let res = match res { Ok((data, next_cache)) => { cache = next_cache; Ok(data) }, Err(e) => { cache = remote::Cache::default(); Err(e) } };
                 if let Ok(Some(data)) = res {
                     if poll_tx.send(data).await.is_err() {
                         break;
@@ -1470,7 +1520,10 @@ pub async fn run(world: SharedWorld, mut rx: mpsc::Receiver<ClientFrame>) {
                 };
                 tracing::info!(callsign, thread_id, "relaying message to t3 thread");
                 tokio::task::spawn_blocking(move || {
-                    if let Some(out) = run_t3(&["thread", "send", &thread_id, &text]) {
+                    let response = if let Some((environment, thread)) = remote::owner(&thread_id) {
+                        remote::bridge(&serde_json::json!({"action":"send", "arguments": {"environmentId":environment,"threadId":thread,"message":text}})).map(|v| v.to_string())
+                    } else { run_t3(&["thread", "send", &thread_id, &text]) };
+                    if let Some(out) = response {
                         tracing::debug!(thread_id, "t3 send ok: {out}");
                     } else {
                         tracing::error!(thread_id, "t3 thread send failed");
@@ -1485,6 +1538,25 @@ pub async fn run(world: SharedWorld, mut rx: mpsc::Receiver<ClientFrame>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_thread_ids_do_not_alias_local_ids_and_keep_device_ownership() {
+        let mut world = World::new();
+        let mut sky = Callsigns::default(); let mut taxi = TaxiwayCallsigns::default();
+        let mut gates = GateCallsigns::default(); let mut wing = Wingmen::default(); let mut runway = RunwayOps::default();
+        let poll = PollData { omitted: 3,
+            airports: vec![Airport::home("local", "PC"), Airport::satellite("mac", "Mac", [400.0,0.0], false)],
+            flying: vec![(make_entry("same", "Local", "running"),0), (make_entry(&remote::key("mac","same"), "Remote", "running"),0)],
+            taxiway: vec![], stale: vec![], done_or_archived: HashSet::new(), subagents: vec![], now: 1700000000 };
+        apply_poll(&mut world, "PC", poll, &mut sky, &mut taxi, &mut gates, &mut wing, &mut runway);
+        let local = world.iter().find(|a| a.title.as_deref()==Some("Local")).unwrap();
+        let remote = world.iter().find(|a| a.title.as_deref()==Some("Remote")).unwrap();
+        assert_ne!(local.id, remote.id);
+        assert_eq!(remote.environment_id.as_deref(),Some("mac"));
+        assert_eq!(remote.thread_id.as_deref(),Some("same"));
+        assert_eq!(remote.device.as_deref(),Some("Mac")); assert!(remote.data_stale);
+        assert_eq!(world.snapshot().omitted_threads,3);
+    }
 
     #[test]
     fn parses_rfc3339_to_unix_secs() {
@@ -1599,6 +1671,7 @@ mod tests {
 
         // Poll 1: one flying (with a wingman), one on taxiway, one parked at a gate.
         let poll1 = PollData {
+            omitted: 0,
             airports: vec![Airport::home("local", "omarchy")],
             flying: vec![(make_entry("t-fly", "Active Flight", "running"), 0)],
             taxiway: vec![make_entry("t-taxi", "Waiting Thread", "idle")],
@@ -1633,6 +1706,7 @@ mod tests {
         done.insert("t-taxi".to_string());
         done.insert("t-gate".to_string());
         let poll2 = PollData {
+            omitted: 0,
             airports: vec![Airport::home("local", "omarchy")],
             flying: vec![],
             taxiway: vec![],
@@ -1685,6 +1759,7 @@ mod tests {
         let mut runway = RunwayOps::default();
 
         let poll1 = PollData {
+            omitted: 0,
             airports: vec![Airport::home("local", "omarchy")],
             flying: vec![(make_entry("t-1", "Busy Thread", "running"), 0)],
             taxiway: vec![],
@@ -1707,6 +1782,7 @@ mod tests {
 
         // Thread finishes its turn and moves to taxiway (not marked done/archived).
         let poll2 = PollData {
+            omitted: 0,
             airports: vec![Airport::home("local", "omarchy")],
             flying: vec![],
             taxiway: vec![make_entry("t-1", "Busy Thread", "completed")],
@@ -1731,6 +1807,7 @@ mod tests {
         assert!(world.get_mut("TX1").is_none(), "TX appears only once it has landed");
 
         let taxi_poll = || PollData {
+            omitted: 0,
             airports: vec![Airport::home("local", "omarchy")],
             flying: vec![],
             taxiway: vec![make_entry("t-1", "Busy Thread", "completed")],
@@ -1776,6 +1853,7 @@ mod tests {
         let mut runway = RunwayOps::default();
 
         let poll = |flying: bool| PollData {
+            omitted: 0,
             airports: vec![Airport::home("local", "omarchy")],
             flying: if flying {
                 vec![(make_entry("t-1", "Thread", "running"), 0)]
@@ -1827,6 +1905,7 @@ mod tests {
         let mut wingmen = Wingmen::default();
         let mut runway = RunwayOps::default();
         let poll = |ids: &[&str]| PollData {
+            omitted: 0,
             airports: vec![Airport::home("local", "omarchy")],
             flying: ids.iter().map(|id| (make_entry(id, "Thread", "running"), 0)).collect(),
             taxiway: vec![],
@@ -1878,6 +1957,7 @@ mod tests {
         assert!(detect_token_wait(&completed, now).is_none());
 
         let poll1 = PollData {
+            omitted: 0,
             airports: vec![Airport::home("local", "omarchy")],
             flying: vec![(limited, 0)],
             taxiway: vec![completed],
@@ -1908,6 +1988,7 @@ mod tests {
         // Thread resumes running -> disconnects from tanker and tanker disappears!
         let resumed = make_entry("t-claude", "Refuel Me", "running");
         let poll2 = PollData {
+            omitted: 0,
             airports: vec![Airport::home("local", "omarchy")],
             flying: vec![(resumed, 0)],
             taxiway: vec![],

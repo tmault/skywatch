@@ -1682,6 +1682,8 @@ function applySnapshot(snapshot) {
     ? `${airportCount} airports · airspace empty`
     : `${airportCount} airports · ${aircraft.length} aircraft`;
 
+  if (snapshot.omitted_threads) countEl.textContent += ` · ${snapshot.omitted_threads} threads outside display capacity`;
+
   const selectedId = selectedAircraftId();
   if (selectedId !== null) {
     const selected = aircraft.find((a) => a.id === selectedId);
