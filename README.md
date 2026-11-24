@@ -189,6 +189,8 @@ Overrides: `T3_USERDATA` (default `~/.t3/userdata`), `SKYWATCH_T3_TOKEN_PATH` (d
 
 If the paired token expires, re-run `python3 scripts/pair_t3.py` and restart the container.
 
+For a homelab host that publishes Skywatch through DockTail on a tailnet, see [docs/tower-deployment.md](docs/tower-deployment.md).
+
 ### Update & Rollback
 
 ```bash
