@@ -334,14 +334,25 @@ export function fuselageTexture(livery, airframe, L) {
     }
 
     // Windows (supports a single window layout or an array of rows, e.g. 747 upper + main decks).
-    ctx.fillStyle = '#1b2a3a';
     const windowSets = Array.isArray(L.windows) ? L.windows : (L.windows ? [L.windows] : []);
     for (const wnd of windowSets) {
       if (wnd?.kind === 'row') {
+        const skipZs = wnd.skipZs ?? [];
+        const skipMargin = wnd.skipMargin ?? (wnd.w * 2.1);
         for (const side of [1, -1]) {
           const xc = X(side * wnd.a);
           for (let z = wnd.z1; z >= wnd.z0; z -= wnd.pitch) {
-            roundRect(ctx, xc - wnd.h / 2, Y(z) - wnd.w / 2, wnd.h, wnd.w, Math.min(wnd.h, wnd.w) * 0.45);
+            if (skipZs.some((sz) => Math.abs(z - sz) < skipMargin)) continue;
+            const rx = xc - wnd.h / 2;
+            const ry = Y(z) - wnd.w / 2;
+            const rr = Math.min(wnd.h, wnd.w) * 0.45;
+            ctx.fillStyle = '#111a24';
+            roundRect(ctx, rx, ry, wnd.h, wnd.w, rr);
+            ctx.fill();
+            // Subtle upper-pane sky sheen so cabin windows read as dark tinted glass.
+            ctx.fillStyle = 'rgba(130, 165, 198, 0.22)';
+            const sheenX = side > 0 ? rx + wnd.h * 0.52 : rx + wnd.h * 0.14;
+            roundRect(ctx, sheenX, ry + wnd.w * 0.14, wnd.h * 0.34, wnd.w * 0.72, rr * 0.4);
             ctx.fill();
           }
         }
@@ -349,6 +360,7 @@ export function fuselageTexture(livery, airframe, L) {
         // Light high-wing cabin: windscreen wrapping round to a raked
         // A-pillar, door window, tapering rear side window and a skylight
         // behind the wing. Points are [angle from top, z].
+        ctx.fillStyle = '#121b26';
         const poly = (pts) => {
           ctx.beginPath();
           pts.forEach(([a, z]) => ctx.lineTo(X(a), Y(z)));
@@ -358,7 +370,7 @@ export function fuselageTexture(livery, airframe, L) {
         };
         ctx.strokeStyle = ctx.fillStyle;
         ctx.lineJoin = 'round';
-        ctx.lineWidth = wnd.post * 0.6;
+        ctx.lineWidth = wnd.post * 0.4;
         const { top, sill, post, front, pillarTop, pillarBottom, doorEnd, rearEnd, rearTaper } = wnd;
         for (const s of [1, -1]) {
           poly([[s * top, pillarTop - post], [s * top, doorEnd + post / 2],
@@ -373,7 +385,7 @@ export function fuselageTexture(livery, airframe, L) {
         poly([[-ka, k0], [ka, k0], [ka * 0.75, k1], [-ka * 0.75, k1]]);
         // Windscreen centre strip.
         ctx.strokeStyle = bodyColor;
-        ctx.lineWidth = post * 0.7;
+        ctx.lineWidth = post * 0.5;
         ctx.beginPath();
         ctx.moveTo(X(0), Y(pillarTop + post));
         ctx.lineTo(X(0), Y(front));
@@ -382,6 +394,7 @@ export function fuselageTexture(livery, airframe, L) {
     }
     if (L.cockpit) {
       const { z0, z1, a, frames = [-0.33, 0, 0.33], frameColor = bodyColor } = L.cockpit;
+      ctx.fillStyle = '#111a24';
       ctx.beginPath();
       ctx.moveTo(X(a), Y(z0));
       ctx.lineTo(X(a * 0.8), Y(z1));
@@ -391,7 +404,7 @@ export function fuselageTexture(livery, airframe, L) {
       ctx.fill();
       // Window frames.
       ctx.strokeStyle = frameColor;
-      ctx.lineWidth = 0.055;
+      ctx.lineWidth = 0.032;
       for (const f of frames) {
         ctx.beginPath();
         ctx.moveTo(X(a * f * 1.5), Y(z0));

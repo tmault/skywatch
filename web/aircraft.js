@@ -14,9 +14,26 @@ import {
 
 /* --------------------------------------------------------------- helpers */
 
+// Binary-search linear interpolation along a monotonic Z sample array.
+function sampleAtZ(pts, z, getZ, getV) {
+  if (z <= getZ(pts[0])) return getV(pts[0]);
+  if (z >= getZ(pts[pts.length - 1])) return getV(pts[pts.length - 1]);
+  let lo = 0;
+  let hi = pts.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (getZ(pts[mid]) <= z) lo = mid; else hi = mid;
+  }
+  const z0 = getZ(pts[lo]);
+  const z1 = getZ(pts[hi]);
+  const f = z1 > z0 ? (z - z0) / (z1 - z0) : 0;
+  return getV(pts[lo]) + (getV(pts[hi]) - getV(pts[lo])) * f;
+}
+
 // Body of revolution along Z. `profile` is [[z, radius], ...] from tail to nose.
 // `sx`/`sy` squash the cross-section; `warp(z)` returns a vertical offset so
-// tails can sweep up and noses can droop. Also returns the paint layout basics.
+// tails can sweep up and noses can droop. Also returns the paint layout basics
+// and a `pointAt(z, phi)` surface sampler for fitted 3D cockpit glazing.
 function fuselage(profile, { sx = 1, sy = 1, warp = null, segments = 28, smooth = true } = {}) {
   let pts = profile.map(([z, r]) => new THREE.Vector3(r, z, 0));
   if (smooth) {
@@ -38,7 +55,13 @@ function fuselage(profile, { sx = 1, sy = 1, warp = null, segments = 28, smooth 
   }
   geo.computeVertexNormals();
   const rmax = Math.max(...profile.map(([, r]) => r));
-  return { geo, zmin, zmax, circ: 2 * Math.PI * rmax * (sx + sy) / 2 };
+  // phi = 0 is belly, PI/2 is +X port side, PI is top spine.
+  const pointAt = (z, phi) => {
+    const r = Math.max(sampleAtZ(pts, z, (p) => p.y, (p) => p.x), 0.0001);
+    const wy = warp ? warp(z) : 0;
+    return [Math.sin(phi) * r * sx, -Math.cos(phi) * r * sy + wy, z];
+  };
+  return { geo, zmin, zmax, circ: 2 * Math.PI * rmax * (sx + sy) / 2, pointAt };
 }
 
 // Body with superellipse cross-sections, for airframes that are boxier than
@@ -59,12 +82,14 @@ function loftBody(stations, { power = 2.5, segments = 36, samples = 8 } = {}) {
   const uv = [];
   const idx = [];
   const rings = [];
+  const secSamples = [];
   for (let i = 0; i <= n; i++) {
     const u = upper.getPoint(i / n);
     const l = lower.getPoint(i / n);
     const w = Math.max(u.y, 0.001);
     const yc = (u.z + l.y) / 2;
     const h = Math.max((u.z - l.y) / 2, 0.001);
+    secSamples.push({ z: u.x, w, yc, h });
     const ring = [];
     for (let j = 0; j <= S; j++) {
       // phi = 0 is the belly, PI the spine, PI/2 the +X side (as LatheGeometry).
@@ -105,7 +130,260 @@ function loftBody(stations, { power = 2.5, segments = 36, samples = 8 } = {}) {
   geo.setIndex(idx);
   geo.computeVertexNormals();
   const widest = stations.reduce((m, [, w, t, b]) => Math.max(m, Math.hypot(w, (t - b) / 2)), 0);
-  return { geo, zmin, zmax, circ: 2 * Math.PI * widest / Math.SQRT2 };
+  const pointAt = (z, phi) => {
+    const w = sampleAtZ(secSamples, z, (s) => s.z, (s) => s.w);
+    const yc = sampleAtZ(secSamples, z, (s) => s.z, (s) => s.yc);
+    const h = sampleAtZ(secSamples, z, (s) => s.z, (s) => s.h);
+    const sn = Math.sin(phi);
+    const cs = Math.cos(phi);
+    return [w * Math.sign(sn) * Math.abs(sn) ** e, yc - h * Math.sign(cs) * Math.abs(cs) ** e, z];
+  };
+  return { geo, zmin, zmax, circ: 2 * Math.PI * widest / Math.SQRT2, pointAt };
+}
+
+// Multi-pane 3D cockpit glazing fitted directly to a fuselage's `pointAt(z, phi)`.
+// Each pane is specified on the port (+X) side as `knots: [[s, yBot, yTop], ...]`
+// where `y` is exact vertical height in model coordinates (so window sills stay
+// crisp and horizontal instead of curving around the nose) and `s` is 3D arc
+// length measured along the constant-y surface contour starting from the front
+// centreline (s = 0). Leaving small gaps between adjacent panes lets the actual
+// fuselage paint show through as razor-thin body-coloured frames, with distinct
+// semi-flat glass reflections per pane and zero Z-fighting.
+function cockpitGlazingMesh(body, mat, panes, {
+  zSearchStart = body.zmax - 0.02,
+  zSearchEnd = body.zmin + (body.zmax - body.zmin) * 0.5,
+  offset = 0.03,
+  subdivS = 4,
+  subdivY = 2,
+  flatBlend = 0.72,
+  extraQuads = [],
+} = {}) {
+  const dzN = Math.max((body.zmax - body.zmin) * 0.0008, 0.004);
+  const dphiN = 0.008;
+
+  // Outward unit normal at (z, phi) on the port side (phi in [0, PI]).
+  const normalAt = (z, phi) => {
+    const za = Math.max(body.zmin + 0.001, z - dzN);
+    const zb = Math.min(body.zmax - 0.001, z + dzN);
+    const pa = Math.max(0.001, phi - dphiN);
+    const pb = Math.min(Math.PI - 0.001, phi + dphiN);
+    const pZ0 = body.pointAt(za, phi);
+    const pZ1 = body.pointAt(zb, phi);
+    const pP0 = body.pointAt(z, pa);
+    const pP1 = body.pointAt(z, pb);
+    // Tangent along +phi (belly -> port -> spine) crossed with +z (tail -> nose)
+    // points outward on the port (+X) half.
+    const tx = pP1[0] - pP0[0], ty = pP1[1] - pP0[1], tz = pP1[2] - pP0[2];
+    const ux = pZ1[0] - pZ0[0], uy = pZ1[1] - pZ0[1], uz = pZ1[2] - pZ0[2];
+    let nx = ty * uz - tz * uy;
+    let ny = tz * ux - tx * uz;
+    let nz = tx * uy - ty * ux;
+    const len = Math.hypot(nx, ny, nz) || 1;
+    nx /= len; ny /= len; nz /= len;
+    // Sanity check: on the upper port nose, outward normal has nx >= -0.05 and (ny + nz) > -0.2.
+    const p = body.pointAt(z, phi);
+    const ctrY = (body.pointAt(z, 0)[1] + body.pointAt(z, Math.PI)[1]) * 0.5;
+    if (nx * p[0] + ny * (p[1] - ctrY) < 0 && p[0] > 0.02) {
+      nx = -nx; ny = -ny; nz = -nz;
+    }
+    return [nx, ny, nz];
+  };
+
+  // Horizontal contour (x >= 0, y, z) at constant height `y`, parameterized by
+  // arc length `s` from the frontmost intersection on the centreline (s = 0).
+  const contourCache = new Map();
+  const contourAtY = (y) => {
+    const key = Math.round(y * 10000);
+    if (contourCache.has(key)) return contourCache.get(key);
+    const topY = (z) => body.pointAt(z, Math.PI)[1];
+    // Scan aft from nose tip to find where the upper spine rises to `y`.
+    const scanSteps = 120;
+    let zHi = zSearchStart;
+    let zLo = zSearchEnd;
+    let found = false;
+    for (let i = 0; i <= scanSteps; i++) {
+      const z = zSearchStart - (zSearchStart - zSearchEnd) * (i / scanSteps);
+      if (topY(z) >= y) {
+        zLo = z;
+        zHi = i === 0 ? z : zSearchStart - (zSearchStart - zSearchEnd) * ((i - 1) / scanSteps);
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      contourCache.set(key, null);
+      return null;
+    }
+    // Refine exact front centreline intersection zFront where topY(zFront) == y.
+    for (let k = 0; k < 18; k++) {
+      const mid = (zLo + zHi) * 0.5;
+      if (topY(mid) >= y) zLo = mid; else zHi = mid;
+    }
+    const zFront = zLo;
+    const pts = [];
+    const M = 90;
+    let accumS = 0;
+    let prev = null;
+    for (let i = 0; i <= M; i++) {
+      const t = i / M;
+      // Quadratic clustering packs samples into the tight curve around the nose front.
+      const z = zFront - (zFront - zSearchEnd) * (t * t);
+      const yBot = body.pointAt(z, 0)[1];
+      const yTop = topY(z);
+      if (y < yBot || y > yTop + 1e-4) continue;
+      let phi;
+      if (i === 0) {
+        phi = Math.PI;
+      } else {
+        let lo = 0;
+        let hi = Math.PI;
+        for (let k = 0; k < 18; k++) {
+          const mid = (lo + hi) * 0.5;
+          if (body.pointAt(z, mid)[1] < y) lo = mid; else hi = mid;
+        }
+        phi = (lo + hi) * 0.5;
+      }
+      const p = body.pointAt(z, phi);
+      const n = normalAt(z, phi);
+      if (prev) accumS += Math.hypot(p[0] - prev[0], p[1] - prev[1], p[2] - prev[2]);
+      pts.push({ s: accumS, p, n });
+      prev = p;
+    }
+    contourCache.set(key, pts);
+    return pts;
+  };
+
+  const sampleContour = (y, s) => {
+    const pts = contourAtY(y);
+    if (!pts || pts.length < 2) return null;
+    if (s <= pts[0].s) return pts[0];
+    if (s >= pts[pts.length - 1].s) return pts[pts.length - 1];
+    let lo = 0;
+    let hi = pts.length - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (pts[mid].s <= s) lo = mid; else hi = mid;
+    }
+    const a = pts[lo], b = pts[hi];
+    const f = b.s > a.s ? (s - a.s) / (b.s - a.s) : 0;
+    const p = [
+      a.p[0] + (b.p[0] - a.p[0]) * f,
+      a.p[1] + (b.p[1] - a.p[1]) * f,
+      a.p[2] + (b.p[2] - a.p[2]) * f,
+    ];
+    let nx = a.n[0] + (b.n[0] - a.n[0]) * f;
+    let ny = a.n[1] + (b.n[1] - a.n[1]) * f;
+    let nz = a.n[2] + (b.n[2] - a.n[2]) * f;
+    const l = Math.hypot(nx, ny, nz) || 1;
+    return { p, n: [nx / l, ny / l, nz / l] };
+  };
+
+  const verts = [];
+  const norms = [];
+  const idx = [];
+
+  const emitGrid = (grid, nxCols, nyRows, mirror) => {
+    // Average pane normal for crisp semi-flat laminated glass reflections.
+    let anx = 0, any = 0, anz = 0;
+    for (const cell of grid) {
+      anx += cell.n[0]; any += cell.n[1]; anz += cell.n[2];
+    }
+    const al = Math.hypot(anx, any, anz) || 1;
+    anx /= al; any /= al; anz /= al;
+
+    for (const side of (mirror ? [1, -1] : [1])) {
+      const base = verts.length / 3;
+      const sx = side;
+      for (const cell of grid) {
+        const px = sx * (cell.p[0] + cell.n[0] * offset);
+        const py = cell.p[1] + cell.n[1] * offset;
+        const pz = cell.p[2] + cell.n[2] * offset;
+        let vx = sx * (cell.n[0] * (1 - flatBlend) + anx * flatBlend);
+        let vy = cell.n[1] * (1 - flatBlend) + any * flatBlend;
+        let vz = cell.n[2] * (1 - flatBlend) + anz * flatBlend;
+        const vl = Math.hypot(vx, vy, vz) || 1;
+        verts.push(px, py, pz);
+        norms.push(vx / vl, vy / vl, vz / vl);
+      }
+      const stride = nyRows + 1;
+      for (let i = 0; i < nxCols; i++) {
+        for (let j = 0; j < nyRows; j++) {
+          const a = base + i * stride + j;
+          const b = base + (i + 1) * stride + j;
+          const c = base + (i + 1) * stride + (j + 1);
+          const d = base + i * stride + (j + 1);
+          // Enforce outward CCW winding against the pane normal.
+          const ax = verts[a * 3], ay = verts[a * 3 + 1], az = verts[a * 3 + 2];
+          const bx = verts[b * 3] - ax, by = verts[b * 3 + 1] - ay, bz = verts[b * 3 + 2] - az;
+          const cx = verts[c * 3] - ax, cy = verts[c * 3 + 1] - ay, cz = verts[c * 3 + 2] - az;
+          const crx = by * cz - bz * cy, cry = bz * cx - bx * cz, crz = bx * cy - by * cx;
+          const dot = crx * (sx * anx) + cry * any + crz * anz;
+          if (dot >= 0) idx.push(a, b, c, a, c, d);
+          else idx.push(a, c, b, a, d, c);
+        }
+      }
+    }
+  };
+
+  for (const pane of panes) {
+    const knots = pane.knots;
+    const cols = [];
+    for (let k = 0; k < knots.length - 1; k++) {
+      const [s0, b0, t0] = knots[k];
+      const [s1, b1, t1] = knots[k + 1];
+      const steps = pane.subdivS ?? subdivS;
+      const startI = k === 0 ? 0 : 1;
+      for (let i = startI; i <= steps; i++) {
+        const u = i / steps;
+        cols.push([s0 + (s1 - s0) * u, b0 + (b1 - b0) * u, t0 + (t1 - t0) * u]);
+      }
+    }
+    const ny = pane.subdivY ?? subdivY;
+    const grid = [];
+    let ok = true;
+    for (const [s, yB, yT] of cols) {
+      for (let j = 0; j <= ny; j++) {
+        const y = yB + (yT - yB) * (j / ny);
+        const sample = sampleContour(y, s);
+        if (!sample) { ok = false; break; }
+        grid.push(sample);
+      }
+      if (!ok) break;
+    }
+    if (ok) emitGrid(grid, cols.length - 1, ny, pane.mirror !== false);
+  }
+
+  // Optional direct (z, phi) quads (e.g. Cessna rear omni-vision wrap window).
+  for (const q of extraQuads) {
+    const [z0, z1, a0, a1] = [q.z0, q.z1, q.a0, q.a1];
+    const nu = q.subdivU ?? 6;
+    const nv = q.subdivV ?? 2;
+    const grid = [];
+    for (let i = 0; i <= nu; i++) {
+      const u = i / nu;
+      const a = -a0 + 2 * a0 * u; // symmetric across spine
+      const aTop = -a1 + 2 * a1 * u;
+      for (let j = 0; j <= nv; j++) {
+        const v = j / nv;
+        const z = z0 + (z1 - z0) * v;
+        const ang = a + (aTop - a) * v;
+        const phi = Math.PI - Math.abs(ang);
+        const p = body.pointAt(z, phi);
+        const n = normalAt(z, phi);
+        const sign = ang < 0 ? -1 : 1;
+        grid.push({ p: [sign * p[0], p[1], p[2]], n: [sign * n[0], n[1], n[2]] });
+      }
+    }
+    emitGrid(grid, nu, nv, false);
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(norms, 3));
+  geo.setIndex(idx);
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.name = 'cockpit-glazing';
+  return mesh;
 }
 
 // NACA 00xx half-thickness at chord fraction c (0 = leading edge).
@@ -314,7 +592,13 @@ function paintKit(model, airframe, layout) {
     }),
     dark: new THREE.MeshStandardMaterial({ color: 0x20262e, roughness: 0.7 }),
     metal: new THREE.MeshStandardMaterial({ color: 0x9aa4ae, roughness: 0.35, metalness: 0.6 }),
-    glass: new THREE.MeshStandardMaterial({ color: 0x1d2c3d, roughness: 0.06, metalness: 0.35 }),
+    // Dark tinted near-black aerospace glazing with subtle sky/sun sheen.
+    glass: new THREE.MeshStandardMaterial({ color: 0x162332, roughness: 0.12, metalness: 0.18 }),
+    windowGlass: new THREE.MeshStandardMaterial({
+      color: 0x162332, roughness: 0.12, metalness: 0.18,
+      polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+    }),
+    frame: new THREE.MeshStandardMaterial({ color: 0x3b4552, roughness: 0.5, metalness: 0.25 }),
     rubber: new THREE.MeshStandardMaterial({ color: 0x141619, roughness: 0.92 }),
     // Heat-stained exhaust metal.
     nozzle: new THREE.MeshStandardMaterial({
@@ -391,18 +675,154 @@ export function makeAgentMesh(model) {
   const kit = paintKit(model, 'prop', {
     zmin: body.zmin, zmax: body.zmax, circ: body.circ,
     bellyA: 2.25, stripeA: 1.55, stripeW: 0.1, stripeZ1: Z(0.6), swooshZ: Z(5.8),
-    windows: {
-      kind: 'highwing', top: 0.5, sill: 1.3, post: 0.06,
-      front: Z(1.42), pillarTop: Z(2.12), pillarBottom: Z(1.72),
-      doorEnd: Z(2.95), rearEnd: Z(3.85), rearTaper: 0.28,
-      skylight: [Z(3.88), Z(4.35), 0.42],
-    },
     titles: { a: 1.25, z: Z(5.25), size: 0.36 },
     nose: { a: 1.3, z: Z(0.95), size: 0.13 },
   });
   const bodyMesh = new THREE.Mesh(body.geo, kit.body);
   bodyMesh.name = 'fuselage';
   g.add(bodyMesh);
+
+  // Realistic Cessna 172 multi-pane cabin glazing fitted directly onto the
+  // superellipse cabin body in true (z, y) coordinates so the raked 2-pane
+  // windshield, vertical A/B pillars, rectangular door windows, tapered rear
+  // side windows, and rear omni-vision window stay straight and crisp.
+  g.add((() => {
+    const verts = [];
+    const norms = [];
+    const idx = [];
+    const eps = 0.014;
+    const dzN = 0.01;
+    const dpN = 0.01;
+
+    const surfNorm = (z, phi) => {
+      const pZ0 = body.pointAt(Math.max(body.zmin + 0.01, z - dzN), phi);
+      const pZ1 = body.pointAt(Math.min(body.zmax - 0.01, z + dzN), phi);
+      const pP0 = body.pointAt(z, Math.max(0.002, phi - dpN));
+      const pP1 = body.pointAt(z, Math.min(Math.PI - 0.002, phi + dpN));
+      const tx = pP1[0] - pP0[0], ty = pP1[1] - pP0[1], tz = pP1[2] - pP0[2];
+      const ux = pZ1[0] - pZ0[0], uy = pZ1[1] - pZ0[1], uz = pZ1[2] - pZ0[2];
+      let nx = ty * uz - tz * uy, ny = tz * ux - tx * uz, nz = tx * uy - ty * ux;
+      const l = Math.hypot(nx, ny, nz) || 1;
+      nx /= l; ny /= l; nz /= l;
+      const p = body.pointAt(z, phi);
+      const cy = (body.pointAt(z, 0)[1] + body.pointAt(z, Math.PI)[1]) * 0.5;
+      if (nx * p[0] + ny * (p[1] - cy) < 0 && p[0] > 0.02) {
+        nx = -nx; ny = -ny; nz = -nz;
+      }
+      return { p, n: [nx, ny, nz] };
+    };
+
+    const phiForY = (z, y) => {
+      let lo = 0, hi = Math.PI;
+      for (let k = 0; k < 18; k++) {
+        const mid = (lo + hi) * 0.5;
+        if (body.pointAt(z, mid)[1] < y) lo = mid; else hi = mid;
+      }
+      return (lo + hi) * 0.5;
+    };
+
+    const emitPatch = (grid, nu, nv, mirror = true) => {
+      let anx = 0, any = 0, anz = 0;
+      for (const c of grid) { anx += c.n[0]; any += c.n[1]; anz += c.n[2]; }
+      const al = Math.hypot(anx, any, anz) || 1;
+      anx /= al; any /= al; anz /= al;
+      for (const side of (mirror ? [1, -1] : [1])) {
+        const base = verts.length / 3;
+        for (const c of grid) {
+          verts.push(side * (c.p[0] + c.n[0] * eps), c.p[1] + c.n[1] * eps, c.p[2] + c.n[2] * eps);
+          let vx = side * (c.n[0] * 0.25 + anx * 0.75);
+          let vy = c.n[1] * 0.25 + any * 0.75;
+          let vz = c.n[2] * 0.25 + anz * 0.75;
+          const vl = Math.hypot(vx, vy, vz) || 1;
+          norms.push(vx / vl, vy / vl, vz / vl);
+        }
+        const stride = nv + 1;
+        for (let i = 0; i < nu; i++) {
+          for (let j = 0; j < nv; j++) {
+            const a = base + i * stride + j;
+            const b = base + (i + 1) * stride + j;
+            const c = base + (i + 1) * stride + (j + 1);
+            const d = base + i * stride + (j + 1);
+            const ax = verts[a * 3], ay = verts[a * 3 + 1], az = verts[a * 3 + 2];
+            const bx = verts[b * 3] - ax, by = verts[b * 3 + 1] - ay, bz = verts[b * 3 + 2] - az;
+            const cx = verts[c * 3] - ax, cy = verts[c * 3 + 1] - ay, cz = verts[c * 3 + 2] - az;
+            const crx = by * cz - bz * cy, cry = bz * cx - bx * cz, crz = bx * cy - by * cx;
+            if (crx * (side * anx) + cry * any + crz * anz >= 0) idx.push(a, b, c, a, c, d);
+            else idx.push(a, c, b, a, d, c);
+          }
+        }
+      }
+    };
+
+    // 1) Front 2-pane raked windshield (z runs cowl -> roof, angle from centre post -> A-pillar).
+    {
+      const nu = 4, nv = 4;
+      const grid = [];
+      for (let i = 0; i <= nu; i++) {
+        const u = i / nu;
+        for (let j = 0; j <= nv; j++) {
+          const v = j / nv;
+          const z = Z(1.42) + (Z(2.10) - Z(1.42)) * v;
+          // Angle from top spine: thin centre strip (0.045 rad) out to raked A-pillar corner.
+          const aMax = 0.62 + 0.14 * (1 - v);
+          const a = 0.045 + (aMax - 0.045) * u;
+          grid.push(surfNorm(z, Math.PI - a));
+        }
+      }
+      emitPatch(grid, nu, nv, true);
+    }
+
+    // 2) Cabin door side window (raked front A-pillar, crisp horizontal sill & header, vertical B-pillar).
+    const emitSideQuad = (zFBot, zFTop, zABot, zATop, yBotF, yTopF, yBotA, yTopA) => {
+      const nu = 4, nv = 2;
+      const grid = [];
+      for (let i = 0; i <= nu; i++) {
+        const u = i / nu;
+        for (let j = 0; j <= nv; j++) {
+          const v = j / nv;
+          const zBot = zFBot + (zABot - zFBot) * u;
+          const zTop = zFTop + (zATop - zFTop) * u;
+          const z = zBot + (zTop - zBot) * v;
+          const yBot = yBotF + (yBotA - yBotF) * u;
+          const yTop = yTopF + (yTopA - yTopF) * u;
+          const y = yBot + (yTop - yBot) * v;
+          grid.push(surfNorm(z, phiForY(z, y)));
+        }
+      }
+      emitPatch(grid, nu, nv, true);
+    };
+    // Door window (front edge parallels the raked A-pillar from Z(1.78) bottom to Z(2.16) top).
+    emitSideQuad(Z(1.78), Z(2.16), Z(2.94), Z(2.94), 0.36, 0.90, 0.36, 0.91);
+    // Rear cabin side window (aft of crisp B-pillar, gently tapering aft).
+    emitSideQuad(Z(3.04), Z(3.04), Z(3.84), Z(3.84), 0.36, 0.91, 0.50, 0.85);
+
+    // 3) Rear omni-vision wraparound window behind the wing.
+    {
+      const nu = 6, nv = 2;
+      const grid = [];
+      for (let i = 0; i <= nu; i++) {
+        const u = i / nu;
+        for (let j = 0; j <= nv; j++) {
+          const v = j / nv;
+          const z = Z(4.36) + (Z(3.92) - Z(4.36)) * v;
+          const aLim = 0.34 + (0.44 - 0.34) * v;
+          const ang = -aLim + 2 * aLim * u;
+          const s = surfNorm(z, Math.PI - Math.abs(ang));
+          const sgn = ang < 0 ? -1 : 1;
+          grid.push({ p: [sgn * s.p[0], s.p[1], s.p[2]], n: [sgn * s.n[0], s.n[1], s.n[2]] });
+        }
+      }
+      emitPatch(grid, nu, nv, false);
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+    geo.setAttribute('normal', new THREE.Float32BufferAttribute(norms, 3));
+    geo.setIndex(idx);
+    const mesh = new THREE.Mesh(geo, kit.windowGlass);
+    mesh.name = 'cockpit-glazing';
+    return mesh;
+  })());
 
   // Spinner, two-blade 1.9 m prop, round cooling inlets beside the spinner,
   // exhaust stack under the cowl.
@@ -531,19 +951,32 @@ export function makeJetMesh(model) {
   const body = fuselage([
     [-12.6, 0.12], [-11.6, 0.55], [-9.5, 1.15], [-6.5, 1.65], [-4, 1.75],
     [8, 1.75], [9.8, 1.6], [11.2, 1.25], [12.2, 0.8], [12.8, 0.35], [13.0, 0.0001],
-  ], { sy: 1.05, warp, segments: 32 });
+  ], { sy: 1.05, warp, segments: 40 });
   const kit = paintKit(model, 'jet', {
     zmin: body.zmin, zmax: body.zmax, circ: body.circ,
     bellyA: 2.05, stripeA: 1.5, stripeW: 0.1, stripeZ1: 11.2, swooshZ: -5.0,
-    windows: { kind: 'row', a: 1.16, z0: -5.6, z1: 8.4, pitch: 0.62, w: 0.24, h: 0.32 },
-    cockpit: { z0: 10.35, z1: 11.0, a: 0.78 },
-    titles: { a: 0.6, z: 2.2, size: 1.05 },
-    operator: { a: 0.72, z: 7.7, size: 0.34 },
-    nose: { a: 1.3, z: 9.9, size: 0.34 },
+    windows: { kind: 'row', a: 1.16, z0: -5.6, z1: 8.4, pitch: 0.62, w: 0.22, h: 0.3 },
+    titles: { a: 0.68, z: 2.2, size: 1.05 },
+    operator: { a: 0.78, z: 7.7, size: 0.34 },
+    nose: { a: 1.34, z: 9.4, size: 0.34 },
   });
   const bodyMesh = new THREE.Mesh(body.geo, kit.body);
   bodyMesh.name = 'fuselage';
   group.add(bodyMesh);
+
+  // Realistic 6-pane airliner flight-deck glazing (A320 / 737 style): two main
+  // forward panes with subtle centre brow peak, two side-forward sliding panes,
+  // and two slim tapered aft side windows with crisp thin body-coloured frames.
+  group.add(cockpitGlazingMesh(body, kit.windowGlass, [
+    { knots: [[0.035, 0.42, 0.89], [0.42, 0.43, 0.88], [0.78, 0.44, 0.86]], subdivS: 3, subdivY: 2 },
+    { knots: [[0.845, 0.44, 0.855], [1.46, 0.47, 0.825]], subdivS: 3, subdivY: 2 },
+    { knots: [[1.525, 0.47, 0.82], [2.08, 0.59, 0.75]], subdivS: 3, subdivY: 2 },
+  ], {
+    zSearchStart: 12.95,
+    zSearchEnd: 8.8,
+    offset: 0.022,
+    flatBlend: 0.78,
+  }));
   // APU exhaust in the tail cone.
   const apu = new THREE.Mesh(new THREE.CircleGeometry(0.11, 12), kit.dark);
   apu.rotation.y = Math.PI;
@@ -662,43 +1095,77 @@ export function makeJetMesh(model) {
 // fillet of width k where a and b cross. Used to blend the 747's upper-deck
 // lobe seamlessly into the main widebody cylinder with zero crease or seam.
 function smax(a, b, k) {
+  if (k <= 1e-6) return Math.max(a, b);
   const h = Math.max(k - Math.abs(a - b), 0) / k;
   return Math.max(a, b) + h * h * k * 0.25;
 }
 
-// Single seamless double-bubble Boeing 747 fuselage: circular widebody main
-// deck smoothly fused via polynomial smooth-max with the iconic raised
-// stretched upper-deck hump, raked flight-deck forehead, protruding lower nose
-// cone, and upswept aft belly. Same UV layout as fuselage().
-function jumboFuselage(profile, humpProfile, { sy = 1.04, warp = null, segments = 48 } = {}) {
-  const mainCurve = new THREE.CatmullRomCurve3(
-    profile.map(([z, r]) => new THREE.Vector3(r, z, 0)), false, 'centripetal',
-  );
-  const humpCurve = new THREE.CatmullRomCurve3(
-    humpProfile.map(([z, s]) => new THREE.Vector3(z, s, 0)), false, 'catmullrom', 0.5,
-  );
-  const zmin = profile[0][0];
-  const zmax = profile[profile.length - 1][0];
-  const N = 96;
-  const S = segments;
+// Single seamless double-bubble Boeing 747 fuselage lofted from explicit
+// longitudinal stations `[z, w1, yBot, yTop1, yTop2, w2]` (tail -> nose):
+//   w1, yBot, yTop1 : main widebody ellipse half-width, keel, and main crown
+//   yTop2, w2       : upper-deck hump crown and lobe half-width (w2 = 0 aft)
+// Using explicit top/bottom heights keeps the aft spine dead-straight and
+// horizontal while ONLY the aft belly sweeps upward into the tailcone, and
+// produces the authentic narrow-top / wide-bottom 747 double-bubble section.
+function jumboFuselage(stations, { segments = 56 } = {}) {
+  // Linear/cubic-Hermite (monotone-safe Catmull-Rom with clamped overshoot)
+  // sampling across explicit stations so straight sections stay dead flat.
+  const zmin = stations[0][0];
+  const zmax = stations[stations.length - 1][0];
+  const nSt = stations.length;
 
-  // Sample both curves on a uniform Z grid (with extra density across nose & hump).
-  const mainSamples = mainCurve.getPoints(240);
-  const humpSamples = humpCurve.getPoints(160);
-  const sampleAtZ = (pts, z, getZ, getV) => {
-    if (z <= getZ(pts[0])) return getV(pts[0]);
-    if (z >= getZ(pts[pts.length - 1])) return getV(pts[pts.length - 1]);
-    let lo = 0;
-    let hi = pts.length - 1;
-    while (hi - lo > 1) {
-      const mid = (lo + hi) >> 1;
-      if (getZ(pts[mid]) <= z) lo = mid; else hi = mid;
+  // Monotone Fritsch-Carlson cubic Hermite interpolation per channel prevents
+  // spline ringing on straight keel/spine segments and sharp nose radomes.
+  function makeHermite(col) {
+    const xs = stations.map((s) => s[0]);
+    const ys = stations.map((s) => s[col]);
+    const d = [];
+    for (let i = 0; i < nSt - 1; i++) {
+      d.push((ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i]));
     }
-    const z0 = getZ(pts[lo]);
-    const z1 = getZ(pts[hi]);
-    const f = z1 > z0 ? (z - z0) / (z1 - z0) : 0;
-    return getV(pts[lo]) + (getV(pts[hi]) - getV(pts[lo])) * f;
-  };
+    const m = new Array(nSt).fill(0);
+    m[0] = d[0];
+    m[nSt - 1] = d[nSt - 2];
+    for (let i = 1; i < nSt - 1; i++) {
+      if (d[i - 1] * d[i] <= 0) m[i] = 0;
+      else m[i] = (d[i - 1] + d[i]) * 0.5;
+    }
+    for (let i = 0; i < nSt - 1; i++) {
+      if (Math.abs(d[i]) < 1e-9) {
+        m[i] = 0; m[i + 1] = 0;
+      } else {
+        const a = m[i] / d[i];
+        const b = m[i + 1] / d[i];
+        const s = Math.hypot(a, b);
+        if (s > 3) {
+          m[i] = (3 / s) * a * d[i];
+          m[i + 1] = (3 / s) * b * d[i];
+        }
+      }
+    }
+    return (z) => {
+      if (z <= xs[0]) return ys[0];
+      if (z >= xs[nSt - 1]) return ys[nSt - 1];
+      let lo = 0, hi = nSt - 1;
+      while (hi - lo > 1) {
+        const mid = (lo + hi) >> 1;
+        if (xs[mid] <= z) lo = mid; else hi = mid;
+      }
+      const h = xs[hi] - xs[lo];
+      const t = (z - xs[lo]) / h;
+      const t2 = t * t, t3 = t2 * t;
+      return (2 * t3 - 3 * t2 + 1) * ys[lo]
+        + (t3 - 2 * t2 + t) * h * m[lo]
+        + (-2 * t3 + 3 * t2) * ys[hi]
+        + (t3 - t2) * h * m[hi];
+    };
+  }
+
+  const evalW1 = makeHermite(1);
+  const evalYBot = makeHermite(2);
+  const evalYTop1 = makeHermite(3);
+  const evalYTop2 = makeHermite(4);
+  const evalW2 = makeHermite(5);
 
   // Ray distance from (0, 0) along (dx, dy) to ellipse centered at (0, cy) with radii (a, b).
   const rayEllipse = (dx, dy, cy, a, b) => {
@@ -710,42 +1177,60 @@ function jumboFuselage(profile, humpProfile, { sy = 1.04, warp = null, segments 
     return (-B + Math.sqrt(disc)) / (2 * A);
   };
 
+  const pointAt = (z, phi) => {
+    const w1 = Math.max(evalW1(z), 0.0005);
+    const yBot = evalYBot(z);
+    const yTop1 = Math.max(evalYTop1(z), yBot + 0.001);
+    const yTop2 = Math.max(evalYTop2(z), yTop1);
+    const w2 = Math.max(evalW2(z), 0);
+    const cy1 = (yTop1 + yBot) * 0.5;
+    const b1 = Math.max((yTop1 - yBot) * 0.5, 0.0005);
+    const hRise = yTop2 - yTop1;
+    const useHump = hRise > 0.012 && w2 > 0.08 && w1 > 0.5;
+
+    const dx = Math.sin(phi);
+    const dy = -Math.cos(phi);
+    let rad = rayEllipse(dx, dy, 0, w1, b1);
+    if (useHump && dy > -0.15) {
+      // Upper-deck ellipse anchored so its top reaches yTop2 exactly while its
+      // bottom sits strictly below cy1 (guaranteeing single positive ray hit).
+      const spanUp = yTop2 - cy1;
+      const cy2Rel = 0.49 * spanUp;
+      const b2 = 0.51 * spanUp;
+      const r2 = rayEllipse(dx, dy, cy2Rel, w2, b2);
+      const blendK = Math.min(0.24, 0.22 * Math.min(1, hRise / 0.45));
+      rad = smax(rad, r2, blendK);
+    }
+    return [dx * rad, cy1 + dy * rad, z];
+  };
+
+  // Build dense longitudinal rings with extra clustering across the blunt nose
+  // radome, raked cockpit forehead, hump taper, and tailcone.
+  const zRings = [];
+  for (let i = 0; i < nSt - 1; i++) {
+    const z0 = stations[i][0];
+    const z1 = stations[i + 1][0];
+    const span = z1 - z0;
+    const sub = z1 > zmax - 10 ? 6 : Math.max(3, Math.round(span / 1.4));
+    for (let k = 0; k < sub; k++) zRings.push(z0 + span * (k / sub));
+  }
+  zRings.push(zmax);
+
+  const S = segments;
   const pos = [];
   const uv = [];
   const idx = [];
-  for (let i = 0; i <= N; i++) {
-    const t = i / N;
-    // Slight cosine clustering near tail & nose for silky nose cone curvature.
-    const z = zmin + (zmax - zmin) * (0.5 - 0.5 * Math.cos(Math.PI * t));
-    const r = Math.max(sampleAtZ(mainSamples, z, (p) => p.y, (p) => p.x), 0.0001);
-    const s = Math.max(sampleAtZ(humpSamples, z, (p) => p.x, (p) => p.y), 0);
-    const wy = warp ? warp(z) : 0;
-    const a1 = r;
-    const b1 = r * sy;
-    // Upper-deck ellipse scales smoothly with hump envelope s ∈ [0..1].
-    // Center sits at cy = 1.56 * s with b2 = 2.08 * s (top at +3.64 * s, bottom
-    // at -0.52 * s < 0 so the origin is always strictly inside the ellipse).
-    const useHump = s > 0.02 && r > 0.3;
-    const cy2 = 1.56 * s;
-    const a2 = Math.max(1.58 * s, 0.01);
-    const b2 = Math.max(2.08 * s, 0.01);
-    const blendK = 0.26 * Math.min(1, s * 1.4);
-
+  for (let i = 0; i < zRings.length; i++) {
+    const z = zRings[i];
+    const v = (z - zmin) / (zmax - zmin);
     for (let j = 0; j <= S; j++) {
-      // phi = 0 is belly, PI/2 is +X port, PI is top spine (matches LatheGeometry).
       const phi = (j / S) * Math.PI * 2;
-      const dx = Math.sin(phi);
-      const dy = -Math.cos(phi);
-      let rad = rayEllipse(dx, dy, 0, a1, b1);
-      if (useHump && dy > -0.15) {
-        const r2 = rayEllipse(dx, dy, cy2, a2, b2);
-        rad = smax(rad, r2, blendK);
-      }
-      pos.push(dx * rad, wy + dy * rad, z);
-      uv.push(j / S, (z - zmin) / (zmax - zmin));
+      const p = pointAt(z, phi);
+      pos.push(p[0], p[1], p[2]);
+      uv.push(j / S, v);
     }
   }
-  for (let i = 0; i < N; i++) {
+  for (let i = 0; i < zRings.length - 1; i++) {
     for (let j = 0; j < S; j++) {
       const a = i * (S + 1) + j;
       const b = a + S + 1;
@@ -757,71 +1242,150 @@ function jumboFuselage(profile, humpProfile, { sy = 1.04, warp = null, segments 
   geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
   geo.setIndex(idx);
   geo.computeVertexNormals();
-  const rmax = Math.max(...profile.map(([, r]) => r));
-  return { geo, zmin, zmax, circ: 2 * Math.PI * rmax * (1 + sy) / 2 };
+  const maxW = Math.max(...stations.map((s) => s[1]));
+  const maxH = Math.max(...stations.map((s) => (s[3] - s[2]) * 0.5));
+  return { geo, zmin, zmax, circ: 2 * Math.PI * (maxW + maxH) / 2, pointAt };
 }
 
-// Quad-engine widebody Boeing 747 ("Queen of the Sky"): reserved exclusively
-// for top-tier flagship models (see flagship.js). Features a single seamless
-// double-bubble fuselage with the iconic raised stretched upper-deck hump and
-// high 6-pane flight deck, strongly swept wings with four underwing turbofans
-// on pylons, canted 747-400 winglets, tall swept vertical tail, and the
-// signature 18-wheel (4x4 main bogies + twin nose) landing gear.
+// Boeing 747-400 ("Queen of the Sky") — flagship frontier models (flagship.js).
+// Built in true metres (z = 34.3 - m, where m is metres aft of nose tip) and
+// scaled uniformly by 0.355 to fit Skywatch's gates, taxiways, and Runway 36
+// while keeping exact real-world proportions.
+//
+// Verified Boeing 747-400 reference dimensions (Boeing D6-58326-1 Airport
+// Planning Manual, Boeing 747 Structural Repair Manual, ATA Ch. 56, Wikipedia):
+//   Overall length        : 70.66 m (231 ft 10 in); fuselage body 68.63 m
+//   Wingspan (w/ winglets): 64.44 m (211 ft 5 in) = 0.912 x length; 6 ft (1.83 m) canted winglets
+//   Overall tail height   : 19.41 m (63 ft 8 in); top of upper deck 9.82-10.24 m above ground
+//   Main fuselage section : 6.50 m wide (256 in) x 6.81 m tall (268 in), L:W = 10.87:1
+//   Hump keel-to-crown    : 7.85 m structural shell (309 in, WL 91 to WL 400) / ~8.0 m w/ fairing;
+//                           upper-deck cabin ~15.8-16.5 m interior length (10-11 windows/side),
+//                           3.45 m interior floor width (~4.16 m exterior width, approx. — exact
+//                           exterior BL unconfirmed); aft fairing taper end (~35 m) approx. from 3-views
+//   Wing geometry         : 37.5 deg quarter-chord sweep (~39.8 deg LE), 7 deg dihedral,
+//                           ~14.84 m theoretical root chord, 3.70 m tip chord, Yehudi TE kink at
+//                           inboard engine station (~37% semi-span)
+//   Engines (4x CF6/PW4k) : 2.74 m cowl OD (93-94 in fan); inboard at 11.9 m (39 ft = 36.9%
+//                           semi-span), outboard at 21.2 m (69 ft 6 in = 65.8% semi-span),
+//                           slung well forward of and below wing LE on swept pylons
+//   Horizontal stabiliser : 22.17 m span (72 ft 9 in), 37 deg quarter-chord sweep, 7 deg dihedral
+//   Landing gear (18 whl) : 25.60 m wheelbase (84 ft 0 in), 11.00 m outer track (36 ft 1 in),
+//                           4x 4-wheel main bogies (2 wing + 2 aft body, 1.24 m H49x19-22 tyres) +
+//                           twin-wheel nose gear
+//   Flight deck windows   : 6 primary panes (No. 1 L/R forward, No. 2 L/R sliding side, No. 3 L/R
+//                           raked aft side) high on the upper-deck brow above the blunt rounded chin
 export function makeJumboMesh(model) {
   const group = new THREE.Group();
-  const warp = (z) => (z < -5.8 ? (-5.8 - z) * 0.145 : 0) - (z > 10.6 ? (z - 10.6) * 0.085 : 0);
-  const body = jumboFuselage([
-    [-16.0, 0.18], [-14.8, 0.72], [-12.2, 1.44], [-8.8, 2.04], [-5.8, 2.26],
-    [10.2, 2.26], [12.0, 2.12], [13.6, 1.76], [14.9, 1.24], [15.8, 0.66],
-    [16.25, 0.28], [16.45, 0.0001],
-  ], [
-    // Upper-deck hump envelope s(z): 0 aft of wing box, rising smoothly into
-    // the long 747-400 upper deck, then sloping steeply down across the
-    // forward-facing cockpit forehead into the lower nose cone.
-    [-16.0, 0.0], [-2.8, 0.0], [-1.4, 0.50], [0.2, 0.74], [1.8, 0.90],
-    [3.8, 0.99], [6.8, 1.0], [9.8, 0.99], [11.1, 0.92], [12.0, 0.77],
-    [12.8, 0.58], [13.5, 0.32], [14.2, 0.0], [16.45, 0.0],
-  ], { sy: 1.04, warp, segments: 52 });
+  const M = (m) => 34.3 - m; // m = metres aft of nose tip (0 -> 68.63 m tailcone)
+
+  // Fuselage stations from tailcone (m=68.63) forward to nose tip (m=0.0):
+  // [z, w1, yBot, yTop1, yTop2, w2]
+  // Main constant cylinder: 6.50 m wide x 6.60 m tall (±3.30 m); stretched
+  // upper-deck hump rises cleanly to +4.75 m (8.05 m keel-to-crown, +1.45 m
+  // proud of the straight horizontal aft spine) with a distinct nose-to-brow
+  // inflection at the 43 deg raked flight-deck windscreen and a proud ~1.0 m
+  // curved forehead rising above the cockpit glass.
+  const stations = [
+    [68.63, 0.22, 1.66, 2.10, 2.10, 0.0],
+    [67.80, 0.42, 1.48, 2.26, 2.26, 0.0],
+    [65.00, 0.98, 0.84, 2.78, 2.78, 0.0],
+    [61.00, 1.78, -0.26, 3.24, 3.24, 0.0],
+    [56.50, 2.54, -1.55, 3.30, 3.30, 0.0],
+    [52.00, 3.04, -2.60, 3.30, 3.30, 0.0],
+    [47.50, 3.25, -3.30, 3.30, 3.30, 0.0],
+    [42.00, 3.25, -3.30, 3.30, 3.30, 0.0],
+    // Long graceful 747-400 aft hump fairing tapering smoothly into straight spine.
+    [35.20, 3.25, -3.30, 3.30, 3.30, 0.0],
+    [32.50, 3.25, -3.30, 3.30, 3.48, 1.12],
+    [29.50, 3.25, -3.30, 3.30, 3.84, 1.50],
+    [26.50, 3.25, -3.30, 3.30, 4.26, 1.78],
+    [23.50, 3.25, -3.30, 3.30, 4.60, 1.96],
+    // Stretched 747-400 upper-deck level roof (~13 m full-height hump crest).
+    [21.00, 3.25, -3.30, 3.30, 4.75, 2.02],
+    [16.00, 3.25, -3.30, 3.30, 4.75, 2.02],
+    [11.20, 3.25, -3.30, 3.30, 4.75, 2.02],
+    [8.20, 3.25, -3.30, 3.30, 4.72, 1.99],
+    // Proud curved upper forehead rounding down into the 43 deg windscreen face.
+    [7.00, 3.22, -3.30, 3.26, 4.56, 1.92],
+    [6.00, 3.14, -3.30, 3.16, 4.16, 1.80],
+    [5.10, 3.00, -3.28, 2.98, 3.46, 1.62],
+    [4.30, 2.84, -3.22, 2.66, 2.68, 1.38],
+    // Blunt rounded lower chin and drooping nose radome below the windscreen.
+    [3.30, 2.58, -3.08, 2.18, 2.18, 0.0],
+    [2.20, 2.20, -2.80, 1.62, 1.62, 0.0],
+    [1.25, 1.72, -2.40, 1.02, 1.02, 0.0],
+    [0.58, 1.20, -1.94, 0.36, 0.36, 0.0],
+    [0.18, 0.70, -1.48, -0.22, -0.22, 0.0],
+    [0.00, 0.001, -0.90, -0.899, -0.899, 0.0],
+  ].map(([m, ...rest]) => [M(m), ...rest]);
+
+  const body = jumboFuselage(stations, { segments: 56 });
+  const doorZs = [M(9.2), M(21.4), M(35.0), M(46.8), M(56.8)];
 
   const kit = paintKit(model, 'jumbo', {
     zmin: body.zmin, zmax: body.zmax, circ: body.circ,
-    texW: 1024, texH: 1024,
-    bellyA: 2.02, stripeA: 1.56, stripeW: 0.11, stripeZ1: 14.4, swooshZ: -7.2,
-    // Iconic 6-pane flight deck high on the forward-facing brow of the hump.
-    cockpit: { z0: 11.45, z1: 12.65, a: 0.50, frames: [-0.54, -0.27, 0, 0.27, 0.54] },
-    // Both upper-deck cabin windows AND full-length main-deck windows extending
-    // all the way forward beneath the cockpit into the nose.
+    texW: 1024, texH: 2048,
+    bellyA: 2.08, stripeA: 1.60, stripeW: 0.085, stripeZ1: M(4.5), swooshZ: M(51.5),
+    // One row of small oval main-deck cabin windows (with door gaps) plus a
+    // crisp short row of 11 small upper-deck windows; none on the hump top.
     windows: [
-      { kind: 'row', a: 1.26, z0: -9.8, z1: 12.8, pitch: 0.56, w: 0.21, h: 0.27 },
-      { kind: 'row', a: 0.55, z0: 3.4, z1: 10.2, pitch: 0.56, w: 0.22, h: 0.16 },
+      {
+        kind: 'row', a: 1.38, z0: M(57.8), z1: M(8.2), pitch: 0.94, w: 0.32, h: 0.44,
+        skipZs: doorZs, skipMargin: 1.05,
+      },
+      { kind: 'row', a: 0.49, z0: M(20.6), z1: M(9.8), pitch: 1.05, w: 0.28, h: 0.36 },
     ],
-    doors: { a: 1.32, zs: [-9.2, -3.6, 2.4, 8.2, 12.9], w: 0.52, h: 1.02 },
-    titles: { a: 0.74, z: -2.4, size: 1.36 },
-    operator: { a: 0.84, z: 2.2, size: 0.35 },
-    nose: { a: 1.02, z: 11.2, size: 0.34 },
+    doors: { a: 1.44, zs: doorZs, w: 1.05, h: 2.05 },
+    // Airline titles squarely on the main-fuselage side flank (never on the hump).
+    titles: { a: 1.05, z: M(40.5), size: 2.55 },
+    operator: { a: 1.13, z: M(29.8), size: 0.68 },
+    nose: { a: 1.18, z: M(14.5), size: 0.68 },
   });
   const bodyMesh = new THREE.Mesh(body.geo, kit.body);
   bodyMesh.name = 'fuselage';
   group.add(bodyMesh);
 
-  // APU exhaust in the tail cone.
-  const apu = new THREE.Mesh(new THREE.CircleGeometry(0.16, 12), kit.dark);
+  // Iconic 6-pane Boeing 747-400 flight-deck glazing set on the raked front
+  // face of the upper deck below the proud curved forehead brow:
+  // No. 1 L/R central windscreens with subtle pointed eyebrow peak at the
+  // centre post, No. 2 L/R side-forward sliding windows, No. 3 L/R slim raked
+  // aft side windows tapering to a sharp rear corner.
+  group.add(cockpitGlazingMesh(body, kit.windowGlass, [
+    // No. 1 forward windshield (slight pointed eyebrow brow near centre post).
+    { knots: [[0.06, 2.94, 3.70], [0.46, 2.96, 3.73], [1.16, 3.01, 3.67]], subdivS: 3, subdivY: 2 },
+    // No. 2 side-forward sliding window.
+    { knots: [[1.25, 3.02, 3.66], [2.24, 3.10, 3.61]], subdivS: 3, subdivY: 2 },
+    // No. 3 aft fixed side window with signature 747 swept-back rear corner.
+    { knots: [[2.33, 3.11, 3.60], [3.32, 3.38, 3.50]], subdivS: 3, subdivY: 2 },
+  ], {
+    zSearchStart: M(3.6),
+    zSearchEnd: M(11.5),
+    offset: 0.045,
+    flatBlend: 0.78,
+  }));
+
+  // APU exhaust in the tapered tailcone.
+  const apu = new THREE.Mesh(new THREE.CircleGeometry(0.22, 12), kit.dark);
   apu.rotation.y = Math.PI;
-  apu.position.set(0, warp(-16.0), -16.02);
+  apu.position.set(0, 1.88, M(68.65));
   group.add(apu);
 
-  // Strongly swept 747 wing (~37 deg) with broad inboard Yehudi crank,
-  // pronounced dihedral, wing-body belly fairing, and canted 747-400 winglets.
-  const wingY = -1.25;
-  const wingSpan = 14.9;
-  const kinkX = 5.3;
-  const wingDihedral = 0.095;
+  // Strongly swept 747-400 wing (37.5 deg quarter-chord / ~39.8 deg LE sweep),
+  // 7 deg dihedral, huge inboard chord with Yehudi trailing-edge kink at the
+  // inboard engine station (x = 11.9 m = 36.9% semi-span), 3.70 m tip chord,
+  // and 6 ft (1.83 m) canted winglets bringing total span to 64.44 m.
+  const wingY = -2.15;
+  const wingSpan = 31.4; // + canted winglets = 64.44 m total span
+  const kinkX = 11.9;    // Yehudi crank aligned with inboard engine pylon (39 ft)
+  const wingDihedral = 0.122; // 7.0 deg
   const rise = Math.tan(wingDihedral);
-  const kink = { le: 0.6, chord: 4.7, t: 0.12 };
-  const tip = { le: -6.2, chord: 1.52, t: 0.095 };
+  const rootLe = M(21.3);     // z = +13.0 m (interacts w/ fuselage side at ~24 m)
+  const rootChord = 16.5;
+  const kink = { le: rootLe - kinkX * 0.833, chord: 8.20, t: 0.118 };
+  const tip = { le: rootLe - wingSpan * 0.833, chord: 3.70, t: 0.088 };
   for (const w of surfacePair(kit.wingSkin, {
     span: kinkX, dihedral: wingDihedral,
-    root: { le: 4.8, chord: 8.8, y: wingY, t: 0.145 }, tip: kink,
+    root: { le: rootLe, chord: rootChord, y: wingY, t: 0.138 }, tip: kink,
   })) group.add(w);
   for (const w of surfacePair(kit.wingSkin, {
     span: wingSpan - kinkX, x0: kinkX, dihedral: wingDihedral,
@@ -829,44 +1393,46 @@ export function makeJumboMesh(model) {
   })) group.add(w);
 
   const wingYAt = (x) => wingY + rise * x;
+  const rootTe = rootLe - rootChord;
   const kinkTe = kink.le - kink.chord;
   const tipTe = tip.le - tip.chord;
   const leAt = (x) => (x < kinkX
-    ? 4.8 + (kink.le - 4.8) * (x / kinkX)
+    ? rootLe + (kink.le - rootLe) * (x / kinkX)
     : kink.le + (tip.le - kink.le) * ((x - kinkX) / (wingSpan - kinkX)));
   const teAt = (x) => (x < kinkX
-    ? -4.0 + (kinkTe + 4.0) * (x / kinkX)
+    ? rootTe + (kinkTe - rootTe) * (x / kinkX)
     : kinkTe + (tipTe - kinkTe) * ((x - kinkX) / (wingSpan - kinkX)));
 
-  // Canted 747-400 winglets in the provider's tail livery.
+  // Canted 747-400 winglets (~6 ft / 1.83 m vertical rise, ~24 deg outward cant).
   const tipY = wingYAt(wingSpan);
   for (const side of [1, -1]) {
     group.add(finMesh(kit.fin, {
-      height: 1.9, thickness: 0.08, base: [side * wingSpan, tipY], cant: 0.36, side,
-      root: { le: tip.le, chord: tip.chord }, tip: { le: -7.5, chord: 0.62 },
+      height: 2.05, thickness: 0.08, base: [side * wingSpan, tipY], cant: 0.42, side,
+      root: { le: tip.le, chord: tip.chord }, tip: { le: tip.le - 2.35, chord: 1.35 },
     }));
   }
 
-  // Prominent wing-body belly fairing bridging fuselage and wing roots.
+  // Wing-body belly fairing bridging the widebody keel and inboard wing roots.
   group.add(new THREE.Mesh(fuselage([
-    [-5.2, 0.28], [-3.6, 1.18], [2.2, 1.28], [4.8, 0.72], [5.8, 0.0001],
-  ], { sx: 1.9, sy: 0.72, warp: () => -1.42 }).geo, kit.wing));
+    [M(44.0), 0.35], [M(39.0), 1.65], [M(25.0), 1.85], [M(19.5), 1.15], [M(17.5), 0.0001],
+  ], { sx: 2.05, sy: 0.62, warp: () => -2.55, segments: 24 }).geo, kit.wing));
 
-  // Flap-track fairings under the trailing edge (4 per wing).
+  // Flap-track canoes under the wing trailing edge (4 per wing).
   for (const side of [1, -1]) {
-    for (const x of [3.1, 6.6, 9.5, 12.1]) {
+    for (const x of [7.2, 14.5, 20.0, 25.0]) {
       const pod = new THREE.Mesh(fuselage([
-        [-1.4, 0.0001], [-0.95, 0.14], [0.22, 0.18], [1.15, 0.0001],
-      ], { sx: 0.6, segments: 10 }).geo, kit.wing);
-      pod.position.set(side * x, wingYAt(x) - 0.12, teAt(x) + 0.55);
+        [-2.2, 0.0001], [-1.45, 0.22], [0.35, 0.28], [1.75, 0.0001],
+      ], { sx: 0.58, segments: 10 }).geo, kit.wing);
+      pod.position.set(side * x, wingYAt(x) - 0.22, teAt(x) + 0.9);
       group.add(pod);
     }
   }
 
-  // Four high-bypass turbofan engines slung well forward on swept pylons.
+  // Four high-bypass turbofans (CF6-80C2 / PW4056: ~2.7 m cowl OD) slung well
+  // forward of and below the strongly swept wing LE on slender pylons.
   const engines = [
-    { x: 5.1, drop: 1.22, fwd: 0.95, scale: 0.94, pylonH: 0.62 },
-    { x: 9.3, drop: 1.06, fwd: 0.80, scale: 0.88, pylonH: 0.54 },
+    { x: 11.9, drop: 1.78, fwd: 2.35, scale: 1.38, pylonH: 0.96 }, // inboard (39 ft)
+    { x: 21.2, drop: 1.52, fwd: 1.85, scale: 1.36, pylonH: 0.80 }, // outboard (69.5 ft)
   ];
   for (const side of [1, -1]) {
     for (const e of engines) {
@@ -877,68 +1443,88 @@ export function makeJumboMesh(model) {
       engine.position.set(side * e.x, ey, ez);
       group.add(engine);
       group.add(finMesh(kit.wing, {
-        height: e.pylonH, thickness: 0.16, base: [side * e.x, wingYAt(e.x) + 0.04], cant: Math.PI,
-        root: { le: leAt(e.x) + 0.15, chord: 2.7 }, tip: { le: ez + 1.55, chord: 3.5 },
+        height: e.pylonH, thickness: 0.12, base: [side * e.x, wingYAt(e.x) + 0.05], cant: Math.PI,
+        root: { le: leAt(e.x) + 0.4, chord: 5.4 },
+        tip: { le: ez + 2.55, chord: 6.2 },
       }));
     }
   }
 
-  // Swept horizontal stabilisers and tall, majestic 747 vertical tail fin.
-  const tailY = warp(-12.6);
+  // Swept horizontal stabilisers (22.17 m span, 37 deg quarter-chord sweep,
+  // 7 deg dihedral) and tall swept vertical tail fin (19.41 m overall height
+  // from runway ground plane at y = -5.45 m -> fin tip at y = +13.96 m).
   for (const t of surfacePair(kit.tailSkin, {
-    span: 6.0, dihedral: 0.11,
-    root: { le: -10.2, chord: 3.9, y: tailY, t: 0.11 }, tip: { le: -14.0, chord: 1.45, t: 0.09 },
+    span: 11.08, dihedral: 0.122,
+    root: { le: M(58.1), chord: 7.4, y: 1.70, t: 0.105 },
+    tip: { le: M(67.6), chord: 2.95, t: 0.085 },
   })) group.add(t);
   group.add(finMesh(kit.fin, {
-    height: 6.9, thickness: 0.11, base: [0, tailY + 1.15],
-    root: { le: -7.8, chord: 6.2 }, tip: { le: -13.6, chord: 2.35 },
-    logo: kit.logo, logoAt: 0.44, logoScale: 0.76,
+    height: 11.11, thickness: 0.105, base: [0, 2.85],
+    root: { le: M(52.8), chord: 12.2 },
+    tip: { le: M(64.1), chord: 4.25 },
+    logo: kit.logo, logoAt: 0.44, logoScale: 0.78,
   }));
+  // Graceful dorsal fin fillet rising smoothly from the straight aft spine.
   group.add(finMesh(kit.fin, {
-    height: 0.85, thickness: 0.12, base: [0, 2.08],
-    root: { le: -5.2, chord: 3.2 }, tip: { le: -7.8, chord: 1.0 },
+    height: 1.35, thickness: 0.11, base: [0, 3.25],
+    root: { le: M(46.8), chord: 6.4 },
+    tip: { le: M(52.8), chord: 1.6 },
   }));
 
-  // Iconic 18-wheel retractable 747 landing gear:
-  // 4 four-wheel main bogies (2 wing gear + 2 aft body gear) + twin-wheel nose gear.
+  // Iconic 18-wheel retractable 747-400 landing gear (25.60 m wheelbase,
+  // 11.00 m outer track, 1.24 m H49x19-22 main tyres, ground plane y = -5.45 m
+  // giving 2.05 m belly clearance) with open wheel-well doors.
   const gear = new THREE.Group();
   gear.name = 'gear';
-  const mainWheelY = -3.70;
-  const mainWheelR = 0.56; // bottom contact plane at y = -4.26
-  const addMainBogie = (x, z, strutTopY, braceX) => {
-    gear.add(rod(kit.metal, [x, strutTopY, z], [x, mainWheelY, z], 0.15, 8));
-    gear.add(rod(kit.metal, [braceX, -1.65, z], [x, -2.75, z], 0.07, 6));
-    // Longitudinal bogie beam carrying forward and aft dual-wheel pairs.
-    gear.add(rod(kit.metal, [x, mainWheelY, z - 0.62], [x, mainWheelY, z + 0.62], 0.09, 6));
-    for (const dz of [-0.56, 0.56]) {
-      gear.add(rod(kit.metal, [x - 0.34, mainWheelY, z + dz], [x + 0.34, mainWheelY, z + dz], 0.07, 6));
-      for (const dx of [-0.34, 0.34]) {
-        gear.add(wheel(kit, x + dx, mainWheelY, z + dz, mainWheelR, 0.28));
+  const mainWheelR = 0.62;
+  const mainWheelY = -5.45 + mainWheelR; // -4.83 m -> bottom contact y = -5.45 m
+  const addMainBogie = (x, z, strutTopY, braceX, doorSide) => {
+    gear.add(rod(kit.metal, [x, strutTopY, z], [x, mainWheelY, z], 0.20, 8));
+    gear.add(rod(kit.metal, [braceX, strutTopY - 0.25, z], [x, -3.75, z], 0.09, 6));
+    gear.add(rod(kit.metal, [x, mainWheelY, z - 0.86], [x, mainWheelY, z + 0.86], 0.12, 6));
+    for (const dz of [-0.78, 0.78]) {
+      gear.add(rod(kit.metal, [x - 0.46, mainWheelY, z + dz], [x + 0.46, mainWheelY, z + dz], 0.09, 6));
+      for (const dx of [-0.46, 0.46]) {
+        gear.add(wheel(kit, x + dx, mainWheelY, z + dz, mainWheelR, 0.44));
       }
     }
+    // Thin strut door flush beside the retracted bay.
+    const door = new THREE.Mesh(new THREE.BoxGeometry(0.08, 1.45, 2.0), kit.plain);
+    door.position.set(x + doorSide * 0.42, strutTopY - 0.72, z);
+    gear.add(door);
   };
   for (const side of [1, -1]) {
-    // Outboard wing main gear bogie.
-    addMainBogie(side * 3.55, -1.15, wingYAt(3.55) - 0.15, side * 2.1);
-    // Inboard body main gear bogie (staggered slightly aft, like the real 747).
-    addMainBogie(side * 1.42, -2.65, -1.65, side * 0.45);
+    // Wing-gear bogies at exact 11.00 m track (x = ±5.50 m).
+    addMainBogie(side * 5.50, M(33.9), wingYAt(5.50) - 0.15, side * 3.4, side);
+    // Body-gear bogies tucked inboard and staggered 3.2 m aft (x = ±1.95 m).
+    addMainBogie(side * 1.95, M(37.1), -2.85, side * 0.65, -side);
   }
-  // Twin-wheel nose gear (bottom contact matches main gear at y = -4.26).
-  gear.add(rod(kit.metal, [0, -1.8, 11.8], [0, -3.84, 11.8], 0.13, 8));
-  gear.add(rod(kit.metal, [0, -1.9, 10.6], [0, -2.9, 11.8], 0.06, 6));
-  gear.add(rod(kit.metal, [-0.32, -3.84, 11.8], [0.32, -3.84, 11.8], 0.07, 6));
-  gear.add(wheel(kit, 0.32, -3.84, 11.8, 0.42, 0.25));
-  gear.add(wheel(kit, -0.32, -3.84, 11.8, 0.42, 0.25));
+  // Twin-wheel nose gear (25.60 m ahead of main gear midpoint -> m = 9.9 m).
+  const noseGearZ = M(9.9);
+  const noseWheelR = 0.50;
+  const noseWheelY = -5.45 + noseWheelR; // -4.95 m -> bottom contact y = -5.45 m
+  gear.add(rod(kit.metal, [0, -3.15, noseGearZ], [0, noseWheelY, noseGearZ], 0.17, 8));
+  gear.add(rod(kit.metal, [0, -3.20, noseGearZ - 1.5], [0, -4.15, noseGearZ], 0.08, 6));
+  gear.add(rod(kit.metal, [-0.42, noseWheelY, noseGearZ], [0.42, noseWheelY, noseGearZ], 0.09, 6));
+  gear.add(wheel(kit, 0.42, noseWheelY, noseGearZ, noseWheelR, 0.36));
+  gear.add(wheel(kit, -0.42, noseWheelY, noseGearZ, noseWheelR, 0.36));
+  for (const side of [1, -1]) {
+    const nDoor = new THREE.Mesh(new THREE.BoxGeometry(0.08, 1.05, 2.2), kit.plain);
+    nDoor.position.set(side * 0.62, -3.65, noseGearZ - 0.3);
+    gear.add(nDoor);
+  }
   group.add(gear);
 
-  // Nav lights on swept wingtips & tail cone, beacons on upper-deck crown & belly.
-  navLights(group, kit, [wingSpan - 0.2, tipY + 0.12, -6.5], [0, tailY + 0.32, -16.1]);
-  group.add(dot(kit.beacon, 0, 3.72, 6.2, 0.22));
-  group.add(dot(kit.beacon, 0, -2.42, 4.5, 0.24));
+  // Wingtip nav lights, tailcone white light, upper-deck crown & belly beacons.
+  group.add(dot(kit.red, wingSpan - 0.2, tipY + 0.16, tip.le - 0.5, 0.34));
+  group.add(dot(kit.green, -(wingSpan - 0.2), tipY + 0.16, tip.le - 0.5, 0.34));
+  group.add(dot(kit.white, 0, 1.94, M(68.75), 0.28));
+  group.add(dot(kit.beacon, 0, 4.90, M(16.0), 0.42));
+  group.add(dot(kit.beacon, 0, -3.46, M(20.0), 0.42));
 
-  return finish(group, 0.67, kit, {
-    refuelPort: new THREE.Vector3(0, 1.92, 13.8),
-    landingLightPos: new THREE.Vector3(0, -0.65, 17.3), // just ahead of nose tip (z=16.45)
+  return finish(group, 0.345, kit, {
+    refuelPort: new THREE.Vector3(0, 2.25, M(3.6)),
+    landingLightPos: new THREE.Vector3(0, -1.2, M(-1.2)), // just ahead of nose radome (z=+34.3)
     landingGlowScale: 0.6,
   });
 }
@@ -1003,16 +1589,21 @@ export function makeFighterMesh(model) {
     group.add(splitter);
   }
 
+  // Sleek dark-tinted fighter bubble canopy with thin swept windscreen bow
+  // arch and slim canopy sill frame rails.
   const canopy = new THREE.Mesh(fuselage([
-    [1.6, 0.0001], [2.0, 0.35], [3.3, 0.55], [4.6, 0.42], [5.6, 0.0001],
-  ], { sy: 1.15, segments: 20 }).geo, kit.glass);
-  canopy.position.y = 0.72;
+    [1.3, 0.0001], [1.9, 0.28], [2.9, 0.48], [3.9, 0.50], [4.9, 0.38], [5.85, 0.0001],
+  ], { sx: 0.92, sy: 1.08, segments: 28 }).geo, kit.glass);
+  canopy.position.y = 0.62;
   group.add(canopy);
-  // Canopy bow frame between windscreen and bubble.
-  const bow = new THREE.Mesh(new THREE.TorusGeometry(0.5, 0.035, 6, 20, Math.PI), kit.dark);
-  bow.scale.y = 1.15;
-  bow.position.set(0, 0.72, 4.0);
+  const bow = new THREE.Mesh(new THREE.TorusGeometry(0.47, 0.022, 8, 24, Math.PI), kit.frame);
+  bow.scale.set(0.92, 1.08, 1);
+  bow.rotation.x = -0.22; // gently raked windscreen frame arch
+  bow.position.set(0, 0.63, 4.25);
   group.add(bow);
+  for (const side of [1, -1]) {
+    group.add(rod(kit.frame, [side * 0.41, 0.68, 2.2], [side * 0.34, 0.64, 5.1], 0.024, 6));
+  }
   // Nose pitot probe.
   group.add(rod(kit.metal, [0, noseDroop(9.3), 9.3], [0, noseDroop(9.3), 10.5], 0.025));
 
@@ -1100,11 +1691,15 @@ export function makeDroneMesh(model) {
   bodyMesh.name = 'fuselage';
   group.add(bodyMesh);
 
-  // Sensor turret under the nose, SATCOM and data-link antennas on the spine.
-  const mount = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.34, 0.5, 12), kit.plain);
-  mount.position.set(0, -1.0, 5.7);
+  // EO/IR sensor gimbal turret under the nose (matte housing + dark optical
+  // lens aperture), plus SATCOM and data-link antennas on the spine.
+  const mount = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.30, 0.42, 12), kit.dark);
+  mount.position.set(0, -0.98, 5.7);
   group.add(mount);
-  group.add(dot(kit.glass, 0, -1.4, 5.7, 0.5));
+  group.add(dot(kit.dark, 0, -1.32, 5.7, 0.42));
+  const lens = new THREE.Mesh(new THREE.CircleGeometry(0.18, 14), kit.glass);
+  lens.position.set(0, -1.35, 6.11);
+  group.add(lens);
   group.add(rod(kit.dark, [0, 0.95, -1.5], [0, 1.45, -1.9], 0.04));
   group.add(rod(kit.dark, [0, -0.9, -2.5], [0, -1.35, -2.8], 0.04));
 
@@ -1163,13 +1758,12 @@ export function makeTankerMesh(model) {
   const body = fuselage([
     [-16.4, 0.16], [-15.0, 0.72], [-12.2, 1.48], [-8.4, 2.08], [-5.0, 2.22],
     [10.2, 2.22], [12.6, 2.04], [14.4, 1.6], [15.8, 1.0], [16.6, 0.44], [17.0, 0.0001],
-  ], { sy: 1.06, warp, segments: 36 });
+  ], { sy: 1.06, warp, segments: 44 });
   const kit = paintKit(model, 'tanker', {
     zmin: body.zmin, zmax: body.zmax, circ: body.circ,
     bodyColor: TANKER_GREY.body, bellyColor: TANKER_GREY.belly, bellyA: 1.98,
-    radomeZ: 14.95, radomeColor: TANKER_GREY.radome,
-    antiGlare: { z0: 14.3, z1: 15.0, a: 0.44, color: TANKER_GREY.antiGlare },
-    cockpit: { z0: 13.5, z1: 14.35, a: 0.78, frameColor: TANKER_GREY.body },
+    radomeZ: 15.98, radomeColor: TANKER_GREY.radome,
+    antiGlare: { z0: 15.0, z1: 15.90, a: 0.25, color: TANKER_GREY.antiGlare },
     // Small crew observation ports only (no civil passenger window row).
     windows: { kind: 'row', a: 1.16, z0: 10.6, z1: 12.2, pitch: 0.8, w: 0.22, h: 0.26 },
     military: {
@@ -1181,6 +1775,19 @@ export function makeTankerMesh(model) {
   const bodyMesh = new THREE.Mesh(body.geo, kit.body);
   bodyMesh.name = 'fuselage';
   group.add(bodyMesh);
+
+  // Realistic 6-pane angular military transport flight-deck glazing
+  // (A330 MRTT / A400M class) in dark tinted glass with thin grey frames.
+  group.add(cockpitGlazingMesh(body, kit.windowGlass, [
+    { knots: [[0.045, 0.56, 1.18], [0.52, 0.57, 1.16], [1.02, 0.59, 1.14]], subdivS: 3, subdivY: 2 },
+    { knots: [[1.10, 0.59, 1.13], [1.94, 0.63, 1.08]], subdivS: 3, subdivY: 2 },
+    { knots: [[2.02, 0.64, 1.08], [2.78, 0.80, 0.98]], subdivS: 3, subdivY: 2 },
+  ], {
+    zSearchStart: 16.92,
+    zSearchEnd: 11.8,
+    offset: 0.028,
+    flatBlend: 0.8,
+  }));
 
   // Dorsal SATCOM & fuel-control fairing hump along the upper spine.
   const satcom = new THREE.Mesh(fuselage([
