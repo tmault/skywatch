@@ -1198,20 +1198,21 @@ fn apply_poll(
                 world.depart_by_callsign(&cs);
                 radio_events.push((cs, "thread done — departing into the horizon".to_string()));
             } else if runway.primed && taxi_ids.contains(&id) {
-                let arrival_slot = owning_ap
-                    .as_ref()
-                    .filter(|ap| !ap.is_home && !ap.gates.is_empty())
-                    .map(|ap| {
-                        let idx = gates.slots.get(&id).copied().unwrap_or(0);
-                        (ap.gates[idx % ap.gates.len()], GATE_HEADING)
-                    })
+                // Park where this thread sits on the taxiway: its home queue
+                // slot, or its gate at a satellite airport.
+                let arrival_slot = data
+                    .taxiway
+                    .iter()
+                    .position(|e| e.thread_id == id)
+                    .map(|i| taxiway_slot(&data.taxiway, i, &world.airports, gates))
                     .unwrap_or(TAXIWAY_QUEUE[0]);
                 if world
                     .get_mut(&cs)
                     .map(|a| a.begin_approach(Some(arrival_slot)))
                     .unwrap_or(false)
                 {
-                    // Turn finished: fly the approach, land and backtrack to the owning airport's slot.
+                    // Turn finished: fly the approach, land, vacate at the far
+                    // end of the runway and taxi to the owning airport's slot.
                     runway.arrivals.insert(id, cs.clone());
                     radio_events.push((cs, "on approach, Runway 36".to_string()));
                 } else {
@@ -1378,7 +1379,7 @@ fn apply_poll(
                 .get_mut(&acs)
                 .map(|a| a.state == State::Ready && a.arrival_slot().is_some());
             match arrived {
-                // Still landing or backtracking: it becomes this TX when it arrives.
+                // Still landing or taxiing from the far-end exit: it becomes this TX when it arrives.
                 Some(false) => continue,
                 Some(true) => {
                     world.rename(&acs, &cs);
@@ -2326,7 +2327,8 @@ mod tests {
         let mut touchdowns = 0;
         let mut prev_state = State::Landing;
         let mut prev_pos = world.get_mut("SKY1").unwrap().position;
-        for step in 0..4000 {
+        // Shallow circuit, far-end rollout and the taxi back take a while.
+        for step in 0..12000 {
             world.tick(0.05);
             apply_poll(&mut world, "omarchy", poll(false), &mut callsigns, &mut taxiway_cs, &mut gates, &mut wingmen, &mut runway);
             let a = world.aircraft.iter().find(|a| a.id == a_id).unwrap();

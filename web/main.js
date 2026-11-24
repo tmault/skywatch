@@ -125,7 +125,7 @@ scene.add(rim);
 let homeRunwayLights = null;
 const runwayEvents = createRunwayEvents(scene, {
   x: 56, zMin: -76, zMax: 56, halfWidth: 10.6, deckY: TARMAC_TOP_Y,
-  glideFrom: [276, 42], touchdownZ: 34,
+  glideFrom: [276], touchdownZ: 34,
 });
 
 /* ----------------------------------------------------------- airports */
@@ -296,6 +296,18 @@ function buildHomeAirport(ap) {
     island.add(makeMarking(20, 0.8, 72, cz, markY, yellowLineMat));
   }
 
+  // Arrival return loop passes north of Alpha's six holding slots.
+  // Matches the server route: (56,-66) -> (70,-66) -> (70,-88)
+  // -> (103,-88) -> apron. Departures keep the south threshold entrance.
+  for (const [w, h, x, z] of [[14, 22, 70, -77], [33, 12, 86.5, -88]]) {
+    const loop = makeDeckSlab(w, h, TARMAC_TOP_Y, 0.4, taxiMat);
+    loop.position.set(x, loop.position.y, z);
+    island.add(loop);
+  }
+  island.add(makeMarking(14, 0.8, 63, -66, markY, yellowLineMat));
+  island.add(makeMarking(0.8, 22, 70, -77, markY, yellowLineMat));
+  island.add(makeMarking(33, 0.8, 86.5, -88, markY, yellowLineMat));
+
   // Wide South Departure Holding Bay at [74, 46] with hold-short bars & guard lights.
   const holdBay = makeDeckSlab(24, 22, TARMAC_TOP_Y, 0.4, taxiMat);
   holdBay.position.set(74, holdBay.position.y, 46);
@@ -457,6 +469,18 @@ function buildSatelliteAirport(ap, idx) {
     }
   }
 
+  // Painted lead-in/lead-off lines matching the server's satellite routes:
+  // departures join at the south threshold (z = 30) from the apron lane
+  // (x = 16); arrivals vacate at the far (north) end (z = -30.5).
+  for (const z of [30, -30.5]) {
+    const connector = makeDeckSlab(12, 6, TARMAC_TOP_Y - 0.03, 0.35, apronMat);
+    connector.position.set(10, connector.position.y, z);
+    island.add(connector);
+  }
+  island.add(makeMarking(12, 0.7, 10, 30, markY, yellowLineMat));
+  island.add(makeMarking(12, 0.7, 10, -30.5, markY, yellowLineMat));
+  island.add(makeMarking(0.7, 61.2, 16, -0.25, markY, yellowLineMat));
+
   // Elevated apron + small terminal + 4 gates.
   const apron = makeDeckSlab(24, 70, TARMAC_TOP_Y - 0.05, 0.35, apronMat);
   apron.position.x = 25;
@@ -495,7 +519,7 @@ function buildSatelliteAirport(ap, idx) {
   scene.add(island);
   const satRunwayEvents = createRunwayEvents(scene, {
     x: cx + 4, zMin: cz - 36.5, zMax: cz + 36.5, halfWidth: 8.1, deckY: TARMAC_TOP_Y,
-    glideFrom: [cz + 115, 28], touchdownZ: cz + 22,
+    glideFrom: [cz + 192], touchdownZ: cz + 22,
   });
   const entry = {
     id: ap.id,
