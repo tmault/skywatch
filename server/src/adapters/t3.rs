@@ -182,6 +182,8 @@ impl TaxiwayCallsigns {
 #[derive(Default)]
 struct GateCallsigns {
     by_thread: HashMap<String, String>,
+    /// Sticky gate index per thread: a plane stays put when another leaves.
+    slots: HashMap<String, usize>,
     next: usize,
 }
 
@@ -193,6 +195,34 @@ impl GateCallsigns {
             self.by_thread.insert(thread_id.to_string(), cs.clone());
             cs
         })
+    }
+}
+
+impl GateCallsigns {
+    /// Give every parked thread a gate that never changes while it stays parked;
+    /// new arrivals take the lowest free gate at their airport.
+    fn assign_slots(&mut self, entries: &[ThreadListEntry], airports: &[Airport]) {
+        let ids: HashSet<&String> = entries.iter().map(|e| &e.thread_id).collect();
+        self.slots.retain(|id, _| ids.contains(id));
+        for e in entries {
+            if self.slots.contains_key(&e.thread_id) {
+                continue;
+            }
+            let env = remote::owner(&e.thread_id).map(|o| o.0);
+            let capacity = env
+                .as_ref()
+                .and_then(|id| airports.iter().find(|ap| &ap.id == id))
+                .map(|ap| ap.gates.len())
+                .unwrap_or(HOME_GATES.len())
+                .max(1);
+            let used: HashSet<usize> = entries
+                .iter()
+                .filter(|o| remote::owner(&o.thread_id).map(|x| x.0) == env)
+                .filter_map(|o| self.slots.get(&o.thread_id).copied())
+                .collect();
+            let slot = (0..capacity).find(|s| !used.contains(s)).unwrap_or(self.slots.len() % capacity);
+            self.slots.insert(e.thread_id.clone(), slot);
+        }
     }
 }
 
@@ -780,6 +810,11 @@ fn retarget_ground(a: &mut Aircraft, slot: [f32; 2], heading: f32, next: State) 
 fn ground_slot(entries: &[ThreadListEntry], i: usize, airports: &[Airport], taxi: bool) -> ([f32;2], f32) {
     let env = remote::owner(&entries[i].thread_id).map(|o| o.0);
     let slot = entries[..i].iter().filter(|e| remote::owner(&e.thread_id).map(|o|o.0) == env).count();
+    slot_position(&entries[i].thread_id, slot, airports, taxi)
+}
+
+fn slot_position(thread_id: &str, slot: usize, airports: &[Airport], taxi: bool) -> ([f32;2], f32) {
+    let env = remote::owner(thread_id).map(|o| o.0);
     if let Some(ap) = env.and_then(|id| airports.iter().find(|ap| ap.id == id)) {
         return (ap.gates[slot % ap.gates.len()], GATE_HEADING);
     }
@@ -1194,9 +1229,11 @@ fn apply_poll(
         }
     }
 
-    for (i, entry) in data.stale.iter().enumerate() {
+    gates.assign_slots(&data.stale, &world.airports);
+    for entry in data.stale.iter() {
         let cs = gates.get(&entry.thread_id);
-        let (slot, _) = ground_slot(&data.stale, i, &world.airports, false);
+        let gate_index = gates.slots.get(&entry.thread_id).copied().unwrap_or(0);
+        let (slot, _) = slot_position(&entry.thread_id, gate_index, &world.airports, false);
         if let Some(a) = world.get_mut(&cs) {
             a.title = Some(entry.title.clone());
             a.model = entry.model.clone();
@@ -1214,7 +1251,7 @@ fn apply_poll(
             a.topic = None;
             a.device = Some(home_name.to_string());
             world.add(a);
-            radio_events.push((cs.clone(), format!("parked at gate {}", i + 1)));
+            radio_events.push((cs.clone(), format!("parked at gate {}", gate_index + 1)));
         }
     }
 
@@ -1597,6 +1634,21 @@ mod tests {
         assert_eq!(parse_rfc3339("1970-01-02T00:00:00Z"), Some(86400));
         assert!(parse_rfc3339("2026-11-01T17:39:45.542Z").is_some());
         assert_eq!(parse_rfc3339("garbage"), None);
+    }
+
+    #[test]
+    fn gate_slots_stay_put_when_another_plane_leaves() {
+        let mut gates = GateCallsigns::default();
+        let e = |id: &str| make_entry(id, id, "idle");
+        gates.assign_slots(&[e("a"), e("b"), e("c")], &[]);
+        let before: Vec<usize> = ["a", "b", "c"].iter().map(|k| gates.slots[*k]).collect();
+        assert_eq!(before, vec![0, 1, 2]);
+        // "a" leaves; b and c keep their gates, and a newcomer takes the freed one.
+        gates.assign_slots(&[e("b"), e("c")], &[]);
+        assert_eq!((gates.slots["b"], gates.slots["c"]), (1, 2));
+        gates.assign_slots(&[e("d"), e("b"), e("c")], &[]);
+        assert_eq!(gates.slots["d"], 0);
+        assert_eq!((gates.slots["b"], gates.slots["c"]), (1, 2));
     }
 
     #[test]
