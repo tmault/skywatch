@@ -1084,12 +1084,13 @@ function makeContrailsFor(a) {
     })];
   }
   if (isFlagshipAgent(a)) {
-    // Flagship 747 streams four crisp high-altitude contrails from its four engines!
+    // Flagship 747-400 streams four crisp high-altitude contrails from its
+    // four underwing turbofan exhausts (model space is in true metres).
     return [
-      [-9.3, -1.42, -3.65],
-      [-5.1, -1.98, -0.58],
-      [5.1, -1.98, -0.58],
-      [9.3, -1.42, -3.65],
+      [-21.2, -1.07, -7.0],
+      [-11.9, -2.47, 1.2],
+      [11.9, -2.47, 1.2],
+      [21.2, -1.07, -7.0],
     ].map((localOffset) => new ContrailRibbon({
       localOffset,
       maxPoints: 130,
