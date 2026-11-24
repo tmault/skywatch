@@ -13,6 +13,8 @@ use crate::world::{
     Sector, State, World, GATE_HEADING, HOME_GATES, PROJECT_SECTOR_RADIUS, PROJECT_SECTOR_SLOTS,
     RUNWAY_HEADING, RUNWAY_THRESHOLD, SATELLITE_SLOTS, TAXIWAY_QUEUE,
 };
+#[cfg(test)]
+use crate::world::wrap_centered;
 use crate::ws::{ClientFrame, SharedWorld};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -1916,6 +1918,77 @@ mod tests {
         assert!(rolled, "should roll down the runway");
         assert_eq!(a.state, State::Cruising);
         assert!(a.altitude > 80.0);
+    }
+
+    #[test]
+    fn repeated_polls_during_arrival_do_not_reset_or_duplicate_landing() {
+        let mut world = World::new();
+        let mut callsigns = Callsigns::default();
+        let mut taxiway_cs = TaxiwayCallsigns::default();
+        let mut gates = GateCallsigns::default();
+        let mut wingmen = Wingmen::default();
+        let mut runway = RunwayOps::default();
+
+        let now = 1_700_000_000;
+        let poll = |running: bool| PollData {
+            omitted: 0,
+            airports: vec![Airport::home("local", "omarchy")],
+            flying: if running {
+                vec![(make_entry("t-1", "Thread", "running"), 0)]
+            } else {
+                vec![]
+            },
+            taxiway: if running {
+                vec![]
+            } else {
+                vec![make_entry("t-1", "Thread", "idle")]
+            },
+            stale: vec![],
+            done_or_archived: HashSet::new(),
+            subagents: vec![],
+            now,
+        };
+        // Running at startup: appears in the air.
+        apply_poll(&mut world, "omarchy", poll(true), &mut callsigns, &mut taxiway_cs, &mut gates, &mut wingmen, &mut runway);
+        assert_eq!(world.get_mut("SKY1").unwrap().state, State::Cruising);
+        // Thread stops: the aircraft turns into an arrival.
+        apply_poll(&mut world, "omarchy", poll(false), &mut callsigns, &mut taxiway_cs, &mut gates, &mut wingmen, &mut runway);
+        assert_eq!(world.get_mut("SKY1").unwrap().state, State::Landing);
+        // Track by id: when the arrival vacates the runway it is renamed to
+        // its holding-short callsign (TX1) — identity must survive that.
+        let a_id = world.get_mut("SKY1").unwrap().id;
+
+        // Identical polls keep arriving through the whole approach, rollout
+        // and backtrack: identity persists, motion stays bounded, and the
+        // touchdown happens exactly once.
+        let mut touchdowns = 0;
+        let mut prev_state = State::Landing;
+        let mut prev_pos = world.get_mut("SKY1").unwrap().position;
+        for step in 0..4000 {
+            world.tick(0.05);
+            apply_poll(&mut world, "omarchy", poll(false), &mut callsigns, &mut taxiway_cs, &mut gates, &mut wingmen, &mut runway);
+            let a = world.aircraft.iter().find(|a| a.id == a_id).unwrap();
+            if a.state == State::Landed && prev_state != State::Landed {
+                touchdowns += 1;
+            }
+            // Torus-aware: a legitimate boundary crossing must not read as a
+            // teleport, while any real snap stays larger than the bound.
+            let d = wrap_centered(a.position[0] - prev_pos[0])
+                .hypot(wrap_centered(a.position[1] - prev_pos[1]));
+            assert!(d < 3.0, "unbounded per-tick motion at {step}: {d}");
+            prev_state = a.state;
+            prev_pos = a.position;
+            if matches!(a.state, State::Ready | State::Parked) && a.speed < 0.5 {
+                break;
+            }
+        }
+        let a = world.aircraft.iter().find(|a| a.id == a_id).unwrap();
+        assert!(
+            matches!(a.state, State::Ready | State::Parked),
+            "arrival never finished: {:?}",
+            a.state
+        );
+        assert_eq!(touchdowns, 1, "expected exactly one touchdown");
     }
 
     #[test]

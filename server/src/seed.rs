@@ -72,7 +72,9 @@ pub fn seed(world: &mut World) {
             }
             "SKY3" => {
                 a.title = Some("Fix flaky integration test".to_string());
-                a.land();
+                // Hold position on the runway until the script clears it for
+                // takeoff at cycle 3 (a real landing would auto-exit to a gate).
+                a.hold_on_runway();
             }
             "REAP1" => a.title = Some("Tower health monitor".to_string()),
             "REAP2" => a.title = Some("Nightly backup cron".to_string()),
@@ -285,6 +287,24 @@ mod tests {
         run_cycle(&mut world, 2);
         let a = world.iter().find(|a| a.callsign == "SKY1").unwrap();
         assert_eq!(a.state, State::Takeoff);
+    }
+
+    #[test]
+    fn sky3_holds_on_runway_until_script_releases_it() {
+        let mut world = World::new();
+        seed(&mut world);
+        // Tick up to the cycle-3 release: SKY3 must still be holding on the
+        // runway, never auto-cleared to a gate or arrival slot.
+        for _ in 0..((180.0 - 1.0) / 0.05) as usize {
+            world.tick(0.05);
+        }
+        let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
+        assert_eq!(a.state, State::Landed, "SKY3 must hold until cycle 3");
+        let d = (a.position[0] - RUNWAY_MID[0]).hypot(a.position[1] - RUNWAY_MID[1]);
+        assert!(d < 1.0, "SKY3 must not have taxied off: {:?}", a.position);
+        run_cycle(&mut world, 3);
+        let a = world.iter().find(|a| a.callsign == "SKY3").unwrap();
+        assert_eq!(a.state, State::Taxi, "SKY3 must be cleared for takeoff");
     }
 
     #[test]

@@ -171,6 +171,12 @@ pub struct Aircraft {
     /// Ground timer: auto-taxi after landing, hold-short before takeoff.
     #[serde(skip)]
     ground_timer: f32,
+    /// Set once the aircraft has genuinely landed (or been placed on the deck
+    /// via `land()`) and must clear the runway to a gate or arrival slot.
+    /// Aircraft seeded on the runway holding for a takeoff clearance stay
+    /// `Landed` without this flag, so the tower never auto-clears them off.
+    #[serde(skip)]
+    must_clear_runway: bool,
     /// Current taxi speed (m/s) for bounded acceleration and braking.
     #[serde(skip)]
     ground_speed: f32,
@@ -248,6 +254,8 @@ const CPA_LOOKAHEAD: f32 = 10.0;      // seconds of own velocity predicted for C
 const CPA_HORIZ_BUFFER: f32 = 26.0;   // predicted horizontal clearance that triggers avoidance
 const CPA_VERT_BUFFER: f32 = 14.0;    // ...and vertical
 const VERT_HARD_RATE: f32 = 40.0;     // u/s max rate of the hard vertical floor
+const TCAS_SOFT_VERT_RATE: f32 = 14.0; // u/s soft vertical separation rate (scaled by urgency)
+const ALT_EASE_RATE: f32 = 10.0;       // u/s bounded easing rate toward a target altitude
 
 /// Home airport geometry (matches the client's island rendering).
 pub const RUNWAY_MID: [f32; 2] = [56.0, -10.0];
@@ -303,7 +311,21 @@ const FINAL_APPROACH_FIX: [f32; 2] = [RUNWAY_THRESHOLD[0], RUNWAY_THRESHOLD[1] +
 const APPROACH_ALT: f32 = 42.0;
 /// Main-gear touchdown point just past the threshold.
 const TOUCHDOWN_Z: f32 = RUNWAY_THRESHOLD[1] - 12.0;
-const ROLLOUT_DECEL: f32 = 5.0; // m/s^2 braking after touchdown
+/// Far end of Runway 36 in the landing direction; rollout must stop short of it.
+const RUNWAY_END_Z: f32 = -76.0;
+/// Glide-shape exponent: >1 flattens the final descent into a natural flare,
+/// easing the descent rate toward zero at the touchdown point.
+const FLARE_EXP: f32 = 1.35;
+/// Bounded vertical correction rates (u/s) while tracking the shaped glide.
+const GLIDE_DESCENT_RATE: f32 = 12.0;
+const GLIDE_CLIMB_RATE: f32 = 10.0;
+/// A runway occupancy this close (u) to the touchdown point forces a go-around.
+const GOAROUND_BLOCKED_DIST: f32 = 150.0;
+/// Rollout braking (m/s^2): base wheel braking plus a speed-proportional fade
+/// so the stop eases out; the emergency cap guarantees stopping short of the end.
+const ROLLOUT_BRAKE_BASE: f32 = 3.0;
+const ROLLOUT_BRAKE_FADE: f32 = 0.10;
+const ROLLOUT_BRAKE_MAX: f32 = 8.0;
 
 /// Satellite device airport coordinates placed in open water clear of sectors.
 pub const SATELLITE_SLOTS: [[f32; 2]; 5] = [
@@ -316,7 +338,7 @@ pub const SATELLITE_SLOTS: [[f32; 2]; 5] = [
 
 /// Wrap a coordinate into [-AREA_SIZE/2, AREA_SIZE/2) so the world is
 /// centred on the origin (where the home island sits).
-fn wrap_centered(v: f32) -> f32 {
+pub(crate) fn wrap_centered(v: f32) -> f32 {
     (v + AREA_SIZE / 2.0).rem_euclid(AREA_SIZE) - AREA_SIZE / 2.0
 }
 
@@ -524,6 +546,7 @@ impl Aircraft {
             taxi_next: None,
             cleared_for_takeoff: false,
             ground_timer: 0.0,
+            must_clear_runway: false,
             ground_speed: 0.0,
             ground_blocked: false,
             runway_occupied: false,
@@ -698,7 +721,8 @@ impl Aircraft {
             self.turn_toward(dz.atan2(dx), (0.6 + 20.0 / dist.max(1.0)) * dt);
             // Descend (or climb after a go-around) to cross the fix at approach altitude.
             let time_left = (dist / self.speed.max(1.0)).max(1.0);
-            let rate = ((self.altitude - APPROACH_ALT) / time_left).clamp(-6.0, 14.0);
+            let rate = ((self.altitude - APPROACH_ALT) / time_left)
+                .clamp(-GLIDE_CLIMB_RATE, GLIDE_DESCENT_RATE);
             self.altitude -= rate * dt;
             if dist < 30.0 {
                 self.on_final = true;
@@ -708,32 +732,57 @@ impl Aircraft {
             let aim_z = (pz - 70.0).max(TOUCHDOWN_Z - 60.0);
             self.turn_toward((aim_z - pz).atan2(RUNWAY_THRESHOLD[0] - px), 0.9 * dt);
             let frac = ((pz - TOUCHDOWN_Z) / (FINAL_APPROACH_FIX[1] - TOUCHDOWN_Z)).clamp(0.0, 1.0);
-            let glide = APPROACH_ALT * frac;
-            if self.altitude > glide {
-                self.altitude = (self.altitude - 10.0 * dt).max(glide);
+            let mut dh = self.heading - RUNWAY_HEADING;
+            while dh > std::f32::consts::PI {
+                dh -= std::f32::consts::TAU;
             }
-            if pz <= TOUCHDOWN_Z + 1.0 {
-                let mut dh = self.heading - RUNWAY_HEADING;
-                while dh > std::f32::consts::PI {
-                    dh -= std::f32::consts::TAU;
-                }
-                while dh < -std::f32::consts::PI {
-                    dh += std::f32::consts::TAU;
-                }
-                let lined_up = (px - RUNWAY_THRESHOLD[0]).abs() < 5.0 && dh.abs() < 0.2;
-                if lined_up && self.altitude < 2.0 && !self.runway_occupied {
-                    // Touchdown: roll out along the centerline.
-                    self.state = State::Landed;
-                    self.on_final = false;
-                    self.altitude = 0.0;
-                    self.position[0] = RUNWAY_THRESHOLD[0];
-                    self.position[2] = 0.0;
-                    self.heading = RUNWAY_HEADING;
-                    self.ground_timer = 0.0;
-                    return;
-                }
-                // Not lined up: go around and fly the approach again.
+            while dh < -std::f32::consts::PI {
+                dh += std::f32::consts::TAU;
+            }
+            // Blocked runway: go around well before the threshold. The inbound
+            // phase re-captures the fix; the window is finite, so a still-blocked
+            // runway just starts the cycle again instead of stalling.
+            if self.runway_occupied && (pz - TOUCHDOWN_Z) < GOAROUND_BLOCKED_DIST {
                 self.on_final = false;
+            } else if frac < 0.5
+                && ((px - RUNWAY_THRESHOLD[0]).abs() > 18.0 + 12.0 * frac
+                    || dh.abs() > 0.3 + 0.6 * frac)
+            {
+                // Committed to the approach and no longer recoverable: go
+                // around continuously. Tolerances stay well outside what the
+                // pure-pursuit alignment can still correct (it has the rest of
+                // final plus the threshold gate to finish the job), so a
+                // normal capture never flaps into a go-around cycle.
+                self.on_final = false;
+            }
+            if self.on_final {
+                // Shaped glide: a power curve that flattens into a flare, so
+                // the descent rate eases to zero at the touchdown point. The
+                // correction is bounded and works both ways — a too-low
+                // approach climbs back to the path instead of clipping short.
+                let desired = APPROACH_ALT * frac.powf(FLARE_EXP);
+                self.altitude += (desired - self.altitude)
+                    .clamp(-GLIDE_DESCENT_RATE * dt, GLIDE_CLIMB_RATE * dt);
+                if pz <= TOUCHDOWN_Z + 1.0 {
+                    // The pursuit oscillation damps out slowly, so the last
+                    // gate is deliberately forgiving — a 6u / 0.25 rad
+                    // touchdown is still well inside the 21u-wide runway.
+                    let lined_up = (px - RUNWAY_THRESHOLD[0]).abs() < 6.0 && dh.abs() < 0.25;
+                    if lined_up && self.altitude < 2.0 && !self.runway_occupied {
+                        // Touchdown: roll out along the centerline. The flare
+                        // already has us on the deck — no position snap; the
+                        // Landed state eases the heading onto the centerline.
+                        self.state = State::Landed;
+                        self.must_clear_runway = true;
+                        self.on_final = false;
+                        self.altitude = 0.0;
+                        self.position[2] = 0.0;
+                        self.ground_timer = 0.0;
+                        return;
+                    }
+                    // Not lined up: go around and fly the approach again.
+                    self.on_final = false;
+                }
             }
         }
         self.advance(dt);
@@ -750,7 +799,7 @@ impl Aircraft {
         let cruise = self.cruise_speed();
         let transit = cruise * (1.0 + (dist / 180.0).clamp(0.0, 0.65));
         self.speed += (transit - self.speed).clamp(-5.0 * dt, 5.0 * dt);
-        self.altitude += (target_alt - self.altitude).clamp(-10.0 * dt, 10.0 * dt);
+        self.altitude += (target_alt - self.altitude).clamp(-ALT_EASE_RATE * dt, ALT_EASE_RATE * dt);
         let heading = if dist > 4.0 { dz.atan2(dx) } else { path_heading };
         self.turn_toward(heading, 0.65 * dt);
         self.advance(dt);
@@ -845,6 +894,7 @@ impl Aircraft {
         match self.state {
             // On the ground: taxi to the runway threshold, hold short, then roll.
             State::Parked | State::Landed | State::Taxi | State::Ready => {
+                self.must_clear_runway = false;
                 let d = (self.position[0] - RUNWAY_THRESHOLD[0])
                     .hypot(self.position[1] - RUNWAY_THRESHOLD[1]);
                 self.speed = 0.0;
@@ -896,8 +946,8 @@ impl Aircraft {
         self.taxi_waypoints.push(RUNWAY_THRESHOLD);
     }
 
-    /// Touch down: roll out, then wait for World::tick to assign a free gate.
-    pub fn land(&mut self) {
+    /// Common on-deck state for an aircraft in the Landed state.
+    fn start_landed(&mut self) {
         self.state = State::Landed;
         self.speed = 0.0;
         self.on_final = false;
@@ -915,11 +965,16 @@ impl Aircraft {
         self.departure_heading = None;
         self.taxi_waypoints.clear();
         self.taxi_next = None;
-        // Touch down mid-runway, rolling north.
-        self.position[0] = RUNWAY_MID[0];
-        self.position[1] = RUNWAY_MID[1];
-        self.heading = RUNWAY_HEADING;
         self.ground_timer = 0.0;
+    }
+
+    /// Seeded on the runway holding for a takeoff clearance: hold position in
+    /// the Landed state until `release()` clears it. World::tick must not
+    /// assign such an aircraft a gate or arrival slot.
+    pub fn hold_on_runway(&mut self) {
+        self.start_landed();
+        self.must_clear_runway = false;
+        self.heading = RUNWAY_HEADING;
     }
 
     /// True if this aircraft is taxiing out for or flying a final farewell departure.
@@ -1017,7 +1072,8 @@ impl Aircraft {
                 (self.patrol_angle + (TANKER_SPEED / ds_dt) * dt) % std::f32::consts::TAU;
             let ([x, z], heading) = tanker_orbit_point(self.patrol_angle, rot);
             let target_alt = self.cruise_altitude();
-            self.altitude += (target_alt - self.altitude).clamp(-10.0 * dt, 10.0 * dt);
+            self.altitude +=
+                (target_alt - self.altitude).clamp(-ALT_EASE_RATE * dt, ALT_EASE_RATE * dt);
             self.position = [x, z, self.altitude];
             self.heading = heading;
             self.speed = TANKER_SPEED;
@@ -1029,7 +1085,8 @@ impl Aircraft {
                 // Driven in formation by `World::tick` once linked to a provider tanker;
                 // if ticked standalone (e.g. in unit tests), hold a calm high orbit.
                 let target_alt = TANKER_BASE_ALTITUDE - 10.0;
-                self.altitude += (target_alt - self.altitude).clamp(-10.0 * dt, 10.0 * dt);
+                self.altitude +=
+                    (target_alt - self.altitude).clamp(-ALT_EASE_RATE * dt, ALT_EASE_RATE * dt);
                 self.position[2] = self.altitude;
                 self.advance(dt);
             }
@@ -1148,7 +1205,7 @@ impl Aircraft {
                 }
                 // Ease to the (possibly TCAS-offset) cruise altitude; never snap.
                 self.altitude += (base_alt + self.sep_offset[2] - self.altitude)
-                    .clamp(-10.0 * dt, 10.0 * dt);
+                    .clamp(-ALT_EASE_RATE * dt, ALT_EASE_RATE * dt);
                 if self.joining {
                     // Unassigned: still accelerating to cruise speed on the current heading.
                     self.speed += (self.cruise_speed() - self.speed).clamp(-5.0 * dt, 5.0 * dt);
@@ -1165,8 +1222,26 @@ impl Aircraft {
                 // free gate (or the arrival slot) after the landing pause.
                 self.altitude = 0.0;
                 self.position[2] = 0.0;
+                // Ease onto the centerline heading (touchdown no longer snaps it).
+                let mut dh = RUNWAY_HEADING - self.heading;
+                while dh > std::f32::consts::PI {
+                    dh -= std::f32::consts::TAU;
+                }
+                while dh < -std::f32::consts::PI {
+                    dh += std::f32::consts::TAU;
+                }
+                self.heading += dh.clamp(-1.5 * dt, 1.5 * dt);
                 if self.speed > 0.3 {
-                    self.speed = (self.speed - ROLLOUT_DECEL * dt).max(0.0);
+                    // Speed-dependent rollout: wheel braking fades as speed
+                    // drops so the stop eases out, and an emergency boost
+                    // guarantees we still stop short of the far end of the
+                    // runway even from a fast, short touchdown.
+                    let v = self.speed;
+                    let remaining = (self.position[1] - RUNWAY_END_Z).max(1.0);
+                    let a_req = (v * v) / (2.0 * remaining);
+                    let a = (ROLLOUT_BRAKE_BASE + ROLLOUT_BRAKE_FADE * v)
+                        .max(a_req.min(ROLLOUT_BRAKE_MAX));
+                    self.speed = (self.speed - a * dt).max(0.0);
                     self.advance(dt);
                 } else {
                     self.speed = 0.0;
@@ -1851,6 +1926,7 @@ impl World {
             .filter(|a| {
                 a.parent_id.is_none()
                     && a.state == State::Landed
+                    && a.must_clear_runway
                     && a.ground_timer >= TAXI_DELAY_AFTER_LANDING
             })
             .map(|a| a.id)
@@ -2111,7 +2187,7 @@ impl World {
                     .max(1.0 - h_pred / CPA_HORIZ_BUFFER)
                     .max(1.0 - vdist / TCAS_VERT_BUFFER)
                     .clamp(0.15, 1.0);
-                let vert_step = 14.0 * urgency * dt;
+                let vert_step = TCAS_SOFT_VERT_RATE * urgency * dt;
 
                 // Vertical resolution: both aircraft separate, at a bounded rate.
                 push[c][2] -= sgn * vert_step;
@@ -2402,8 +2478,11 @@ mod tests {
         }
 
         // Land a plane — it must claim the only free gate (HOME_GATES[last]).
+        // Simulate a real landing: on the deck, and it must clear the runway.
         let mut arriving = Aircraft::new("SKY9", Kind::Agent);
-        arriving.land();
+        arriving.position = [RUNWAY_MID[0], RUNWAY_MID[1], 0.0];
+        arriving.hold_on_runway();
+        arriving.must_clear_runway = true;
         world.add(arriving);
 
         for _ in 0..600 {
@@ -2417,7 +2496,9 @@ mod tests {
 
         // Land another plane when ALL gates are full — must stay Landed, never overlap!
         let mut overflow = Aircraft::new("SKY10", Kind::Agent);
-        overflow.land();
+        overflow.position = [RUNWAY_MID[0], RUNWAY_MID[1] + 20.0, 0.0];
+        overflow.hold_on_runway();
+        overflow.must_clear_runway = true;
         world.add(overflow);
         for _ in 0..200 {
             world.tick(0.1);
@@ -2452,11 +2533,12 @@ mod tests {
 
         let dt = 0.05;
         // Worst-case per-tick relative growth: both planes get the full soft
-        // vertical step (14 u/s) plus the rate-limited hard floor
-        // (VERT_HARD_RATE), while only the evader moves laterally (18 u/s).
-        // Derived from the rate constants so the caps can't drift out of sync.
+        // vertical step plus the rate-limited hard floor, on top of the
+        // bounded easing each does toward its own (TCAS-offset) target
+        // altitude; only the evader moves laterally (18 u/s). Derived from
+        // the rate constants so the caps can't drift out of sync.
         let max_dh = 18.0 * dt + 0.5;
-        let max_dv = 2.0 * (14.0 + VERT_HARD_RATE) * dt + 0.25;
+        let max_dv = 2.0 * (TCAS_SOFT_VERT_RATE + VERT_HARD_RATE + ALT_EASE_RATE) * dt + 0.25;
         let (mut prev_h, mut prev_v) = (0.0f32, 0.0f32);
         for step in 0..200 {
             world.tick(dt);
@@ -2569,7 +2651,8 @@ mod tests {
                 }
             }
             let p = landed_at.unwrap_or_else(|| panic!("approach {i} never landed"));
-            assert!((p[0] - RUNWAY_THRESHOLD[0]).abs() < 0.01);
+            // No touchdown snap: within the lined-up tolerance of the centerline.
+            assert!((p[0] - RUNWAY_THRESHOLD[0]).abs() < 7.0, "touchdown x {p:?}");
             assert!((p[1] - TOUCHDOWN_Z).abs() < 3.0, "touched down at {p:?}");
             // Rollout stops on the runway (which ends at z = -77).
             for _ in 0..400 {
@@ -2578,6 +2661,185 @@ mod tests {
             assert_eq!(a.speed, 0.0);
             assert!(a.position[1] > -70.0, "overran the runway: {:?}", a.position);
         }
+    }
+
+    /// Arrivals from several spawn points and both approach speeds must flare
+    /// gently onto the centerline, touch down on the deck (no clip, no
+    /// float), and stop well short of the far end of the runway.
+    #[test]
+    fn arrival_flares_and_stops_within_runway() {
+        for (cs, model, start) in [
+            ("FL1", ModelClass::Frontier, [56.0, 300.0, 60.0]),
+            ("FL2", ModelClass::Frontier, [90.0, 240.0, 30.0]),
+            ("FL3", ModelClass::Local, [24.0, 320.0, 90.0]),
+        ] {
+            let mut world = World::new();
+            let mut a = Aircraft::with_model(cs, Kind::Agent, model);
+            a.state = State::Cruising;
+            a.position = start;
+            a.altitude = start[2];
+            a.heading = RUNWAY_HEADING;
+            a.speed = a.approach_speed();
+            assert!(a.begin_approach(None));
+            world.add(a);
+
+            let mut prev_alt = start[2];
+            let mut landed_at: Option<([f32; 2], usize)> = None;
+            let mut max_climb = 0.0f32;
+            let mut max_descent = 0.0f32;
+            let mut early_rates = Vec::new();
+            let mut late_rates = Vec::new();
+            let mut clipped = false;
+            let mut min_z = f32::MAX;
+            for step in 0..2400 {
+                world.tick(0.05);
+                let a = &world.aircraft[0];
+                let rate = (a.altitude - prev_alt) / 0.05;
+                prev_alt = a.altitude;
+                if a.state == State::Landing && a.on_final {
+                    if rate < 0.0 {
+                        let r = -rate;
+                        if a.position[1] < TOUCHDOWN_Z + 50.0 {
+                            late_rates.push(r);
+                        } else if a.position[1] > TOUCHDOWN_Z + 180.0 {
+                            early_rates.push(r);
+                        }
+                        max_descent = max_descent.max(r);
+                    } else {
+                        max_climb = max_climb.max(rate);
+                    }
+                }
+                if a.state == State::Landing && a.altitude < 0.0 {
+                    clipped = true;
+                }
+                if a.state == State::Landed {
+                    landed_at.get_or_insert(([a.position[0], a.position[1]], step));
+                    min_z = min_z.min(a.position[1]);
+                    if a.speed == 0.0 && step - landed_at.unwrap().1 > 20 {
+                        break;
+                    }
+                }
+            }
+            let (td, _) = landed_at.unwrap_or_else(|| panic!("{cs} never landed"));
+            assert!((td[0] - RUNWAY_THRESHOLD[0]).abs() < 7.0, "{cs} touchdown x: {td:?}");
+            assert!((td[1] - TOUCHDOWN_Z).abs() < 4.0, "{cs} touchdown z: {td:?}");
+            assert!(!clipped, "{cs} clipped the deck");
+            assert!(
+                max_descent <= GLIDE_DESCENT_RATE + 0.5 && max_climb <= GLIDE_CLIMB_RATE + 0.5,
+                "{cs} unbounded vertical correction: down {max_descent} up {max_climb}"
+            );
+            // Flare: descent near the touchdown point is far gentler than near
+            // the fix — the path flattens out instead of cutting in.
+            let avg = |v: &Vec<f32>| v.iter().sum::<f32>() / v.len().max(1) as f32;
+            let early = avg(&early_rates);
+            let late = avg(&late_rates);
+            assert!(early > 1.0, "{cs} never meaningfully descended: {early}");
+            assert!(
+                late < 0.6 * early,
+                "{cs} no flare: late {late} u/s vs early {early} u/s"
+            );
+            assert!(
+                min_z > RUNWAY_END_Z + 6.0,
+                "{cs} overran the runway: stopped at z {min_z}"
+            );
+        }
+    }
+
+    /// An arrival whose runway gets occupied on final goes around continuously
+    /// (climbing, no snap), then completes a cleared approach once it clears.
+    #[test]
+    fn occupied_runway_forces_continuous_goaround_then_cleared_landing() {
+        let mut world = World::new();
+        // Blocker: a previous arrival still rolling out on the runway — it
+        // must eventually clear, so it carries the real-landing flag.
+        let mut b = Aircraft::with_model("BLK", Kind::Agent, ModelClass::Frontier);
+        b.state = State::Landed;
+        b.must_clear_runway = true;
+        b.position = [56.0, 10.0, 0.0];
+        b.altitude = 0.0;
+        b.heading = RUNWAY_HEADING;
+        b.speed = 12.0;
+        world.add(b);
+        // Arrival on final, 216u short of the touchdown point with a small
+        // lateral offset — the blocker must still be clearing the runway
+        // when it enters the go-around window, so it goes around, not down.
+        let mut a = Aircraft::with_model("ARR", Kind::Agent, ModelClass::Frontier);
+        a.state = State::Landing;
+        a.on_final = true;
+        a.position = [60.0, 250.0, 36.0];
+        a.altitude = 36.0;
+        a.heading = RUNWAY_HEADING;
+        a.speed = a.approach_speed();
+        world.add(a);
+
+        let mut was_on_final = false;
+        let mut went_around = false;
+        let mut unsafe_gap = false;
+        let mut landed = false;
+        let mut prev_alt = 36.0f32;
+        for step in 0..3000 {
+            world.tick(0.05);
+            let a = &world.aircraft[1];
+            let dalt = (a.altitude - prev_alt) / 0.05;
+            prev_alt = a.altitude;
+            assert!(
+                dalt >= -GLIDE_DESCENT_RATE - 0.5 && dalt <= GLIDE_CLIMB_RATE + 0.5,
+                "vertical snap at {step}: {dalt} u/s"
+            );
+            if was_on_final && !a.on_final && a.altitude > 15.0 {
+                went_around = true;
+            }
+            was_on_final |= a.state == State::Landing && a.on_final;
+            let b = &world.aircraft[0];
+            // Only a blocker actually on the runway matters: a cleared
+            // backtaxi that has left the runway band (e.g. apron taxi to its
+            // gate) does not threaten the final approach.
+            if a.state == State::Landing && b.occupies_runway() {
+                let gap = (a.position[0] - b.position[0]).hypot(a.position[1] - b.position[1]);
+                unsafe_gap = unsafe_gap || gap < 40.0;
+            }
+            if a.state == State::Landed {
+                landed = true;
+                break;
+            }
+        }
+        assert!(went_around, "arrival never went around the occupied runway");
+        assert!(!unsafe_gap, "arrival closed to the blocker on the runway");
+        assert!(landed, "arrival never completed a cleared approach");
+    }
+
+    /// An aircraft seeded on the runway holding for a takeoff clearance must
+    /// not be auto-cleared to a gate, and must depart once released.
+    #[test]
+    fn held_aircraft_stays_on_runway_until_released() {
+        let mut world = World::new();
+        let mut a = Aircraft::with_model("HLD", Kind::Agent, ModelClass::Frontier);
+        a.position = [RUNWAY_MID[0], RUNWAY_MID[1], 0.0];
+        a.hold_on_runway();
+        let id = a.id;
+        world.add(a);
+
+        // 120 s of ticking: the tower must never auto-clear it off the runway.
+        for _ in 0..(120.0 / 0.05) as usize {
+            world.tick(0.05);
+        }
+        let a = world.iter().find(|x| x.id == id).unwrap();
+        assert_eq!(a.state, State::Landed, "held aircraft must stay Landed");
+        let d = (a.position[0] - RUNWAY_MID[0]).hypot(a.position[1] - RUNWAY_MID[1]);
+        assert!(d < 1.0, "held aircraft must hold position: {:?}", a.position);
+
+        // Cleared for takeoff: backtaxi, hold short, roll out and depart.
+        world.get_mut("HLD").unwrap().release();
+        let mut departed = false;
+        for _ in 0..(180.0 / 0.05) as usize {
+            world.tick(0.05);
+            let a = world.iter().find(|x| x.id == id).unwrap();
+            if matches!(a.state, State::Takeoff | State::Cruising) {
+                departed = true;
+                break;
+            }
+        }
+        assert!(departed, "held aircraft must depart once cleared");
     }
 
     #[test]
