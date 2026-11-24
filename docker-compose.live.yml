@@ -1,0 +1,43 @@
+# Live T3 overlay. Use together with docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.live.yml up -d --build
+#
+# What this provides (and what it cannot), plainly:
+#  * T3 state: ~/.t3/userdata is bind-mounted READ-ONLY; the server runs
+#    `sqlite3 -readonly` against statev2.sqlite for local threads.
+#  * Linked devices: the bundled Python MCP bridge calls T3's MCP endpoint with
+#    the paired Skywatch credential (scripts/pair_t3.py), mounted as a Compose
+#    secret. T3 listens on host loopback only (127.0.0.1:3773), so the container
+#    shares the host network namespace to reach it.
+#  * NOT available: the `t3` CLI is an Electron AppImage wrapper on the host and
+#    is not in the image. Features that shell out to it do not work: the
+#    linked-device reachability probe and relaying radio messages to LOCAL
+#    threads. Messages to threads on linked devices go through the bridge.
+#
+# Host networking means SKYWATCH_PORT is the real host port and the
+# (unauthenticated) server listens on all host interfaces; restrict with a
+# firewall or publish only through a trusted proxy such as DockTail.
+services:
+  skywatch:
+    network_mode: host
+    ports: !reset []
+    # Must match the owner of ~/.t3/userdata and the token file (mode 0600).
+    user: "${SKYWATCH_UID:-1000}:${SKYWATCH_GID:-1000}"
+    environment:
+      SKYWATCH_T3: "1"
+      SKYWATCH_PORT: "${SKYWATCH_PORT:-8422}"
+      SKYWATCH_T3_MCP_URL: "${SKYWATCH_T3_MCP_URL:-http://127.0.0.1:3773/mcp}"
+      SKYWATCH_T3_TOKEN_FILE: /run/secrets/skywatch_t3_token
+    volumes:
+      - type: bind
+        source: ${T3_USERDATA:-${HOME}/.t3/userdata}
+        target: /home/skywatch/.t3/userdata
+        read_only: true
+        bind:
+          create_host_path: false
+    secrets:
+      - skywatch_t3_token
+
+secrets:
+  skywatch_t3_token:
+    file: ${SKYWATCH_T3_TOKEN_PATH:-${HOME}/.config/skywatch/t3-mcp-token}

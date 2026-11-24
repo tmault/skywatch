@@ -1,0 +1,37 @@
+# VCS and agent/planning state
+.git
+.gitignore
+.nightshift
+.claude
+.codex
+.t3
+.worktrees
+
+# Build output and caches
+**/target
+**/__pycache__
+**/*.pyc
+**/node_modules
+
+# Local databases and secrets must never enter the build context
+**/*.sqlite
+**/*.sqlite-*
+**/*.db
+**/*.db-*
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/t3-mcp-token
+**/*token*
+**/secrets
+**/credentials*
+
+# Not needed to build or run
+docs
+tests
+server/tests
+*.md
+Dockerfile
+.dockerignore
+docker-compose*.yml

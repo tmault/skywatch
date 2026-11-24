@@ -1,0 +1,31 @@
+name: skywatch
+
+# Skywatch, safe default: standalone scripted demo fleet, no host access.
+# Live T3 integration: add docker-compose.live.yml (see README "Live T3").
+#
+#   docker compose up -d --build
+#   open http://127.0.0.1:${SKYWATCH_PORT:-8422}
+services:
+  skywatch:
+    build:
+      context: .
+      args:
+        SKYWATCH_UID: ${SKYWATCH_UID:-1000}
+        SKYWATCH_GID: ${SKYWATCH_GID:-1000}
+    image: skywatch:${SKYWATCH_TAG:-local}
+    container_name: skywatch
+    restart: unless-stopped
+    environment:
+      SKYWATCH_T3: "0"
+      SKYWATCH_PORT: "8422"
+    # Loopback by default. The server itself binds 0.0.0.0 inside the container
+    # and has no authentication, so only widen SKYWATCH_BIND on a trusted network.
+    ports:
+      - "${SKYWATCH_BIND:-127.0.0.1}:${SKYWATCH_PORT:-8422}:8422"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
