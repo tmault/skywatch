@@ -1029,6 +1029,8 @@ fn apply_poll(
         .collect();
     for id in drop {
         if let Some(cs) = callsigns.by_thread.remove(&id) {
+            let arrival_slot = data.taxiway.iter().position(|e| e.thread_id == id)
+                .map(|i| ground_slot(&data.taxiway, i, &world.airports, true));
             if !all_active_ids.contains(&id) && data.done_or_archived.contains(&id) {
                 world.depart_by_callsign(&cs);
                 radio_events.push((cs, "thread done — departing into the horizon".to_string()));
@@ -1036,10 +1038,10 @@ fn apply_poll(
                 && taxi_ids.contains(&id)
                 && world
                     .get_mut(&cs)
-                    .map(|a| a.begin_approach(Some(TAXIWAY_QUEUE[0])))
+                    .map(|a| a.begin_approach(arrival_slot))
                     .unwrap_or(false)
             {
-                // Turn finished: fly the approach, land and backtrack to the taxiway.
+                // Turn finished: fly the approach, land and vacate via the north exit.
                 runway.arrivals.insert(id, cs.clone());
                 radio_events.push((cs, "on approach, Runway 36".to_string()));
             } else {
@@ -1174,7 +1176,7 @@ fn apply_poll(
                 .get_mut(&acs)
                 .map(|a| a.state == State::Ready && a.arrival_slot().is_some());
             match arrived {
-                // Still landing or backtracking: it becomes this TX when it arrives.
+                // Still landing or taxiing via the north exit: it becomes this TX when it arrives.
                 Some(false) => continue,
                 Some(true) => {
                     world.rename(&acs, &cs);

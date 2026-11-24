@@ -296,6 +296,18 @@ function buildHomeAirport(ap) {
     island.add(makeMarking(20, 0.8, 72, cz, markY, yellowLineMat));
   }
 
+  // Arrival return loop passes north of Alpha's six holding slots.
+  // Matches the server route: (56,-66) -> (70,-66) -> (70,-88)
+  // -> (103,-88) -> apron. Departures keep the south threshold entrance.
+  for (const [w, h, x, z] of [[14, 22, 70, -77], [33, 12, 86.5, -88]]) {
+    const loop = makeDeckSlab(w, h, TARMAC_TOP_Y, 0.4, taxiMat);
+    loop.position.set(x, loop.position.y, z);
+    island.add(loop);
+  }
+  island.add(makeMarking(14, 0.8, 63, -66, markY, yellowLineMat));
+  island.add(makeMarking(0.8, 22, 70, -77, markY, yellowLineMat));
+  island.add(makeMarking(33, 0.8, 86.5, -88, markY, yellowLineMat));
+
   // Wide South Departure Holding Bay at [74, 46] with hold-short bars & guard lights.
   const holdBay = makeDeckSlab(24, 22, TARMAC_TOP_Y, 0.4, taxiMat);
   holdBay.position.set(74, holdBay.position.y, 46);
