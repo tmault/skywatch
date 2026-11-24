@@ -221,6 +221,14 @@ pub struct Aircraft {
     /// flight paths and decayed gently once clear of traffic.
     #[serde(skip)]
     sep_offset: [f32; 3],
+    /// Seconds left before `sep_offset` may relax. Held after any conflict so the
+    /// offset doesn't decay, re-conflict and bob up and down.
+    #[serde(skip)]
+    sep_hold: f32,
+    /// Low-pass filtered `sep_offset[2]`; the altitude targets use this so TCAS
+    /// pushes from several conflicts never make an aircraft bob.
+    #[serde(skip)]
+    sep_alt: f32,
     /// True after climb-out: fly a smooth transit to the sector's patrol path
     /// instead of snapping onto it.
     #[serde(skip)]
@@ -271,6 +279,9 @@ const CPA_HORIZ_BUFFER: f32 = 26.0;   // predicted horizontal clearance that tri
 const CPA_VERT_BUFFER: f32 = 14.0;    // ...and vertical
 const VERT_HARD_RATE: f32 = 40.0;     // u/s max rate of the hard vertical floor
 const TCAS_SOFT_VERT_RATE: f32 = 14.0; // u/s soft vertical separation rate (scaled by urgency)
+const SEP_ALT_SMOOTHING: f32 = 1.0;    // per-second low-pass on the vertical TCAS offset
+const SEP_HOLD_TIME: f32 = 10.0;       // seconds a separation offset is held after the last conflict
+const SEP_DECAY_RATE: f32 = 0.2;       // per-second relaxation of the offset once released
 const ALT_EASE_RATE: f32 = 10.0;       // u/s bounded easing rate toward a target altitude
 
 /// Home airport geometry (matches the client's island rendering).
@@ -577,6 +588,8 @@ impl Aircraft {
             departing_forever: false,
             departure_heading: None,
             sep_offset: [0.0, 0.0, 0.0],
+            sep_hold: 0.0,
+            sep_alt: 0.0,
             joining: false,
             on_final: false,
             arrival_slot: None,
@@ -1103,7 +1116,7 @@ impl Aircraft {
             self.patrol_angle =
                 (self.patrol_angle + (TANKER_SPEED / ds_dt) * dt) % std::f32::consts::TAU;
             let ([x, z], heading) = tanker_orbit_point(self.patrol_angle, rot);
-            let target_alt = self.cruise_altitude() + self.sep_offset[2];
+            let target_alt = self.cruise_altitude() + self.sep_alt;
             self.altitude +=
                 (target_alt - self.altitude).clamp(-ALT_EASE_RATE * dt, ALT_EASE_RATE * dt);
             self.position = [wrap_centered(x + self.sep_offset[0]), wrap_centered(z + self.sep_offset[1]), self.altitude];
@@ -1230,13 +1243,13 @@ impl Aircraft {
                         ];
                         // Gentle vertical breath while cruising + TCAS altitude offset.
                         let wave = 2.5 * (2.0 * t).sin();
-                        let target_alt = (base_alt + wave + self.sep_offset[2]).max(30.0);
+                        let target_alt = (base_alt + wave + self.sep_alt).max(30.0);
                         self.join_path(target, target_alt, path_heading, dt);
                         return;
                     }
                 }
                 // Ease to the (possibly TCAS-offset) cruise altitude; never snap.
-                self.altitude += (base_alt + self.sep_offset[2] - self.altitude)
+                self.altitude += (base_alt + self.sep_alt - self.altitude)
                     .clamp(-ALT_EASE_RATE * dt, ALT_EASE_RATE * dt);
                 if self.joining {
                     // Unassigned: still accelerating to cruise speed on the current heading.
@@ -2011,17 +2024,22 @@ impl World {
 
         // Gently relax previous TCAS offsets back toward zero when clear.
         // The latched evasion side releases once the offset has decayed away.
-        let decay = (-0.45 * dt).exp();
+        let decay = (-SEP_DECAY_RATE * dt).exp();
         for a in &mut self.aircraft {
             if is_airborne(a.state) {
-                a.sep_offset[0] *= decay;
-                a.sep_offset[1] *= decay;
-                a.sep_offset[2] *= decay;
+                a.sep_alt += (a.sep_offset[2] - a.sep_alt) * (1.0 - (-SEP_ALT_SMOOTHING * dt).exp());
+                a.sep_hold = (a.sep_hold - dt).max(0.0);
+                if a.sep_hold <= 0.0 {
+                    a.sep_offset[0] *= decay;
+                    a.sep_offset[1] *= decay;
+                    a.sep_offset[2] *= decay;
+                }
                 if a.sep_offset[0].abs() + a.sep_offset[1].abs() < 4.0 {
                     a.avoid_side = 0.0;
                 }
             } else {
                 a.sep_offset = [0.0, 0.0, 0.0];
+                a.sep_alt = 0.0;
                 a.avoid_side = 0.0;
             }
         }
@@ -2179,9 +2197,12 @@ impl World {
             a.sep_offset[2] = (a.sep_offset[2] + push[i][2] + hard_alt[i]).clamp(-26.0, 36.0);
 
             if push[i][0] != 0.0 || push[i][1] != 0.0 || push[i][2] != 0.0 || hard_alt[i] != 0.0 {
+                a.sep_hold = SEP_HOLD_TIME;
                 a.position[0] = wrap_centered(a.position[0] + push[i][0]);
                 a.position[1] = wrap_centered(a.position[1] + push[i][1]);
-                a.altitude = (a.altitude + push[i][2] + hard_alt[i]).max(30.0);
+                // Soft vertical resolution flows through the smoothed `sep_alt` target. Only
+                // the rare hard safety floor moves altitude directly (bounded rate).
+                a.altitude = (a.altitude + hard_alt[i]).max(30.0);
                 a.position[2] = a.altitude;
             }
         }
@@ -3048,5 +3069,47 @@ mod tests {
         let hdist = (sky1.position[0] - expected[0]).hypot(sky1.position[1] - expected[1]);
         let vdist = (sky1.altitude - expected[2]).abs();
         assert!(hdist < 6.0 && vdist < 4.0, "SKY1 should hold formation behind tanker: h={hdist:.2}, v={vdist:.2}");
+    }
+
+    #[test]
+    fn crowded_sector_cruise_altitude_does_not_bob() {
+        // Several agents sharing a sector trigger TCAS offsets; altitude must stay
+        // smooth (no near-instant jumps or rapid up/down flips).
+        let sectors = default_sectors();
+        let c = sectors[0].center;
+        for count in [3usize, 6] {
+            let mut w = World::new();
+            for i in 0..count {
+                let mut a = Aircraft::with_model(&format!("B{i}"), Kind::Agent, ModelClass::Frontier);
+                a.state = State::Cruising;
+                let ang = i as f32 * std::f32::consts::TAU / count as f32;
+                a.position = [c[0] + 70.0 * ang.cos(), c[1] + 70.0 * ang.sin(), 130.0];
+                a.altitude = 130.0;
+                a.joining = true;
+                a.assign(&sectors[0].name);
+                w.add(a);
+            }
+            let mut prev: Vec<f32> = w.aircraft.iter().map(|a| a.altitude).collect();
+            let (mut samples, mut jerky) = (0u32, 0u32);
+            for t in 0..4800 {
+                w.tick(0.05);
+                for (i, a) in w.aircraft.iter().enumerate() {
+                    let rate = (a.altitude - prev[i]) / 0.05;
+                    if t > 800 {
+                        samples += 1;
+                        // Only the rare hard safety floor may move faster than the soft easing.
+                        if rate.abs() > 12.0 {
+                            jerky += 1;
+                        }
+                        assert!(rate.abs() < 55.0, "{count} planes: climb rate {rate} at tick {t}");
+                    }
+                    prev[i] = a.altitude;
+                }
+            }
+            assert!(
+                jerky * 200 < samples,
+                "{count} planes: {jerky}/{samples} ticks climbed faster than 12 u/s (bobbing)"
+            );
+        }
     }
 }
