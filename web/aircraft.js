@@ -11,6 +11,9 @@ import * as THREE from './vendor/three.module.js';
 import {
   liveryFor, fuselageTexture, finTexture, logoTexture, surfaceTexture,
 } from './livery.js';
+import {
+  buildJetLandingGear, buildTankerLandingGear,
+} from './landing-gear.js';
 
 /* --------------------------------------------------------------- helpers */
 
@@ -281,6 +284,7 @@ function paintKit(model, airframe, layout) {
     livery,
     body: std({ map: fuselageTexture(livery, airframe, layout) }),
     plain: std({ color: livery.body }),
+    belly: std({ color: livery.belly }),
     wing: std({ color: livery.wing }),
     fin: std({ map: finTexture(livery) }),
     // Flying-surface skins with hinge lines (see surfaceTexture).
@@ -598,27 +602,17 @@ export function makeJetMesh(model) {
     root: { le: -4.4, chord: 2.6 }, tip: { le: -6.5, chord: 0.8 },
   }));
 
-  // Retractable gear (hidden in flight by main.js): twin-wheel main legs
-  // with side braces, twin-wheel nose leg.
-  const gear = new THREE.Group();
-  gear.name = 'gear';
-  for (const side of [1, -1]) {
-    gear.add(rod(kit.metal, [side * 2.2, wingY - 0.2, -1.2], [side * 2.2, -3.3, -1.2], 0.14));
-    gear.add(rod(kit.metal, [side * 1.2, -1.4, -1.2], [side * 2.2, -2.5, -1.2], 0.06));
-    gear.add(rod(kit.metal, [side * 1.9, -3.4, -1.2], [side * 2.5, -3.4, -1.2], 0.09));
-    for (const dx of [1.92, 2.48]) gear.add(wheel(kit, side * dx, -3.4, -1.2, 0.58, 0.34));
-  }
-  gear.add(rod(kit.metal, [0, -1.4, 9.2], [0, -3.4, 9.2], 0.12));
-  gear.add(rod(kit.metal, [0, -1.6, 8.3], [0, -2.6, 9.2], 0.05));
-  gear.add(wheel(kit, 0.22, -3.5, 9.2, 0.38, 0.25));
-  gear.add(wheel(kit, -0.22, -3.5, 9.2, 0.38, 0.25));
-  group.add(gear);
+  // Animated retractable tricycle gear (driven per frame by landing-gear.js):
+  // twin-wheel main legs with folding side braces, twin-wheel nose leg, bay doors.
+  const landingGear = buildJetLandingGear(kit, { wingY });
+  group.add(landingGear.group);
 
   navLights(group, kit, [wingSpan - 0.2, tipY + 0.1, -3.9], [0, tailY + 0.2, -12.7]);
   group.add(dot(kit.beacon, 0, 1.86, 0.5, 0.24));
   group.add(dot(kit.beacon, 0, -1.86, 4.5, 0.24));
 
   return finish(group, 0.74, kit, {
+    landingGear,
     refuelPort: new THREE.Vector3(0, 1.82, 8.4),
     landingLightPos: new THREE.Vector3(0, -0.62, 12.45),
   });
@@ -980,6 +974,10 @@ export function makeTankerMesh(model) {
     }));
   }
 
+  // Animated retractable heavy widebody landing gear (hidden cleanly while orbiting).
+  const landingGear = buildTankerLandingGear(kit, { wingY });
+  group.add(landingGear.group);
+
   // Nav lights, belly refuelling director lights, and spine/belly beacons.
   navLights(group, kit, [wingSpan - 0.2, tipY + 0.12, -5.1], [0, tailY + 0.28, -16.5]);
   group.add(dot(kit.beacon, 0, 2.55, 1.4, 0.32));
@@ -987,6 +985,7 @@ export function makeTankerMesh(model) {
   group.add(dot(amberMat, 0, -2.3, 9.6, 0.22));
 
   return finish(group, 0.85, kit, {
+    landingGear,
     refuelAnchors: {
       center: new THREE.Vector3(...boomTip),
       port: new THREE.Vector3(podX, podY, podZ - 2.35),

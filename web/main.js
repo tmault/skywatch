@@ -17,6 +17,7 @@ import { addLandingLights, createRunwayEvents } from './runway-events.js';
 import {
   makeAgentMesh, makeJetMesh, makeFighterMesh, makeDroneMesh, makeTankerMesh,
 } from './aircraft.js';
+import { initLandingGear, updateLandingGear } from './landing-gear.js';
 import { liveryFor } from './livery.js';
 import { createLocalFlair } from './local-flair.js';
 
@@ -1334,6 +1335,9 @@ function ensureMesh(a) {
   }
   built.prop = built.group.getObjectByName('prop');
   built.gear = built.group.getObjectByName('gear');
+  if (built.landingGear) {
+    initLandingGear(built, a.state, a.position[2]);
+  }
 
   enableShadows(built.group, { receive: false });
   scene.add(built.group);
@@ -1992,8 +1996,11 @@ function animate() {
       entry.prop.rotation.z = now * 30;
     }
 
-    // Retract landing gear while en route or climbing away after takeoff.
-    if (entry.gear) {
+    // Smoothly retract/extend landing gear on large jets & tankers;
+    // keep simple visibility toggle for static gear on fighters & drones.
+    if (entry.landingGear) {
+      updateLandingGear(entry, dt);
+    } else if (entry.gear) {
       entry.gear.visible =
         entry.state !== 'cruising'
         && entry.state !== 'holding'
