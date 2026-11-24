@@ -327,8 +327,20 @@ function navLights(group, kit, tip, tail) {
 // scaling), so aircraft sit exactly on the apron.
 function finish(group, scale, kit, extra = {}) {
   const box = new THREE.Box3().setFromObject(group);
+  // Conservative support hull for deck clearance under pitch/roll. Capture
+  // before adding labels/lights; geometry bounds include the deployed gear.
+  const contactPoints = [];
+  group.traverse((obj) => {
+    if (!obj.isMesh) return;
+    obj.geometry.computeBoundingBox();
+    const b = obj.geometry.boundingBox;
+    for (const x of [b.min.x, b.max.x])
+      for (const y of [b.min.y, b.max.y])
+        for (const z of [b.min.z, b.max.z])
+          contactPoints.push(new THREE.Vector3(x, y, z).applyMatrix4(obj.matrixWorld));
+  });
   return {
-    group, scale,
+    group, scale, contactPoints,
     tintMaterials: [kit.beacon], disposeMaterials: kit.all,
     wheelDrop: -box.min.y * scale,
     ...extra,
@@ -985,6 +997,17 @@ export function makeTankerMesh(model) {
   group.add(dot(kit.beacon, 0, 2.55, 1.4, 0.32));
   group.add(dot(kit.beacon, 0, -2.3, 6.2, 0.3));
   group.add(dot(amberMat, 0, -2.3, 9.6, 0.22));
+
+  // Deployable tricycle gear keeps the boom clear during landing rotation.
+  const gear = new THREE.Group();
+  gear.name = 'gear';
+  for (const side of [1, -1]) {
+    gear.add(rod(kit.metal, [side * 2.4, -1.6, -2.0], [side * 2.4, -5.2, -2.0], 0.16));
+    gear.add(wheel(kit, side * 2.4, -5.2, -2.0, 0.65, 0.38));
+  }
+  gear.add(rod(kit.metal, [0, -1.6, 10.0], [0, -5.35, 10.0], 0.14));
+  gear.add(wheel(kit, 0, -5.35, 10.0, 0.5, 0.3));
+  group.add(gear);
 
   return finish(group, 0.85, kit, {
     refuelAnchors: {
