@@ -1,6 +1,7 @@
 // Radio panel: per-aircraft message history, text chat, approve/reject actions.
 
 import { liveryFor } from './livery.js';
+import { formatTankerWait } from './tanker.js';
 
 const panel = document.getElementById('radio-panel');
 const callsignEl = document.getElementById('radio-callsign');
@@ -41,18 +42,6 @@ function getHistory(id) {
 export function appendHistory(id, who, text) {
   getHistory(id).push({ who, text, at: Date.now() });
   if (id === selectedId) renderLog();
-}
-
-export function formatCountdown(iso) {
-  if (!iso) return '';
-  const ms = Date.parse(iso) - Date.now();
-  if (!Number.isFinite(ms) || ms <= 0) return 'resetting soon';
-  const totalMins = Math.ceil(ms / 60000);
-  const h = Math.floor(totalMins / 60);
-  const m = totalMins % 60;
-  if (h > 0 && m > 0) return `resets in ${h}h ${m}m`;
-  if (h > 0) return `resets in ${h}h`;
-  return `resets in ${m}m`;
 }
 
 export function openRadio(aircraft) {
@@ -109,17 +98,17 @@ function render(a) {
   if (a.topic) parts.push(a.topic.toUpperCase());
   kindEl.textContent = parts.join(' · ');
 
-  stateEl.textContent = a.kind === 'tanker'
-    ? 'on hold · refuelling'
-    : a.state === 'refueling'
-      ? 'refuelling (token hold)'
-      : a.state === 'parked'
-        ? 'at gate'
-        : a.state === 'ready'
-          ? 'taxiway queue'
-          : a.state === 'departing'
-            ? 'departing (done)'
-            : a.state;
+  let state = a.state;
+  if (a.kind === 'tanker') state = 'refuelling track';
+  else if (a.state === 'refueling') {
+    if (a.data_stale) state = 'rendezvous suspended';
+    else if (!a.refuel_connected) state = 'en route to tanker';
+    else if (a.refuel_slot > 2) state = 'in formation';
+    else state = 'refuelling';
+  } else if (a.state === 'parked') state = 'at gate';
+  else if (a.state === 'ready') state = 'taxiway queue';
+  else if (a.state === 'departing') state = 'departing (done)';
+  stateEl.textContent = state;
   stateEl.style.color = stateColor(a.state);
 
   if (a.kind === 'tanker') {
@@ -128,9 +117,8 @@ function render(a) {
       : 'AERIAL REFUEL: orbiting above airspace zones';
     holdReasonEl.hidden = false;
   } else if (a.state === 'refueling') {
-    const cd = formatCountdown(a.refuel_reset_at);
-    const base = a.hold_reason || 'waiting for provider tokens';
-    holdReasonEl.textContent = cd ? `TOKEN HOLD: ${base} (${cd})` : `TOKEN HOLD: ${base}`;
+    const details = formatTankerWait(a);
+    if (holdReasonEl.textContent !== details) holdReasonEl.textContent = details;
     holdReasonEl.hidden = false;
   } else if (a.state === 'holding' && a.hold_reason) {
     holdReasonEl.textContent = `HOLD: ${a.hold_reason}`;

@@ -762,8 +762,7 @@ function buildAircraftLabelTexture(a, accentHex) {
     const match = (a.hold_reason || '').match(/(\d+)/);
     stateLabel = match ? `TANKER · ON HOLD (${match[1]})` : 'TANKER · ON HOLD';
   } else if (a.state === 'refueling') {
-    const cd = formatCountdown(a.refuel_reset_at).replace(/^resets in /i, '');
-    stateLabel = cd ? `REFUEL · ${cd.toUpperCase()}` : 'REFUELING · TOKEN HOLD';
+    stateLabel = a.data_stale ? 'RENDEZVOUS SUSPENDED' : a.refuel_connected ? 'TANKER FORMATION' : 'TANKER RENDEZVOUS';
   } else if (a.state === 'parked') {
     stateLabel = 'AT GATE · >24H';
   } else if (a.state === 'ready') {
@@ -799,8 +798,7 @@ function labelAccentFor(a) {
 }
 
 function updateAircraftLabel(entry, a) {
-  const cd = a.state === 'refueling' ? formatCountdown(a.refuel_reset_at) : '';
-  const extra = a.kind === 'tanker' ? (a.hold_reason || '') : cd;
+  const extra = a.kind === 'tanker' ? (a.hold_reason || '') : `${a.refuel_connected}|${a.data_stale}`;
   const key = `${a.title || ''}|${a.state}|${a.topic || ''}|${a.callsign}|${extra}`;
   if (entry.labelKey === key) return;
   entry.labelKey = key;
@@ -1233,7 +1231,7 @@ const refuelPipes = new Map(); // receiverId -> RefuelPipe
 function updateRefuelPipes(now) {
   const activeReceivers = new Set();
   for (const a of currentSnapshot.values()) {
-    if (a.kind === 'tanker' || a.state !== 'refueling' || a.tanker_id == null) continue;
+    if (!a.refuel_connected || a.tanker_id == null || a.refuel_slot > 2) continue;
     const tankerEntry = meshes.get(a.tanker_id);
     const receiverEntry = meshes.get(a.id);
     if (!tankerEntry || !receiverEntry) continue;
@@ -1786,7 +1784,7 @@ function handleStateChange(a, from, to) {
     else if (to === 'taxi') addTickerLine(`${tag}: taxiing.`);
     else if (to === 'parked') addTickerLine(`${tag}: parked at the gate.`);
     else if (to === 'ready') addTickerLine(`${tag}: lined up, ready for takeoff.`, true, a.id);
-    else if (to === 'cruising' && from === 'refueling') addTickerLine(`${tag}: refuel complete — resuming patrol.`);
+    else if (to === 'cruising' && from === 'refueling') addTickerLine(`${tag}: provider wait ended — resuming patrol.`);
     else if (to === 'cruising' && from !== undefined) addTickerLine(`${tag}: cruising.`);
   }
   if (selectedAircraftId() === a.id && from !== undefined) {

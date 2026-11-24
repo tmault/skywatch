@@ -1,0 +1,10 @@
+[
+  {"thread_id":"codex","title":"Codex limit","status":"failed","latest_run_id":"a","latest_run_provider":"codex","usage_limit_code":"usageLimitExceeded","usage_limit_reset_at":"2026-11-24T03:22:09.000Z"},
+  {"thread_id":"opencode","title":"OpenCode limit","status":"failed","latest_run_id":"b","latest_run_provider":"opencode","usage_limit_code":"provider.quota","usage_limit_message":"OpenCode Go usage limit reached (5-hour, resets in 1h 2m)."},
+  {"thread_id":"claude","title":"Updated Claude limit","status":"failed","latest_run_id":"c","latest_run_provider":"claudeAgent","usage_limit_reset_at":"2026-11-24T02:00:00.000Z","limit_recovery_run_id":"c","limit_recovery_auto_resume":true,"limit_recovery_reset_at":"2026-11-24T06:00:00.000Z"},
+  {"thread_id":"approval","title":"Approval","status":"waiting","pending":1,"usage_limit_code":"api_error_429"},
+  {"thread_id":"resumed","title":"Resumed","status":"running","usage_limit_code":"api_error_429"},
+  {"thread_id":"stale","title":"Different run failed","status":"failed","latest_run_id":"e","limit_recovery_run_id":"d","limit_recovery_reset_at":"2026-11-24T06:00:00.000Z","limit_recovery_auto_resume":true},
+  {"thread_id":"failure","title":"Ordinary failure","status":"failed"},
+  {"thread_id":"idle","title":"Idle","status":"idle"}
+]
