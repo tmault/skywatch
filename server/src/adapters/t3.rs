@@ -848,6 +848,15 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>, cache:
         .unwrap_or(0);
 
     let total_entries = entries.len();
+    // A thread whose sub-agents are still working is airborne even when its own
+    // run reads idle or finished: the parent flies with its fighter escort.
+    let all_ids: HashSet<String> = entries.iter().map(|e| e.thread_id.clone()).collect();
+    let all_subagents = poll_subagents(&all_ids, now);
+    let parents_with_active_subagents: HashSet<String> = all_subagents
+        .iter()
+        .filter(|r| is_working_status(&r.status))
+        .map(|r| r.thread_id.clone())
+        .collect();
     let mut flying = Vec::new();
     let mut working_count = HashMap::<String, usize>::new();
     let mut refuel_count = HashMap::<String, usize>::new();
@@ -861,8 +870,12 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>, cache:
                 flying.push((e, pending));
                 *refuel_count.entry(env.clone()).or_default() += 1;
             }
-        } else if is_working_status(&e.status) {
+        } else if is_working_status(&e.status) || parents_with_active_subagents.contains(&e.thread_id) {
             if *working_count.entry(env.clone()).or_default() < MAX_AIRCRAFT {
+                let mut e = e;
+                if !is_working_status(&e.status) {
+                    e.status = "running".to_string();
+                }
                 let pending = e.pending;
                 flying.push((e, pending));
                 *working_count.entry(env.clone()).or_default() += 1;
@@ -877,7 +890,10 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>, cache:
     }
 
     let flying_ids: HashSet<String> = flying.iter().map(|(e, _)| e.thread_id.clone()).collect();
-    let subagents = poll_subagents(&flying_ids, now);
+    let subagents: Vec<SubagentRow> = all_subagents
+        .into_iter()
+        .filter(|r| flying_ids.contains(&r.thread_id))
+        .collect();
 
     Some(PollData {
         omitted: total_entries.saturating_sub(flying.len() + taxiway.len() + stale.len()),
