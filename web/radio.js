@@ -1,5 +1,6 @@
 // Radio panel: per-aircraft message history, text chat, approve/reject actions.
 
+import { isFlagshipAgent } from './flagship.js';
 import { liveryFor } from './livery.js';
 import { formatTankerWait } from './tanker.js';
 
@@ -89,6 +90,7 @@ function render(a) {
   if (a.kind === 'tanker') airframe = 'AERIAL TANKER';
   else if (a.kind === 'fighter') airframe = 'FIGHTER · SUB-AGENT';
   else if (a.kind === 'drone') airframe = 'REAPER DRONE';
+  else if (isFlagshipAgent(a)) airframe = 'AGENT · FLAGSHIP 747';
   else if (a.model_class === 'frontier') airframe = 'AGENT · FRONTIER JET';
   else airframe = 'AGENT · LOCAL PROP';
 

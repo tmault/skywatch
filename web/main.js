@@ -15,8 +15,9 @@ import {
 import { addRunwayLights } from './runway-lights.js';
 import { addLandingLights, createRunwayEvents } from './runway-events.js';
 import {
-  makeAgentMesh, makeJetMesh, makeFighterMesh, makeDroneMesh, makeTankerMesh,
+  makeAgentMesh, makeJetMesh, makeJumboMesh, makeFighterMesh, makeDroneMesh, makeTankerMesh,
 } from './aircraft.js';
+import { isFlagshipAgent } from './flagship.js';
 import { liveryFor } from './livery.js';
 import { createLocalFlair } from './local-flair.js';
 import { createAlertManager, classifyAircraftUrgency, isPassiveHold } from './alerts.js';
@@ -1078,6 +1079,23 @@ function makeContrailsFor(a) {
       opacity: 0.24,
     })];
   }
+  if (isFlagshipAgent(a)) {
+    // Flagship 747 streams four crisp high-altitude contrails from its four engines!
+    return [
+      [-9.3, -1.42, -3.65],
+      [-5.1, -1.98, -0.58],
+      [5.1, -1.98, -0.58],
+      [9.3, -1.42, -3.65],
+    ].map((localOffset) => new ContrailRibbon({
+      localOffset,
+      maxPoints: 130,
+      sampleInterval: 0.13,
+      startWidth: 0.88,
+      endWidth: 5.2,
+      color: 0xf7fbff,
+      opacity: 0.68,
+    }));
+  }
   if (a.model_class === 'frontier') {
     // High-altitude frontier jets stream twin rich white contrails from both engines!
     // Offsets are in aircraft.js model space: nacelle exhausts / wingtips.
@@ -1340,13 +1358,16 @@ function ensureMesh(a) {
   if (entry) return entry;
 
   let built;
+  const flagship = isFlagshipAgent(a);
   // Each airframe is painted in its model provider's livery.
   if (a.kind === 'tanker') built = makeTankerMesh(a.model);
   else if (a.kind === 'fighter') built = makeFighterMesh(a.model);
   else if (a.kind === 'drone') built = makeDroneMesh(a.model);
+  else if (flagship) built = makeJumboMesh(a.model);
   else if (a.model_class === 'frontier') built = makeJetMesh(a.model);
   else built = makeAgentMesh(a.model);
   built.model = a.model ?? null;
+  built.isFlagship = flagship;
 
   const s = built.scale;
   built.group.scale.setScalar(s);
@@ -1358,10 +1379,10 @@ function ensureMesh(a) {
   const label = new THREE.Sprite(new THREE.SpriteMaterial({
     transparent: true, depthTest: false,
   }));
-  const lw = a.kind === 'tanker' ? 44 : (a.kind === 'fighter' ? 28 : 38);
+  const lw = a.kind === 'tanker' ? 44 : (flagship ? 42 : (a.kind === 'fighter' ? 28 : 38));
   const lh = lw * (104 / 512);
   label.scale.set(lw / s, lh / s, 1);
-  label.position.y = (a.kind === 'tanker' ? 16 : (a.kind === 'fighter' ? 9.5 : 13)) / s;
+  label.position.y = (a.kind === 'tanker' ? 16 : (flagship ? 14.8 : (a.kind === 'fighter' ? 9.5 : 13))) / s;
   label.renderOrder = 10;
   built.group.add(label);
   built.label = label;
@@ -1515,9 +1536,9 @@ let returnOverview = false; // smoothly glide back when exiting follow cam
 
 function chaseOffsetFor(entry) {
   // Position camera slightly behind-and-above the aircraft's tail/starboard quarter.
-  // Tankers get a wider vantage so the trailing pipes and waiting planes stay in frame.
-  const dist = entry.kind === 'tanker' ? 92 : (entry.kind === 'fighter' ? 40 : 54);
-  const lift = entry.kind === 'tanker' ? 38 : (entry.kind === 'fighter' ? 18 : 24);
+  // Tankers and flagship 747s get a wider vantage so their larger airframes stay in frame.
+  const dist = entry.kind === 'tanker' ? 92 : (entry.isFlagship ? 66 : (entry.kind === 'fighter' ? 40 : 54));
+  const lift = entry.kind === 'tanker' ? 38 : (entry.isFlagship ? 28 : (entry.kind === 'fighter' ? 18 : 24));
   // Heading h moves along (cos h, sin h); tail is opposite (-cos h, -sin h),
   // starboard right is (-sin h, cos h).
   const h = entry.heading || 0;
@@ -2041,7 +2062,7 @@ function animate() {
     const omega = dt > 0.001 ? stepH / dt : 0;
     const maxBank = entry.kind === 'tanker'
       ? 0.22
-      : (entry.kind === 'fighter' ? 0.52 : (entry.model_class === 'frontier' ? 0.32 : 0.4));
+      : (entry.isFlagship ? 0.26 : (entry.kind === 'fighter' ? 0.52 : (entry.model_class === 'frontier' ? 0.32 : 0.4)));
     const targetRoll = airborne
       ? Math.max(-maxBank, Math.min(maxBank, omega * 1.15))
       : 0;
@@ -2053,8 +2074,8 @@ function animate() {
 
     // Pitch along the actual climb/descent flight path (negative X pitches +Z nose up,
     // positive X pitches nose down), with pre-liftoff rotation and a short touchdown flare.
-    const maxClimb = entry.kind === 'fighter' ? 0.5 : (entry.model_class === 'frontier' ? 0.38 : 0.42);
-    const maxDescent = entry.kind === 'fighter' ? 0.44 : (entry.model_class === 'frontier' ? 0.34 : 0.36);
+    const maxClimb = entry.kind === 'fighter' ? 0.5 : (entry.isFlagship ? 0.34 : (entry.model_class === 'frontier' ? 0.38 : 0.42));
+    const maxDescent = entry.kind === 'fighter' ? 0.44 : (entry.isFlagship ? 0.30 : (entry.model_class === 'frontier' ? 0.34 : 0.36));
     let targetPitch = 0;
     if (airborne) {
       targetPitch = THREE.MathUtils.clamp((entry.flightPitch || 0) * 1.15, -maxClimb, maxDescent);

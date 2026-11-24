@@ -98,10 +98,12 @@ pub fn seed(world: &mut World) {
         }
     }
 
-    // Seed two idle (>24h) threads parked neatly at the home airport gates.
+    // Seed three idle (>24h) threads parked neatly at the home airport gates,
+    // including a flagship OpenAI Astra 747 beside a standard OpenAI Sol jet.
     for (i, (cs, title, mc, model)) in [
         ("SKY4", "Weekend blog draft", ModelClass::Local, "opencode-go/glm-5.3-flash"),
         ("SKY5", "Benchmark notes", ModelClass::Frontier, "gpt-6.1-sol"),
+        ("SKY9", "Long-horizon research notes", ModelClass::Frontier, "gpt-6.2-astra"),
     ]
     .iter()
     .enumerate()
@@ -116,6 +118,20 @@ pub fn seed(world: &mut World) {
         a.title = Some((*title).to_string());
         a.device = Some("omarchy".to_string());
         world.add(a);
+    }
+
+    // Seed a flagship Anthropic Fable 747 cruising in the Skywatch sector
+    // alongside SKY1 (regular Opus jet) for an immediate in-flight scale contrast.
+    {
+        let mut flagship = Aircraft::with_model("SKY8", Kind::Agent, ModelClass::Frontier);
+        flagship.model = Some("claude-fable-5-2".to_string());
+        flagship.position = [-190.0, 215.0, 120.0];
+        flagship.heading = 0.8;
+        flagship.altitude = 120.0;
+        flagship.title = Some("Flagship architecture synthesis".to_string());
+        flagship.device = Some("omarchy".to_string());
+        flagship.assign("Skywatch");
+        world.add(flagship);
     }
 
     // Two simulated provider-limit waits on the same connection.
@@ -295,8 +311,14 @@ mod tests {
         assert_eq!(state_of("SKY4"), State::Parked);
         assert_eq!(state_of("SKY6"), State::Refueling);
         assert_eq!(state_of("SKY7"), State::Refueling);
+        assert_eq!(state_of("SKY8"), State::Cruising);
+        assert_eq!(state_of("SKY9"), State::Parked);
         assert_eq!(state_of("REAP1"), State::Cruising);
         assert_eq!(state_of("REAP2"), State::Cruising);
+        let sky8 = world.iter().find(|a| a.callsign == "SKY8").unwrap();
+        let sky9 = world.iter().find(|a| a.callsign == "SKY9").unwrap();
+        assert_eq!(sky8.model.as_deref(), Some("claude-fable-5-2"));
+        assert_eq!(sky9.model.as_deref(), Some("gpt-6.2-astra"));
         let tankers: Vec<_> = world.iter().filter(|a| a.kind == Kind::Tanker).collect();
         assert_eq!(tankers.len(), 1);
         assert_eq!(tankers[0].callsign, "KC-CLAUDE");
