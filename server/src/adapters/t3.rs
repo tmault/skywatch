@@ -715,12 +715,21 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>, cache:
                 flying.push((e, pending));
                 *working_count.entry(env.clone()).or_default() += 1;
             }
-        } else if is_stale(&e.updated_at, now) {
-            if stale.iter().filter(|e: &&ThreadListEntry| remote::owner(&e.thread_id).map(|o|o.0).unwrap_or_else(|| "local".into()) == env).count() < if env == "local" { MAX_GATE_PARKED } else { 4 } {
+        } else {
+            // Recent threads queue on Taxiway Alpha; when its slots are full (and for
+            // threads idle >24h) they park at the terminal gates instead of vanishing.
+            let count_in = |v: &Vec<ThreadListEntry>| {
+                v.iter()
+                    .filter(|x| remote::owner(&x.thread_id).map(|o| o.0).unwrap_or_else(|| "local".into()) == env)
+                    .count()
+            };
+            let taxi_cap = if env == "local" { MAX_TAXIWAY_QUEUE } else { 4 };
+            let gate_cap = if env == "local" { MAX_GATE_PARKED } else { 4 };
+            if !is_stale(&e.updated_at, now) && count_in(&taxiway) < taxi_cap {
+                taxiway.push(e);
+            } else if count_in(&stale) < gate_cap {
                 stale.push(e);
             }
-        } else if taxiway.iter().filter(|e: &&ThreadListEntry| remote::owner(&e.thread_id).map(|o|o.0).unwrap_or_else(|| "local".into()) == env).count() < if env == "local" { MAX_TAXIWAY_QUEUE } else { 4 } {
-            taxiway.push(e);
         }
     }
 
