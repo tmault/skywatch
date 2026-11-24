@@ -396,7 +396,7 @@ function buildSatelliteAirport(ap, idx) {
     radius: 72,
     hilliness: 3,
     snowLine: 11,
-    pads: [{ x: 17, z: 0, hw: 25, hl: 41 }],
+    pads: [{ x: 20, z: 0, hw: 30, hl: 41 }],
     peaks: [
       { x: -36, z: 0, h: 4.6, r: 20, flat: 5, crag: 0.15 },
       { x: -34, z: knollZ, h: 14, r: 24, crag: 0.5 },
@@ -458,15 +458,17 @@ function buildSatelliteAirport(ap, idx) {
   }
 
   // Elevated apron + small terminal + 4 gates.
-  const apron = makeDeckSlab(24, 70, TARMAC_TOP_Y - 0.05, 0.35, apronMat);
-  apron.position.x = 25;
+  // Apron and terminal sit far enough east that a nose-in jet (gate x = +24,
+  // nose up to ~15u ahead of it) stops well short of the terminal glass.
+  const apron = makeDeckSlab(31, 70, TARMAC_TOP_Y - 0.05, 0.35, apronMat);
+  apron.position.x = 28.5;
   island.add(apron);
 
   const terminal = new THREE.Mesh(new THREE.BoxGeometry(7, 5.2, 60), terminalMat);
-  terminal.position.set(37, TARMAC_TOP_Y + 2.6, 0);
+  terminal.position.set(44, TARMAC_TOP_Y + 2.6, 0);
   island.add(terminal);
   const tGlass = new THREE.Mesh(new THREE.BoxGeometry(0.5, 2.0, 54), glassMat);
-  tGlass.position.set(33.3, TARMAC_TOP_Y + 3.0, 0);
+  tGlass.position.set(40.3, TARMAC_TOP_Y + 3.0, 0);
   island.add(tGlass);
 
   for (const [gx, gz] of ap.gates) {
