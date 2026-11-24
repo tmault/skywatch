@@ -5,10 +5,10 @@
 //! sample device airports, and `run_script` drives a scripted state machine so
 //! the world evolves over time without any adapters connected.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::world::{
-    default_sectors, formation_position, Aircraft, Airport, Kind, ModelClass, Sector, State, World,
+    default_sectors, formation_position, refuel_formation_position, Aircraft, Airport, Kind, ModelClass, Sector, State, World,
     GATE_HEADING, HOME_GATES, PROJECT_SECTOR_RADIUS, PROJECT_SECTOR_SLOTS, RUNWAY_MID,
     SATELLITE_SLOTS,
 };
@@ -118,8 +118,7 @@ pub fn seed(world: &mut World) {
         world.add(a);
     }
 
-    // Seed two Claude threads waiting for tokens — automatically spawns the
-    // Claude aerial refuelling tanker high above the zones with hoses connected!
+    // Two simulated provider-limit waits on the same connection.
     for (cs, title, model, sector) in [
         (
             "SKY6",
@@ -139,10 +138,28 @@ pub fn seed(world: &mut World) {
         a.title = Some(title.to_string());
         a.device = Some("omarchy".to_string());
         a.assign(sector);
-        a.refuel("Claude usage limit reached — waiting for tokens", None);
+        let reset = (cs == "SKY6").then(|| demo_reset_after(24));
+        a.refuel("Demo usage limit reached", reset);
         world.add(a);
     }
-    world.snap_refueling_to_tankers();
+    world.sync_tankers();
+    let (position, heading) = world.iter().find(|a| a.kind == Kind::Tanker)
+        .map(|a| (a.position, a.heading)).expect("demo tanker");
+    for (slot, callsign) in ["SKY6", "SKY7"].into_iter().enumerate() {
+        let a = world.get_mut(callsign).expect("demo receiver");
+        let target = refuel_formation_position(position, heading, slot);
+        let offset = 65.0 + 45.0 * slot as f32;
+        a.altitude = target[2] - 24.0 - 14.0 * slot as f32;
+        a.position = [target[0] - offset * heading.cos(), target[1] - offset * heading.sin(), a.altitude];
+        a.heading = heading;
+    }
+}
+
+fn demo_reset_after(seconds: u64) -> String {
+    let epoch = (SystemTime::now() + Duration::from_secs(seconds))
+        .duration_since(SystemTime::UNIX_EPOCH).expect("system time").as_secs();
+    // Format the simulated absolute timestamp without another time dependency.
+    crate::time::format_rfc3339(epoch as i64)
 }
 
 /// One scripted action: apply it to the world at a given cycle.
@@ -231,15 +248,23 @@ fn run_cycle(world: &mut World, cycle: u32) {
     }
 }
 
-pub const SCRIPT_INTERVAL: Duration = Duration::from_secs(60);
+const SCRIPT_INTERVAL_SECS: u32 = 60;
 
 pub async fn run_script(world: crate::ws::SharedWorld) {
     let mut cycle: u32 = 0;
-    let mut interval = tokio::time::interval(SCRIPT_INTERVAL);
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
         interval.tick().await;
         let mut w = world.lock().await;
-        run_cycle(&mut w, cycle);
+        if cycle.is_multiple_of(SCRIPT_INTERVAL_SECS) {
+            run_cycle(&mut w, cycle / SCRIPT_INTERVAL_SECS);
+        }
+        match cycle {
+            12 => w.get_mut("SKY6").expect("demo receiver").refuel_reset_at = Some(demo_reset_after(20)),
+            38 => w.get_mut("SKY6").expect("demo receiver").release(),
+            43 => w.get_mut("SKY7").expect("demo receiver").release(),
+            _ => {}
+        }
         cycle = cycle.wrapping_add(1);
     }
 }
@@ -275,6 +300,28 @@ mod tests {
         let tankers: Vec<_> = world.iter().filter(|a| a.kind == Kind::Tanker).collect();
         assert_eq!(tankers.len(), 1);
         assert_eq!(tankers[0].callsign, "KC-CLAUDE");
+    }
+
+    #[test]
+    fn demo_receivers_join_without_violating_separation() {
+        let mut world = World::new();
+        seed(&mut world);
+        let position = |world: &World, callsign: &str| {
+            world.iter().find(|a| a.callsign == callsign).unwrap().position
+        };
+        assert!(!world.get_mut("SKY6").unwrap().refuel_connected);
+        for _ in 0..600 {
+            let before = position(&world, "SKY6");
+            world.tick(0.05);
+            let first = position(&world, "SKY6");
+            let second = position(&world, "SKY7");
+            let distance = |a: [f32; 3], b: [f32; 3]| (a[0] - b[0]).hypot(a[1] - b[1]);
+            assert!(distance(first, before) < 4.0, "receiver position jumped");
+            assert!(distance(first, second) >= 28.0 || (first[2] - second[2]).abs() >= 12.0,
+                "receivers lost separation");
+        }
+        assert!(world.get_mut("SKY6").unwrap().refuel_connected);
+        assert!(world.get_mut("SKY7").unwrap().refuel_connected);
     }
 
     #[test]

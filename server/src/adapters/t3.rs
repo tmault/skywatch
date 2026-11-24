@@ -15,6 +15,7 @@ use crate::world::{
 };
 #[cfg(test)]
 use crate::world::wrap_centered;
+use crate::time::parse_rfc3339;
 use crate::ws::{ClientFrame, SharedWorld};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -29,8 +30,6 @@ const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const MAX_AIRCRAFT: usize = 6;
 /// How many token-limited threads can hold on aerial refuelling tankers concurrently.
 const MAX_REFUELING: usize = 8;
-/// Fallback window (seconds) for a usage-limit error that has no explicit reset time.
-const USAGE_LIMIT_FALLBACK_SECS: i64 = 15 * 60;
 /// How many recent (<24h) idle/waiting threads to queue along Taxiway Alpha.
 const MAX_TAXIWAY_QUEUE: usize = TAXIWAY_QUEUE.len();
 /// Threads untouched for longer than this park at the extended terminal gates.
@@ -79,7 +78,7 @@ struct ThreadListEntry {
     #[serde(default)]
     latest_run_model: Option<String>,
     #[serde(default)]
-    latest_run_completed_at: Option<String>,
+    latest_run_provider_instance: Option<String>,
     #[serde(default)]
     limit_recovery_run_id: Option<String>,
     #[serde(default)]
@@ -87,13 +86,9 @@ struct ThreadListEntry {
     #[serde(default, deserialize_with = "deserialize_opt_bool_ish")]
     limit_recovery_auto_resume: Option<bool>,
     #[serde(default)]
-    limit_recovery_model: Option<String>,
-    #[serde(default)]
-    limit_recovery_provider: Option<String>,
-    #[serde(default)]
     usage_limit_reset_at: Option<String>,
     #[serde(default)]
-    usage_limit_message: Option<String>,
+    usage_limit_code: Option<String>,
 }
 
 /// Active token/usage-limit wait detected for a T3 thread.
@@ -103,6 +98,7 @@ struct TokenWait {
     reset_at: Option<String>,
     model_override: Option<String>,
     provider_hint: Option<String>,
+    scope: String,
 }
 
 #[derive(Deserialize)]
@@ -214,196 +210,45 @@ struct Wingmen {
     by_subagent: HashMap<String, (String, String)>,
 }
 
-/// Days since the Unix epoch for a civil (year, month, day) date.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = if m > 2 { m - 3 } else { m + 9 };
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
-/// Parse an RFC3339 UTC timestamp ("2026-11-01T17:39:45.542Z") to Unix secs.
-fn parse_rfc3339(s: &str) -> Option<i64> {
-    if s.len() < 19 {
+/// Normalize the current run's structured T3 usage-limit error or armed recovery.
+fn detect_token_wait(entry: &ThreadListEntry) -> Option<TokenWait> {
+    if entry.pending > 0 || entry.settled || !matches!(entry.status.as_str(), "waiting" | "failed") {
         return None;
     }
-    let num = |a: usize, n: usize| s.get(a..a + n)?.parse::<i64>().ok();
-    let y = num(0, 4)?;
-    let mo = num(5, 2)?;
-    let d = num(8, 2)?;
-    let h = num(11, 2)?;
-    let mi = num(14, 2)?;
-    let sec = num(17, 2)?;
-    Some(days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec)
-}
 
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
-fn format_rfc3339(ts: i64) -> String {
-    let days = ts.div_euclid(86400);
-    let rem = ts.rem_euclid(86400);
-    let (y, m, d) = civil_from_days(days);
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y,
-        m,
-        d,
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60
-    )
-}
-
-/// Parse a relative reset duration like `"resets in 2h 56m"`, `"resets in 3h"`,
-/// or `"resets in 45m"` into seconds.
-fn parse_resets_in_secs(msg: &str) -> Option<i64> {
-    let lower = msg.to_lowercase();
-    let idx = lower.find("resets in ")?;
-    let rest = &lower[idx + "resets in ".len()..];
-    let mut total: i64 = 0;
-    let mut matched = false;
-    for tok in rest.split(|c: char| !c.is_ascii_alphanumeric()) {
-        if tok.is_empty() {
-            continue;
-        }
-        if let Some(num) = tok.strip_suffix('h').and_then(|n| n.parse::<i64>().ok()) {
-            total += num * 3600;
-            matched = true;
-        } else if let Some(num) = tok.strip_suffix('m').and_then(|n| n.parse::<i64>().ok()) {
-            total += num * 60;
-            matched = true;
-        } else if let Some(num) = tok.strip_suffix('s').and_then(|n| n.parse::<i64>().ok()) {
-            total += num;
-            matched = true;
-        } else if matched {
-            break;
-        } else {
-            break;
-        }
+    let recovery_armed = entry.limit_recovery_auto_resume == Some(true)
+        && entry.limit_recovery_run_id.is_some()
+        && entry.limit_recovery_run_id == entry.latest_run_id;
+    if !recovery_armed && entry.usage_limit_code.is_none() && entry.usage_limit_reset_at.is_none() {
+        return None;
     }
-    if matched && total > 0 {
-        Some(total)
+    let reset_at = if recovery_armed {
+        entry.limit_recovery_reset_at.as_ref().or(entry.usage_limit_reset_at.as_ref())
     } else {
-        None
-    }
-}
-
-/// Determine whether a T3 thread is currently waiting for provider tokens /
-/// usage-limit reset and should connect to its provider's aerial tanker.
-fn detect_token_wait(entry: &ThreadListEntry, now: i64) -> Option<TokenWait> {
-    if matches!(
-        entry.status.as_str(),
-        "completed" | "cancelled" | "interrupted" | "idle"
-    ) {
-        return None;
-    }
-
-    // 1. Latest run itself hit a usage limit (`failure.class = 'usage_limit'`
-    //    or a `usage-limit` system notice).
-    let has_latest_limit =
-        entry.usage_limit_reset_at.is_some() || entry.usage_limit_message.is_some();
-    if has_latest_limit {
-        let same_lr_run = entry.limit_recovery_run_id.is_some()
-            && entry.limit_recovery_run_id == entry.latest_run_id;
-        let explicit_reset_str = entry
-            .usage_limit_reset_at
-            .as_deref()
-            .or_else(|| {
-                if same_lr_run {
-                    entry.limit_recovery_reset_at.as_deref()
-                } else {
-                    None
-                }
-            });
-
-        let derived_reset = explicit_reset_str
-            .and_then(|s| parse_rfc3339(s).map(|ts| (ts, s.to_string())))
-            .or_else(|| {
-                let msg = entry.usage_limit_message.as_deref()?;
-                let delta = parse_resets_in_secs(msg)?;
-                let base_ts = entry
-                    .latest_run_completed_at
-                    .as_deref()
-                    .or(entry.updated_at.as_deref())
-                    .and_then(parse_rfc3339)?;
-                let ts = base_ts + delta;
-                Some((ts, format_rfc3339(ts)))
-            });
-
-        let still_waiting = match &derived_reset {
-            Some((reset_ts, _)) => *reset_ts > now,
-            None => {
-                // Mid-run usage limit pause, or very recent failure without a reset timestamp.
-                if entry.status != "failed" {
-                    true
-                } else {
-                    entry
-                        .latest_run_completed_at
-                        .as_deref()
-                        .or(entry.updated_at.as_deref())
-                        .and_then(parse_rfc3339)
-                        .map(|t| now - t < USAGE_LIMIT_FALLBACK_SECS)
-                        .unwrap_or(false)
-                }
-            }
-        };
-
-        if still_waiting {
-            let reason = entry
-                .usage_limit_message
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("usage limit reached — waiting for tokens")
-                .to_string();
-            return Some(TokenWait {
-                reason,
-                reset_at: derived_reset.map(|(_, s)| s),
-                model_override: entry.latest_run_model.clone().or_else(|| entry.model.clone()),
-                provider_hint: entry.latest_run_provider.clone(),
-            });
+        entry.usage_limit_reset_at.as_ref()
+    };
+    let provider = entry.latest_run_provider.as_deref();
+    let (environment, _) = remote::owner(&entry.thread_id)
+        .unwrap_or_else(|| ("local".into(), entry.thread_id.clone()));
+    // A direct Codex or Claude connection can share a tanker within one device.
+    // An OpenCode connection can multiplex quota scopes, so it stays per thread.
+    let scope = match (provider, entry.latest_run_provider_instance.as_deref()) {
+        (Some(provider @ ("codex" | "claudeAgent")), Some(instance)) => {
+            serde_json::to_string(&(environment, provider, instance)).expect("strings serialize")
         }
-    }
-
-    // 2. Thread has an armed `limitRecovery` with a future `resetAt` while its
-    //    latest run is still `failed` (has not yet resumed/completed).
-    if entry.status == "failed" && entry.limit_recovery_auto_resume == Some(true) {
-        if let Some(reset_str) = entry.limit_recovery_reset_at.as_deref() {
-            if let Some(reset_ts) = parse_rfc3339(reset_str) {
-                if reset_ts > now {
-                    return Some(TokenWait {
-                        reason: "usage limit reached — waiting for tokens".to_string(),
-                        reset_at: Some(reset_str.to_string()),
-                        model_override: entry
-                            .limit_recovery_model
-                            .clone()
-                            .or_else(|| entry.latest_run_model.clone())
-                            .or_else(|| entry.model.clone()),
-                        provider_hint: entry
-                            .limit_recovery_provider
-                            .clone()
-                            .or_else(|| entry.latest_run_provider.clone()),
-                    });
-                }
-            }
-        }
-    }
-
-    None
+        _ => entry.thread_id.clone(),
+    };
+    Some(TokenWait {
+        reason: match entry.usage_limit_code.as_deref() {
+            Some("api_error_429" | "provider.rate-limit") => "Provider rate limit reached",
+            Some("provider.quota") => "Provider quota reached",
+            _ => "Provider usage limit reached",
+        }.into(),
+        reset_at: reset_at.cloned(),
+        model_override: entry.latest_run_model.clone(),
+        provider_hint: entry.latest_run_provider.clone(),
+        scope,
+    })
 }
 
 /// A thread is stale when its last update is older than 24 hours.
@@ -685,53 +530,35 @@ fn poll_subagents(parent_thread_ids: &HashSet<String>, now: i64) -> Vec<Subagent
 /// Also returns the set of recently done/archived/deleted thread IDs so any
 /// aircraft already in the world can taxi out, take off, and fly away forever.
 fn poll_threads() -> Option<(Vec<ThreadListEntry>, HashSet<String>)> {
-    let active_sql = "SELECT t.thread_id, t.title, t.updated_at, \
-               p.title AS project, \
-               json_extract(t.payload_json, '$.modelSelection.model') AS model, \
-               (SELECT r.run_id FROM orchestration_v2_projection_runs r \
-                WHERE r.thread_id = t.thread_id \
-                ORDER BY (r.completed_at IS NULL) DESC, r.ordinal DESC LIMIT 1) AS latest_run_id, \
-               COALESCE((SELECT r.status FROM orchestration_v2_projection_runs r \
-                         WHERE r.thread_id = t.thread_id \
-                         ORDER BY (r.completed_at IS NULL) DESC, r.ordinal DESC LIMIT 1), 'idle') AS status, \
-               (SELECT r.provider FROM orchestration_v2_projection_runs r \
-                WHERE r.thread_id = t.thread_id \
-                ORDER BY (r.completed_at IS NULL) DESC, r.ordinal DESC LIMIT 1) AS latest_run_provider, \
-               (SELECT json_extract(r.payload_json, '$.modelSelection.model') FROM orchestration_v2_projection_runs r \
-                WHERE r.thread_id = t.thread_id \
-                ORDER BY (r.completed_at IS NULL) DESC, r.ordinal DESC LIMIT 1) AS latest_run_model, \
-               (SELECT r.completed_at FROM orchestration_v2_projection_runs r \
-                WHERE r.thread_id = t.thread_id \
-                ORDER BY (r.completed_at IS NULL) DESC, r.ordinal DESC LIMIT 1) AS latest_run_completed_at, \
-               (SELECT COUNT(*) FROM orchestration_v2_projection_runtime_requests q \
-                WHERE q.thread_id = t.thread_id AND q.resolved_at IS NULL) AS pending, \
-               json_extract(t.payload_json, '$.limitRecovery.runId') AS limit_recovery_run_id, \
-               json_extract(t.payload_json, '$.limitRecovery.resetAt') AS limit_recovery_reset_at, \
-               json_extract(t.payload_json, '$.limitRecovery.autoResume') AS limit_recovery_auto_resume, \
-               (SELECT json_extract(lr.payload_json, '$.modelSelection.model') \
-                FROM orchestration_v2_projection_runs lr \
-                WHERE lr.run_id = json_extract(t.payload_json, '$.limitRecovery.runId') LIMIT 1) AS limit_recovery_model, \
-               (SELECT lr.provider \
-                FROM orchestration_v2_projection_runs lr \
-                WHERE lr.run_id = json_extract(t.payload_json, '$.limitRecovery.runId') LIMIT 1) AS limit_recovery_provider, \
-               (SELECT json_extract(i.payload_json, '$.failure.resetAt') \
-                FROM orchestration_v2_projection_turn_items i \
-                WHERE i.run_id = (SELECT r.run_id FROM orchestration_v2_projection_runs r \
-                                  WHERE r.thread_id = t.thread_id \
-                                  ORDER BY (r.completed_at IS NULL) DESC, r.ordinal DESC LIMIT 1) \
-                  AND i.type = 'error' \
-                  AND json_extract(i.payload_json, '$.failure.class') = 'usage_limit' \
-                ORDER BY i.ordinal DESC LIMIT 1) AS usage_limit_reset_at, \
-               (SELECT COALESCE(json_extract(i.payload_json, '$.failure.message'), json_extract(i.payload_json, '$.message')) \
-                FROM orchestration_v2_projection_turn_items i \
-                WHERE i.run_id = (SELECT r.run_id FROM orchestration_v2_projection_runs r \
-                                  WHERE r.thread_id = t.thread_id \
-                                  ORDER BY (r.completed_at IS NULL) DESC, r.ordinal DESC LIMIT 1) \
-                  AND ((i.type = 'error' AND json_extract(i.payload_json, '$.failure.class') = 'usage_limit') \
-                       OR (i.type = 'system_notice' AND i.payload_json LIKE '%usage-limit%')) \
-                ORDER BY i.ordinal DESC LIMIT 1) AS usage_limit_message \
-               FROM orchestration_v2_projection_threads t \
-               LEFT JOIN projection_projects p ON p.project_id = t.project_id \
+    let active_sql = "SELECT t.thread_id, t.title, t.updated_at,
+               p.title AS project,
+               json_extract(t.payload_json, '$.modelSelection.model') AS model,
+               r.run_id AS latest_run_id,
+               COALESCE(r.status, 'idle') AS status,
+               r.provider AS latest_run_provider,
+               json_extract(r.payload_json, '$.providerInstanceId') AS latest_run_provider_instance,
+               json_extract(r.payload_json, '$.modelSelection.model') AS latest_run_model,
+               (SELECT COUNT(*) FROM orchestration_v2_projection_runtime_requests q
+                WHERE q.thread_id = t.thread_id AND q.resolved_at IS NULL) AS pending,
+               json_extract(t.payload_json, '$.limitRecovery.runId') AS limit_recovery_run_id,
+               json_extract(t.payload_json, '$.limitRecovery.resetAt') AS limit_recovery_reset_at,
+               json_extract(t.payload_json, '$.limitRecovery.autoResume') AS limit_recovery_auto_resume,
+               CASE WHEN json_extract(i.payload_json, '$.failure.class') = 'usage_limit'
+                    THEN json_extract(i.payload_json, '$.failure.resetAt')
+               END AS usage_limit_reset_at,
+               CASE WHEN json_extract(i.payload_json, '$.failure.class') = 'usage_limit'
+                    THEN COALESCE(json_extract(i.payload_json, '$.failure.code'), '')
+               END AS usage_limit_code
+               FROM orchestration_v2_projection_threads t
+               LEFT JOIN projection_projects p ON p.project_id = t.project_id
+               LEFT JOIN orchestration_v2_projection_runs r ON r.run_id = (
+                   SELECT run_id FROM orchestration_v2_projection_runs
+                   WHERE thread_id = t.thread_id
+                   ORDER BY (completed_at IS NULL) DESC, ordinal DESC LIMIT 1)
+               LEFT JOIN orchestration_v2_projection_turn_items i ON i.turn_item_id = (
+                   SELECT turn_item_id FROM orchestration_v2_projection_turn_items
+                   WHERE run_id = r.run_id AND type = 'error'
+                   ORDER BY ordinal DESC LIMIT 1)
                WHERE t.deleted_at IS NULL \
                  AND t.archived_at IS NULL \
                  AND json_extract(t.payload_json, '$.archivedAt') IS NULL \
@@ -816,7 +643,6 @@ struct PollData {
     /// Thread IDs confirmed settled (marked done), archived, or deleted in T3.
     done_or_archived: HashSet<String>,
     subagents: Vec<SubagentRow>,
-    now: i64,
 }
 
 /// Fetch airports, threads, pending-request counts, and sub-agents off-lock.
@@ -855,7 +681,7 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>, cache:
     let mut stale = Vec::new();
     for e in entries {
         let env = remote::owner(&e.thread_id).map(|o| o.0).unwrap_or_else(|| "local".into());
-        if detect_token_wait(&e, now).is_some() {
+        if detect_token_wait(&e).is_some() {
             if *refuel_count.entry(env.clone()).or_default() < MAX_REFUELING {
                 let pending = e.pending;
                 flying.push((e, pending));
@@ -887,7 +713,6 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>, cache:
         stale,
         done_or_archived,
         subagents,
-        now,
     })
 }
 
@@ -934,6 +759,7 @@ struct KeepInfo {
     model: Option<String>,
     provider: Option<String>,
     reset_at: Option<String>,
+    refuel_scope: Option<String>,
     zone: String,
 }
 
@@ -950,21 +776,21 @@ fn apply_poll(
 ) -> Vec<(String, String)> {
     world.omitted_threads = data.omitted;
     world.airports = data.airports;
-    let now = data.now;
 
     let mut keep: HashMap<String, KeepInfo> = HashMap::new();
     let mut new_threads: Vec<(String, String, ModelClass)> = Vec::new();
     let mut active_projects: Vec<String> = Vec::new();
 
     for (entry, pending) in &data.flying {
-        let token_wait = detect_token_wait(entry, now);
-        let (state, reason, reset_at, eff_model, prov_hint) = if let Some(tw) = token_wait {
+        let token_wait = detect_token_wait(entry);
+        let (state, reason, reset_at, eff_model, prov_hint, refuel_scope) = if let Some(tw) = token_wait {
             (
                 State::Refueling,
                 Some(tw.reason),
                 tw.reset_at,
                 tw.model_override.or_else(|| entry.model.clone()),
                 tw.provider_hint,
+                Some(tw.scope),
             )
         } else {
             let (st, r) = flight_state(&entry.status, *pending);
@@ -974,9 +800,16 @@ fn apply_poll(
                 None,
                 entry.model.clone(),
                 entry.latest_run_provider.clone(),
+                None,
             )
         };
-        let (prov_key, _, _, _) = provider_info(eff_model.as_deref(), prov_hint.as_deref());
+        let (driver_key, _, _, _) = provider_info(None, prov_hint.as_deref());
+        let (model_key, _, _, _) = provider_info(eff_model.as_deref(), prov_hint.as_deref());
+        let prov_key = if refuel_scope.is_some() && driver_key != "generic" {
+            driver_key
+        } else {
+            model_key
+        };
         let mc = model_class(&eff_model);
         let (zone, is_project) = classify_zone(entry.project.as_deref(), &entry.title);
         if is_project && !active_projects.contains(&zone) {
@@ -992,6 +825,7 @@ fn apply_poll(
                 model: eff_model,
                 provider: Some(prov_key.to_string()),
                 reset_at,
+                refuel_scope,
                 zone,
             },
         );
@@ -1121,6 +955,7 @@ fn apply_poll(
             a.model = info.model.clone();
             a.model_class = info.model_class;
             a.provider = info.provider.clone();
+            a.refuel_scope = info.refuel_scope.clone();
             a.device = Some(home_name.to_string());
         } else if let Some((_, t, mc)) = new_threads.iter().find(|(id, _, _)| id == thread_id) {
             // Woken from the taxiway queue or a gate: the same airframe taxis
@@ -1137,6 +972,7 @@ fn apply_poll(
                         a.model = info.model.clone();
                         a.model_class = *mc;
                         a.provider = info.provider.clone();
+                        a.refuel_scope = info.refuel_scope.clone();
                         a.assign(&info.zone);
                         a.release();
                         a.hold_reason = info.reason.clone();
@@ -1150,6 +986,7 @@ fn apply_poll(
             a.title = info.title.clone().or_else(|| Some(t.clone()));
             a.model = info.model.clone();
             a.provider = info.provider.clone();
+            a.refuel_scope = info.refuel_scope.clone();
             a.device = Some(home_name.to_string());
             a.hold_reason = info.reason.clone();
             a.refuel_reset_at = info.reset_at.clone();
@@ -1397,12 +1234,7 @@ fn apply_poll(
         }
     }
 
-    // Reconcile provider aerial refuelling tankers for any waiting threads.
-    if !runway.primed {
-        world.snap_refueling_to_tankers();
-    } else {
-        world.sync_tankers();
-    }
+    world.sync_tankers();
 
     runway.primed = true;
     radio_events
@@ -1571,7 +1403,7 @@ mod tests {
         let poll = PollData { omitted: 3,
             airports: vec![Airport::home("local", "PC"), Airport::satellite("mac", "Mac", [400.0,0.0], false)],
             flying: vec![(make_entry("same", "Local", "running"),0), (make_entry(&remote::key("mac","same"), "Remote", "running"),0)],
-            taxiway: vec![], stale: vec![], done_or_archived: HashSet::new(), subagents: vec![], now: 1700000000 };
+            taxiway: vec![], stale: vec![], done_or_archived: HashSet::new(), subagents: vec![] };
         apply_poll(&mut world, "PC", poll, &mut sky, &mut taxi, &mut gates, &mut wing, &mut runway);
         let local = world.iter().find(|a| a.title.as_deref()==Some("Local")).unwrap();
         let remote = world.iter().find(|a| a.title.as_deref()==Some("Remote")).unwrap();
@@ -1592,25 +1424,10 @@ mod tests {
 
     #[test]
     fn staleness_boundary_is_24_hours() {
-        let now = 1_000_000_000i64;
-        let ts = |secs_ago: i64| {
-            let t = now - secs_ago;
-            let days = t.div_euclid(86400);
-            let rem = t.rem_euclid(86400);
-            let (y, m, d) = civil_from_days(days);
-            Some(format!(
-                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-                y,
-                m,
-                d,
-                rem / 3600,
-                (rem % 3600) / 60,
-                rem % 60
-            ))
-        };
-        assert!(!is_stale(&ts(24 * 3600 - 60), now));
-        assert!(is_stale(&ts(24 * 3600), now));
-        assert!(is_stale(&ts(48 * 3600), now));
+        let now = parse_rfc3339("2026-11-24T00:00:00Z").unwrap();
+        assert!(!is_stale(&Some("2026-11-23T00:00:01Z".into()), now));
+        assert!(is_stale(&Some("2026-11-23T00:00:00Z".into()), now));
+        assert!(is_stale(&Some("2026-11-22T00:00:00Z".into()), now));
         assert!(!is_stale(&None, now));
     }
 
@@ -1673,14 +1490,12 @@ mod tests {
             latest_run_id: Some(format!("run:{id}:1")),
             latest_run_provider: Some("claudeAgent".to_string()),
             latest_run_model: Some("claude-opus-5-5".to_string()),
-            latest_run_completed_at: None,
+            latest_run_provider_instance: None,
             limit_recovery_run_id: None,
             limit_recovery_reset_at: None,
             limit_recovery_auto_resume: None,
-            limit_recovery_model: None,
-            limit_recovery_provider: None,
             usage_limit_reset_at: None,
-            usage_limit_message: None,
+            usage_limit_code: None,
         }
     }
 
@@ -1710,7 +1525,6 @@ mod tests {
                 title: Some("Scout".to_string()),
                 model: None,
             }],
-            now: 1_700_000_000,
         };
         apply_poll(
             &mut world,
@@ -1737,7 +1551,6 @@ mod tests {
             stale: vec![],
             done_or_archived: done,
             subagents: vec![],
-            now: 1_700_000_010,
         };
         apply_poll(
             &mut world,
@@ -1790,7 +1603,6 @@ mod tests {
             stale: vec![],
             done_or_archived: HashSet::new(),
             subagents: vec![],
-            now: 1_700_000_000,
         };
         apply_poll(
             &mut world,
@@ -1813,7 +1625,6 @@ mod tests {
             stale: vec![],
             done_or_archived: HashSet::new(),
             subagents: vec![],
-            now: 1_700_000_010,
         };
         apply_poll(
             &mut world,
@@ -1838,7 +1649,6 @@ mod tests {
             stale: vec![],
             done_or_archived: HashSet::new(),
             subagents: vec![],
-            now: 1_700_000_020,
         };
         let mut touched_down = false;
         for _ in 0..3000 {
@@ -1892,7 +1702,6 @@ mod tests {
             stale: vec![],
             done_or_archived: HashSet::new(),
             subagents: vec![],
-            now: 1_700_000_000,
         };
         apply_poll(&mut world, "omarchy", poll(false), &mut callsigns, &mut taxiway_cs, &mut gates, &mut wingmen, &mut runway);
         let tx_id = world.get_mut("TX1").unwrap().id;
@@ -1929,7 +1738,6 @@ mod tests {
         let mut wingmen = Wingmen::default();
         let mut runway = RunwayOps::default();
 
-        let now = 1_700_000_000;
         let poll = |running: bool| PollData {
             omitted: 0,
             airports: vec![Airport::home("local", "omarchy")],
@@ -1946,7 +1754,6 @@ mod tests {
             stale: vec![],
             done_or_archived: HashSet::new(),
             subagents: vec![],
-            now,
         };
         // Running at startup: appears in the air.
         apply_poll(&mut world, "omarchy", poll(true), &mut callsigns, &mut taxiway_cs, &mut gates, &mut wingmen, &mut runway);
@@ -2007,7 +1814,6 @@ mod tests {
             stale: vec![],
             done_or_archived: HashSet::new(),
             subagents: vec![],
-            now: 1_700_000_000,
         };
         // Already running at startup: appears in the air.
         apply_poll(&mut world, "omarchy", poll(&["t-1"]), &mut callsigns, &mut taxiway_cs, &mut gates, &mut wingmen, &mut runway);
@@ -2021,14 +1827,93 @@ mod tests {
     }
 
     #[test]
-    fn parses_relative_reset_durations() {
-        assert_eq!(
-            parse_resets_in_secs("OpenCode Go usage limit reached (5-hour, resets in 2h 56m)."),
-            Some(2 * 3600 + 56 * 60)
+    fn only_current_structured_limit_waits_use_a_tanker() {
+        let fixtures: Vec<ThreadListEntry> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/provider-waits.json"
+        )).unwrap();
+        let waits: Vec<_> = fixtures.iter().map(|entry| detect_token_wait(entry)).collect();
+        assert_eq!(waits[0].as_ref().unwrap().reset_at.as_deref(), Some("2026-11-24T03:22:09.000Z"));
+        let open_code = waits[1].as_ref().unwrap();
+        assert_eq!(open_code.reset_at, None, "relative prose stays unknown");
+        assert_eq!(open_code.reason, "Provider quota reached");
+        assert_eq!(waits[2].as_ref().unwrap().reset_at.as_deref(), Some("2026-11-24T06:00:00.000Z"));
+        assert!(waits[3..].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn tanker_identity_survives_poll_updates_and_receiver_ownership_survives_disconnect() {
+        let mut world = World::new();
+        let (mut sky, mut taxi, mut gates, mut wing, mut runway) = (
+            Callsigns::default(),
+            TaxiwayCallsigns::default(),
+            GateCallsigns::default(),
+            Wingmen::default(),
+            RunwayOps::default(),
         );
-        assert_eq!(parse_resets_in_secs("resets in 3h"), Some(3 * 3600));
-        assert_eq!(parse_resets_in_secs("resets in 45m"), Some(45 * 60));
-        assert_eq!(parse_resets_in_secs("no timer here"), None);
+        let receiver = remote::key("mac", "shared-id");
+        let mut poll = |online, reset: &str, settled: bool| {
+            let wait = |id: &str, connection: &str| {
+                let mut entry = make_entry(id, id, "failed");
+                entry.latest_run_provider = Some("claudeAgent".into());
+                entry.latest_run_provider_instance = Some(connection.into());
+                entry.usage_limit_reset_at = Some(reset.into());
+                (entry, 0)
+            };
+            let mut flying = vec![wait("local-a", "connection-1"), wait("local-b", "connection-1"),
+                wait("local-c", "connection-2")];
+            if !settled { flying.push(wait(&receiver, "connection-1")); }
+            let data = PollData {
+                airports: vec![Airport::home("local", "PC"), Airport::satellite("mac", "Mac", [400.0, 0.0], online)],
+                omitted: 0,
+                flying,
+                taxiway: vec![],
+                stale: vec![],
+                done_or_archived: if settled { HashSet::from([receiver.clone()]) } else { HashSet::new() },
+                subagents: vec![],
+            };
+            apply_poll(&mut world, "PC", data, &mut sky, &mut taxi, &mut gates, &mut wing, &mut runway);
+            world.snapshot().aircraft
+        };
+        let initial = poll(true, "2026-11-24T02:00:00Z", false);
+        let get = |fleet: &[Aircraft], callsign: &str| {
+            fleet.iter().find(|a| a.callsign == callsign).unwrap().clone()
+        };
+        let remote = get(&initial, "SKY4");
+        let first = get(&initial, "SKY1");
+        assert_eq!(first.tanker_id, get(&initial, "SKY2").tanker_id);
+        assert_ne!(first.tanker_id, get(&initial, "SKY3").tanker_id);
+        assert_ne!(first.tanker_id, remote.tanker_id);
+        assert!(remote.tanker_id.is_some());
+
+        let extended = poll(true, "2026-11-24T06:00:00Z", false);
+        let updated = get(&extended, "SKY4");
+        assert_eq!(updated.tanker_id, remote.tanker_id);
+        assert_eq!(updated.refuel_slot, remote.refuel_slot);
+        assert_eq!(updated.position, remote.position, "a metadata update must not move the aircraft");
+        assert_eq!(updated.refuel_reset_at.as_deref(), Some("2026-11-24T06:00:00Z"));
+
+        let disconnected = poll(false, "2026-11-24T06:00:00Z", false);
+        let offline = get(&disconnected, "SKY4");
+        assert_eq!(offline.id, remote.id);
+        assert_eq!(offline.state, State::Refueling);
+        assert_eq!(offline.tanker_id, None);
+        assert!(offline.data_stale);
+        assert!(!disconnected.iter().any(|a| Some(a.id) == remote.tanker_id));
+
+        let reconnected = poll(true, "2026-11-24T06:00:00Z", false);
+        let back = get(&reconnected, "SKY4");
+        assert_eq!(back.id, remote.id);
+        assert_eq!(back.environment_id.as_deref(), Some("mac"));
+        assert_eq!(back.thread_id.as_deref(), Some("shared-id"));
+        assert!(!back.data_stale);
+        assert!(back.tanker_id.is_some());
+
+        let settled = poll(true, "2026-11-24T06:00:00Z", true);
+        let departing = get(&settled, "SKY4");
+        assert_eq!(departing.id, remote.id);
+        assert_eq!(departing.state, State::Departing);
+        assert!(departing.tanker_id.is_none());
+        assert!(!settled.iter().any(|a| Some(a.id) == back.tanker_id));
     }
 
     #[test]
@@ -2040,16 +1925,15 @@ mod tests {
         let mut wingmen = Wingmen::default();
         let mut runway = RunwayOps::default();
 
-        let now = parse_rfc3339("2026-11-23T22:15:00Z").unwrap();
         let mut limited = make_entry("t-claude", "Refuel Me", "failed");
         limited.usage_limit_reset_at = Some("2026-11-24T02:00:00.000Z".to_string());
-        limited.usage_limit_message = Some("Claude API rate limit reached.".to_string());
+        limited.usage_limit_code = Some("api_error_429".to_string());
 
         // Completed thread with stale limitRecovery must NOT trigger refueling.
         let mut completed = make_entry("t-done", "Recovered", "completed");
         completed.limit_recovery_auto_resume = Some(true);
         completed.limit_recovery_reset_at = Some("2026-11-24T02:00:00.000Z".to_string());
-        assert!(detect_token_wait(&completed, now).is_none());
+        assert!(detect_token_wait(&completed).is_none());
 
         let poll1 = PollData {
             omitted: 0,
@@ -2059,7 +1943,6 @@ mod tests {
             stale: vec![],
             done_or_archived: HashSet::new(),
             subagents: vec![],
-            now,
         };
         apply_poll(
             &mut world,
@@ -2090,7 +1973,6 @@ mod tests {
             stale: vec![],
             done_or_archived: HashSet::new(),
             subagents: vec![],
-            now: now + 60,
         };
         apply_poll(
             &mut world,
@@ -2108,23 +1990,4 @@ mod tests {
         assert_eq!(world.iter().filter(|a| a.kind == Kind::Tanker).count(), 0);
     }
 
-    #[test]
-    fn armed_limit_recovery_with_future_reset_uses_limit_model_tanker() {
-        let now = parse_rfc3339("2026-11-23T22:15:00Z").unwrap();
-        let mut entry = make_entry("t-lr", "Armed Recovery", "failed");
-        entry.model = Some("gemini-4-neon".to_string());
-        entry.latest_run_model = Some("gemini-4-neon".to_string());
-        entry.limit_recovery_auto_resume = Some(true);
-        entry.limit_recovery_reset_at = Some("2026-11-24T02:00:00.000Z".to_string());
-        entry.limit_recovery_model = Some("claude-opus-5-5".to_string());
-        entry.limit_recovery_provider = Some("claudeAgent".to_string());
-
-        let tw = detect_token_wait(&entry, now).expect("should detect armed limitRecovery");
-        assert_eq!(tw.model_override.as_deref(), Some("claude-opus-5-5"));
-        assert_eq!(tw.reset_at.as_deref(), Some("2026-11-24T02:00:00.000Z"));
-
-        // Past reset time -> no longer waiting.
-        let after = parse_rfc3339("2026-11-24T02:05:00Z").unwrap();
-        assert!(detect_token_wait(&entry, after).is_none());
-    }
 }
