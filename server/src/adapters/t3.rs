@@ -54,6 +54,79 @@ where
     })
 }
 
+/// Accepts T3's pending background work as an array (CLI/MCP) or as the JSON
+/// text SQLite's `json_group_array` yields; anything else means none.
+fn deserialize_background_tasks<'de, D>(deserializer: D) -> Result<Vec<BackgroundTask>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    let val = match val {
+        Some(serde_json::Value::String(text)) => serde_json::from_str(&text).unwrap_or_default(),
+        Some(v) => v,
+        None => serde_json::Value::Null,
+    };
+    Ok(match val {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| serde_json::from_value(item).ok())
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// Work a T3 agent left running after its run ended (T3's `pendingBackgroundTasks`).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, Deserialize)]
+struct BackgroundTask {
+    #[serde(default, alias = "taskId")]
+    task_id: Option<String>,
+    /// `command`, `monitor`, `subagent` or `background_task`.
+    #[serde(default)]
+    kind: Option<String>,
+    /// The agent said it is waiting on this task.
+    #[serde(default, deserialize_with = "deserialize_opt_bool_ish")]
+    awaited: Option<bool>,
+}
+
+/// T3 prefixes the background task it publishes for a watched pull request.
+const PULL_REQUEST_WATCH_TASK_ID: &str = "pull-request-watch:";
+
+impl BackgroundTask {
+    /// Mirrors T3's `backgroundWorkHoldsCompletion`: awaited work, sub-agents and
+    /// background tool calls keep the thread working after its run ends.
+    fn holds_thread(&self) -> bool {
+        self.awaited == Some(true)
+            || matches!(self.kind.as_deref(), Some("subagent" | "background_task"))
+    }
+
+    fn wait_reason(&self) -> &'static str {
+        match self.kind.as_deref() {
+            Some("subagent") => "waiting on sub-agent",
+            Some("background_task") => "waiting on background tool",
+            Some("monitor")
+                if self
+                    .task_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with(PULL_REQUEST_WATCH_TASK_ID)) =>
+            {
+                "watching pull request checks"
+            }
+            Some("monitor") => "waiting on monitor",
+            _ => "waiting on background command",
+        }
+    }
+
+    /// Lower ranks name the more specific wait when several tasks hold a thread.
+    fn reason_rank(&self) -> u8 {
+        match self.kind.as_deref() {
+            Some("subagent") => 0,
+            Some("background_task") => 1,
+            Some("command") => 2,
+            _ => 3,
+        }
+    }
+}
+
 #[derive(serde::Serialize, Deserialize)]
 struct ThreadListEntry {
     #[serde(rename = "threadId", alias = "thread_id")]
@@ -68,6 +141,15 @@ struct ThreadListEntry {
     updated_at: Option<String>,
     #[serde(default, alias = "pendingRequestCount")]
     pending: i64,
+    /// Kind of the unresolved runtime request T3 shows first (`user_input`,
+    /// `auth_refresh`, `dynamic_tool_call`, or a provider approval kind).
+    #[serde(default)]
+    pending_kind: Option<String>,
+    #[serde(default, alias = "pendingBackgroundTasks", deserialize_with = "deserialize_background_tasks")]
+    background_tasks: Vec<BackgroundTask>,
+    /// The running agent is blocked in `t3_thread_wait` / a waiting delegation.
+    #[serde(default, alias = "blockedOnThreadWait", deserialize_with = "deserialize_opt_bool_ish")]
+    blocked_on_thread_wait: Option<bool>,
     #[serde(default)]
     settled: bool,
     #[serde(rename = "settledAt", alias = "settled_at", default)]
@@ -105,6 +187,62 @@ impl ThreadListEntry {
     fn is_delegated(&self) -> bool {
         self.delegated_from.as_ref().is_some_and(|v| !v.is_null())
     }
+
+    /// T3 reports a thread whose latest run ended as `waiting` while awaited
+    /// background work outlives that run (its `threadStatus`); the run row alone
+    /// still says `completed`. Failed runs stay failed, as in T3.
+    fn settle_background_wait(&mut self) {
+        let settled = matches!(
+            self.status.as_str(),
+            "completed" | "cancelled" | "interrupted" | "idle"
+        );
+        if settled && self.background_tasks.iter().any(BackgroundTask::holds_thread) {
+            self.status = "waiting".to_string();
+        }
+    }
+
+    /// A parent whose own run ended keeps flying while its sub-agents work.
+    fn wait_on_subagents(&mut self) {
+        if !is_working_status(&self.status) {
+            self.status = "waiting".to_string();
+            self.background_tasks.push(BackgroundTask {
+                task_id: None,
+                kind: Some("subagent".to_string()),
+                awaited: Some(true),
+            });
+        }
+    }
+}
+
+/// Flight state plus the most specific reason T3's data gives for a hold.
+fn entry_flight_state(e: &ThreadListEntry) -> (State, Option<String>) {
+    let (state, reason) = flight_state(&e.status, e.pending);
+    if !is_working_status(&e.status) {
+        return (state, reason);
+    }
+    if e.pending > 0 {
+        let why = match e.pending_kind.as_deref() {
+            None | Some("user_input") => "awaiting your input",
+            Some("auth_refresh") => "waiting on sign-in",
+            Some("dynamic_tool_call") => "waiting on tool call",
+            Some(_) => "waiting on approval",
+        };
+        return (State::Holding, Some(why.to_string()));
+    }
+    if e.blocked_on_thread_wait == Some(true) {
+        return (State::Holding, Some("waiting on delegated thread".to_string()));
+    }
+    if e.status == "waiting" {
+        if let Some(task) = e
+            .background_tasks
+            .iter()
+            .filter(|t| t.holds_thread())
+            .min_by_key(|t| t.reason_rank())
+        {
+            return (State::Holding, Some(task.wait_reason().to_string()));
+        }
+    }
+    (state, reason)
 }
 
 /// A delegated thread only gets its own aircraft while it is doing work.
@@ -623,6 +761,47 @@ fn poll_threads() -> Option<(Vec<ThreadListEntry>, HashSet<String>)> {
                json_extract(r.payload_json, '$.modelSelection.model') AS latest_run_model,
                (SELECT COUNT(*) FROM orchestration_v2_projection_runtime_requests q
                 WHERE q.thread_id = t.thread_id AND q.resolved_at IS NULL) AS pending,
+               (SELECT q.kind FROM orchestration_v2_projection_runtime_requests q
+                WHERE q.thread_id = t.thread_id AND q.resolved_at IS NULL
+                ORDER BY (q.kind = 'user_input'), q.created_at DESC LIMIT 1) AS pending_kind,
+               (SELECT json_group_array(json(task)) FROM (
+                   SELECT json_object('taskId', json_extract(j.value, '$.taskId'),
+                                      'kind', json_extract(j.value, '$.kind'),
+                                      'awaited', json_extract(j.value, '$.awaited')) AS task
+                   FROM orchestration_v2_projection_provider_threads pt,
+                        json_each(pt.payload_json, '$.pendingBackgroundTasks') j
+                   WHERE pt.thread_id = t.thread_id
+                     AND (json_extract(t.payload_json, '$.activeProviderThreadId') IS NULL
+                          OR pt.provider_thread_id = json_extract(t.payload_json, '$.activeProviderThreadId'))
+                   UNION ALL
+                   SELECT json_object('taskId', bi.turn_item_id,
+                                      'kind', CASE bi.type WHEN 'subagent' THEN 'subagent' ELSE 'background_task' END)
+                   FROM orchestration_v2_projection_turn_items bi
+                   WHERE bi.thread_id = t.thread_id
+                     AND bi.type IN ('subagent', 'dynamic_tool')
+                     AND bi.status IN ('pending', 'running', 'waiting')
+                     AND NOT (bi.type = 'dynamic_tool'
+                              AND COALESCE(json_extract(bi.payload_json, '$.input.persistent'), 0) = 1)
+                     AND NOT EXISTS (SELECT 1 FROM orchestration_v2_projection_runs rb
+                                     WHERE rb.run_id = bi.run_id AND rb.status = 'rolled_back')
+                   UNION ALL
+                   SELECT json_object('taskId', 'pull-request-watch:' || COALESCE(json_extract(pr.value, '$.number'), ''),
+                                      'kind', 'monitor',
+                                      'awaited', CASE WHEN json_extract(pr.value, '$.watch.checksPending') = 0
+                                                       AND COALESCE(json_extract(pr.value, '$.watch.until'), '') != 'merged'
+                                                       AND COALESCE(json_extract(pr.value, '$.snapshot.state'), '') != 'merged'
+                                                      THEN 0 ELSE 1 END)
+                   FROM json_each(t.payload_json, '$.pullRequests') pr
+                   WHERE json_type(pr.value, '$.watch') = 'object'
+                     AND COALESCE(json_extract(pr.value, '$.source'), '') != 'stack-dismissed'
+               )) AS background_tasks,
+               (r.status = 'running' AND EXISTS (
+                   SELECT 1 FROM orchestration_v2_projection_turn_items wi
+                   WHERE wi.run_id = r.run_id AND wi.type = 'dynamic_tool'
+                     AND wi.status IN ('pending', 'running', 'waiting')
+                     AND (json_extract(wi.payload_json, '$.toolName') GLOB '*t3_thread_wait'
+                          OR (json_extract(wi.payload_json, '$.toolName') GLOB '*delegate_task'
+                              AND json_extract(wi.payload_json, '$.input.mode') = 'wait')))) AS blocked_on_thread_wait,
                json_extract(t.payload_json, '$.limitRecovery.runId') AS limit_recovery_run_id,
                json_extract(t.payload_json, '$.limitRecovery.resetAt') AS limit_recovery_reset_at,
                json_extract(t.payload_json, '$.limitRecovery.autoResume') AS limit_recovery_auto_resume,
@@ -820,6 +999,10 @@ fn partition_pools(
     // never queued on the taxiway or parked at a gate on their own.
     let entries: Vec<ThreadListEntry> = entries
         .into_iter()
+        .map(|mut e| {
+            e.settle_background_wait();
+            e
+        })
         .filter(|e| shown_on_its_own(e, &parents_with_active_subagents))
         .collect();
     let total_entries = entries.len();
@@ -842,8 +1025,8 @@ fn partition_pools(
         {
             if *working_count.entry(env.clone()).or_default() < MAX_AIRCRAFT {
                 let mut e = e;
-                if !is_working_status(&e.status) {
-                    e.status = "running".to_string();
+                if parents_with_active_subagents.contains(&e.thread_id) {
+                    e.wait_on_subagents();
                 }
                 let pending = e.pending;
                 flying.push((e, pending));
@@ -1076,7 +1259,7 @@ fn apply_poll(
     let mut new_threads: Vec<(String, String, ModelClass)> = Vec::new();
     let mut active_projects: Vec<String> = Vec::new();
 
-    for (entry, pending) in &data.flying {
+    for (entry, _) in &data.flying {
         let token_wait = detect_token_wait(entry);
         let (state, reason, reset_at, eff_model, prov_hint, refuel_scope) = if let Some(tw) = token_wait {
             (
@@ -1088,7 +1271,7 @@ fn apply_poll(
                 Some(tw.scope),
             )
         } else {
-            let (st, r) = flight_state(&entry.status, *pending);
+            let (st, r) = entry_flight_state(entry);
             (
                 st,
                 r,
@@ -1393,7 +1576,7 @@ fn apply_poll(
         }
         let owning_ap = airport_for_key(&world.airports, &entry.thread_id).cloned();
         let (slot_pos, slot_hdg) = taxiway_slot(&data.taxiway, i, &world.airports, gates);
-        let (_, reason) = flight_state(&entry.status, entry.pending);
+        let (_, reason) = entry_flight_state(entry);
         let (zone, _) = classify_zone(entry.project.as_deref(), &entry.title);
         if let Some(a) = world.get_mut(&cs) {
             if let Some(ap) = &owning_ap {
@@ -2027,6 +2210,9 @@ mod tests {
             model: Some("claude-opus-5-5".to_string()),
             updated_at: None,
             pending: 0,
+            pending_kind: None,
+            background_tasks: Vec::new(),
+            blocked_on_thread_wait: None,
             settled: false,
             settled_at: None,
             latest_run_id: Some(format!("run:{id}:1")),
@@ -2280,6 +2466,199 @@ mod tests {
         assert!(rolled, "should roll down the runway");
         assert_eq!(a.state, State::Cruising);
         assert!(a.altitude > 80.0);
+    }
+
+    /// A row shaped like the SQLite poll's output: the latest run row says
+    /// `completed` and the background work arrives as `json_group_array` text.
+    fn sqlite_row(id: &str, status: &str, background_tasks: &str) -> ThreadListEntry {
+        serde_json::from_value(serde_json::json!({
+            "thread_id": id,
+            "title": "Anon thread",
+            "status": status,
+            "model": "claude-opus-5-5",
+            "updated_at": "2026-11-24T21:12:19.789Z",
+            "pending": 0,
+            "pending_kind": null,
+            "latest_run_id": format!("run:{id}:2"),
+            "latest_run_provider": "claudeAgent",
+            "background_tasks": background_tasks,
+            "blocked_on_thread_wait": 0,
+            "delegated_from": null
+        }))
+        .expect("sqlite-shaped row parses")
+    }
+
+    fn pools(entries: Vec<ThreadListEntry>, subagents: Vec<SubagentRow>) -> (Vec<ThreadListEntry>, Vec<ThreadListEntry>) {
+        let now = parse_rfc3339("2026-11-24T21:17:00Z").unwrap();
+        let airports = vec![Airport::home("local", "home")];
+        let (flying, taxiway, stale, _, _) = partition_pools(entries, subagents, &airports, now);
+        assert!(stale.is_empty());
+        (flying.into_iter().map(|(e, _)| e).collect(), taxiway)
+    }
+
+    #[test]
+    fn completed_run_with_awaited_background_command_stays_airborne_and_says_why() {
+        // Reproduces the report: run status `completed`, no pending requests,
+        // one awaited background command on the provider thread; T3 says `waiting`.
+        let awaited = sqlite_row(
+            "anon-awaiting",
+            "completed",
+            r#"[{"taskId":"bg-1","kind":"command","awaited":1}]"#,
+        );
+        let fire_and_forget = sqlite_row(
+            "anon-detached",
+            "completed",
+            r#"[{"taskId":"bg-2","kind":"command","awaited":null}]"#,
+        );
+        let failed = sqlite_row(
+            "anon-failed",
+            "failed",
+            r#"[{"taskId":"bg-3","kind":"command","awaited":1}]"#,
+        );
+        let (flying, taxiway) = pools(vec![awaited, fire_and_forget, failed], vec![]);
+        assert_eq!(flying.len(), 1);
+        assert_eq!(flying[0].thread_id, "anon-awaiting");
+        assert_eq!(flying[0].status, "waiting");
+        assert_eq!(
+            entry_flight_state(&flying[0]),
+            (State::Holding, Some("waiting on background command".to_string()))
+        );
+        let ground: Vec<&str> = taxiway.iter().map(|e| e.thread_id.as_str()).collect();
+        assert_eq!(ground, vec!["anon-detached", "anon-failed"], "unawaited commands and failed runs stay down, as in T3");
+    }
+
+    #[test]
+    fn delegated_tasks_tool_calls_and_pull_request_watches_hold_with_their_reason() {
+        let cases = [
+            (r#"[{"taskId":"ti-1","kind":"background_task"},{"taskId":"ti-2","kind":"subagent"}]"#, "waiting on sub-agent"),
+            (r#"[{"taskId":"ti-3","kind":"background_task"}]"#, "waiting on background tool"),
+            (r#"[{"taskId":"pull-request-watch:github.com/anon/repo#7","kind":"monitor","awaited":1}]"#, "watching pull request checks"),
+            (r#"[{"taskId":"mon-1","kind":"monitor","awaited":1}]"#, "waiting on monitor"),
+        ];
+        for (tasks, reason) in cases {
+            let (flying, taxiway) = pools(vec![sqlite_row("anon", "completed", tasks)], vec![]);
+            assert!(taxiway.is_empty(), "{tasks} must not land");
+            assert_eq!(entry_flight_state(&flying[0]), (State::Holding, Some(reason.to_string())));
+        }
+        // A watched pull request whose checks finished no longer holds the thread.
+        let done = r#"[{"taskId":"pull-request-watch:github.com/anon/repo#7","kind":"monitor","awaited":0}]"#;
+        let (flying, taxiway) = pools(vec![sqlite_row("anon", "completed", done)], vec![]);
+        assert!(flying.is_empty());
+        assert_eq!(taxiway.len(), 1);
+    }
+
+    #[test]
+    fn pending_requests_and_thread_waits_name_what_the_thread_waits_on() {
+        let mut approval = make_entry("anon-approval", "Anon", "running");
+        approval.pending = 1;
+        approval.pending_kind = Some("command".into());
+        assert_eq!(entry_flight_state(&approval), (State::Holding, Some("waiting on approval".into())));
+        assert!(detect_token_wait(&approval).is_none(), "approval waits never refuel");
+
+        let mut question = make_entry("anon-question", "Anon", "waiting");
+        question.pending = 1;
+        question.pending_kind = Some("user_input".into());
+        assert_eq!(entry_flight_state(&question), (State::Holding, Some("awaiting your input".into())));
+
+        let mut blocked = make_entry("anon-blocked", "Anon", "running");
+        blocked.blocked_on_thread_wait = Some(true);
+        assert_eq!(entry_flight_state(&blocked), (State::Holding, Some("waiting on delegated thread".into())));
+
+        assert_eq!(entry_flight_state(&make_entry("anon-busy", "Anon", "running")), (State::Cruising, None));
+    }
+
+    #[test]
+    fn parent_whose_run_ended_holds_for_its_active_subagent() {
+        let sub = SubagentRow {
+            subagent_id: "anon-sub".into(),
+            thread_id: "anon-parent".into(),
+            child_thread_id: Some("anon-child".into()),
+            chat_thread_id: Some("anon-child".into()),
+            environment_id: None,
+            status: "running".into(),
+            updated_at: None,
+            title: Some("Anon scout".into()),
+            model: None,
+        };
+        let (flying, taxiway) = pools(vec![make_entry("anon-parent", "Anon", "completed")], vec![sub]);
+        assert!(taxiway.is_empty());
+        assert_eq!(entry_flight_state(&flying[0]), (State::Holding, Some("waiting on sub-agent".into())));
+    }
+
+    #[test]
+    fn linked_device_threads_keep_t3_background_wait_and_reason() {
+        // The MCP/CLI thread list already applies T3's status and lists the tasks.
+        let peer = remote::Peer {
+            environment_id: "anon-env".into(),
+            label: "Anon Laptop".into(),
+            online: true,
+            threads: Some(vec![serde_json::json!({
+                "threadId": "anon-remote",
+                "title": "Anon remote",
+                "status": "waiting",
+                "updatedAt": "2026-11-24T21:12:19Z",
+                "settled": false,
+                "pendingRequestCount": 0,
+                "blockedOnThreadWait": false,
+                "pendingBackgroundTasks": [
+                    {"taskId": "bg-9", "kind": "command", "description": "anon", "awaited": true}
+                ]
+            })]),
+        };
+        let (entries, _, _) = extract_peer_threads(&peer, 0, 600);
+        let (flying, taxiway) = pools(entries, vec![]);
+        assert!(taxiway.is_empty());
+        assert_eq!(flying[0].thread_id, remote::key("anon-env", "anon-remote"));
+        assert_eq!(entry_flight_state(&flying[0]), (State::Holding, Some("waiting on background command".into())));
+    }
+
+    #[test]
+    fn taxiing_thread_that_starts_waiting_on_background_work_takes_off_and_holds() {
+        let mut world = World::new();
+        let mut callsigns = Callsigns::default();
+        let mut taxiway_cs = TaxiwayCallsigns::default();
+        let mut gates = GateCallsigns::default();
+        let mut wingmen = Wingmen::default();
+        let mut runway = RunwayOps::default();
+        let waiting = r#"[{"taskId":"bg-1","kind":"command","awaited":1}]"#;
+        let poll = |tasks: &str| {
+            let (flying, taxiway) = pools(vec![sqlite_row("anon-1", "completed", tasks)], vec![]);
+            PollData {
+                omitted: 0,
+                local_environment_id: None,
+                airports: vec![Airport::home("local", "home")],
+                flying: flying.into_iter().map(|e| (e, 0)).collect(),
+                taxiway,
+                stale: vec![],
+                done_or_archived: HashSet::new(),
+                subagents: vec![],
+            }
+        };
+        apply_poll(&mut world, "home", poll("[]"), &mut callsigns, &mut taxiway_cs, &mut gates, &mut wingmen, &mut runway);
+        let tx_id = world.get_mut("TX1").unwrap().id;
+
+        apply_poll(&mut world, "home", poll(waiting), &mut callsigns, &mut taxiway_cs, &mut gates, &mut wingmen, &mut runway);
+        assert!(world.get_mut("TX1").is_none());
+        let sky = world.get_mut("SKY1").unwrap();
+        assert_eq!(sky.id, tx_id, "same airframe, no teleport");
+        assert_eq!(sky.state, State::Taxi);
+        assert_eq!(sky.hold_reason.as_deref(), Some("waiting on background command"));
+
+        let mut rolled = false;
+        for _ in 0..4000 {
+            world.tick(0.05);
+            apply_poll(&mut world, "home", poll(waiting), &mut callsigns, &mut taxiway_cs, &mut gates, &mut wingmen, &mut runway);
+            let a = world.get_mut("SKY1").unwrap();
+            rolled |= a.state == State::Takeoff && a.altitude <= 0.0;
+            if a.state == State::Holding && !a.in_runway_sequence() && a.altitude > 80.0 {
+                break;
+            }
+        }
+        let a = world.get_mut("SKY1").unwrap();
+        assert!(rolled, "should roll down the runway");
+        assert_eq!(a.state, State::Holding);
+        assert!(a.altitude > 80.0);
+        assert_eq!(a.hold_reason.as_deref(), Some("waiting on background command"));
     }
 
     #[test]
