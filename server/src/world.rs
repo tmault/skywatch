@@ -128,7 +128,7 @@ pub struct Aircraft {
     /// Human-readable subject (thread title or sub-agent task).
     #[serde(default)]
     pub title: Option<String>,
-    /// Owning device / airport name (e.g. "omarchy", "Tom's M5 Air").
+    /// Owning device / airport name (e.g. "omarchy", "M5 Air").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

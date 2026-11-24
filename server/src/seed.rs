@@ -29,7 +29,7 @@ const ALTITUDES: [f32; 5] = [100.0, 100.0, 0.0, 65.0, 65.0];
 pub fn seed(world: &mut World) {
     world.airports = vec![
         Airport::home("local", "omarchy"),
-        Airport::satellite("m5-air", "Tom's M5 Air", SATELLITE_SLOTS[0], true),
+        Airport::satellite("m5-air", "M5 Air", SATELLITE_SLOTS[0], true),
         Airport::satellite("m1", "m1", SATELLITE_SLOTS[1], true),
         Airport::satellite("devbox", "devbox", SATELLITE_SLOTS[2], false),
     ];
