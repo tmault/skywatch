@@ -855,6 +855,8 @@ function updateAircraftLabel(entry, a) {
   entry.label.material.needsUpdate = true;
 }
 
+const NOOP_RAYCAST = () => {};
+
 function makeHoldRing(scale) {
   const ring = new THREE.Mesh(
     new THREE.RingGeometry(14 / scale, 17 / scale, 32),
@@ -863,6 +865,7 @@ function makeHoldRing(scale) {
     }),
   );
   ring.rotation.x = -Math.PI / 2;
+  ring.raycast = NOOP_RAYCAST;
   return ring;
 }
 
@@ -876,6 +879,7 @@ function makeHoverRing(scale) {
   ring.rotation.x = -Math.PI / 2;
   ring.renderOrder = 11;
   ring.visible = false;
+  ring.raycast = NOOP_RAYCAST;
   return ring;
 }
 
@@ -1475,11 +1479,13 @@ let hoveredAlertAircraftId = null;
 let hoveredAlertAirportId = null;
 let airportGlideTarget = null;
 
-function selectAndFollowAircraft(id) {
+function selectAircraft(id) {
+  if (id === null || id === undefined) return false;
   const a = currentSnapshot.get(id);
-  if (!a) return false;
+  if (!a || !meshes.has(id)) return false;
   openRadio(a);
-  startFollow(a.id);
+  startFollow(id);
+  alerts.setActiveAircraft(id);
   return true;
 }
 
@@ -1498,7 +1504,7 @@ function focusAirport(airportId) {
 }
 
 const alerts = createAlertManager({
-  onSelectAircraft: (id) => selectAndFollowAircraft(id),
+  onSelectAircraft: (id) => selectAircraft(id),
   onFocusAirport: (airportId) => focusAirport(airportId),
   onHoverAircraft: (id, prevId = null) => {
     if (id != null) {
@@ -1582,6 +1588,7 @@ function stopFollow(glideToOverview = false) {
   returnOverview = glideToOverview;
   airportGlideTarget = null;
   updateFollowBadge(null);
+  alerts.setActiveAircraft(selectedAircraftId());
 }
 
 // Manual camera orbit/zoom cancels automatic swoop/return so controls feel responsive.
@@ -1614,6 +1621,11 @@ function isTypingTarget(el) {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
 }
 
+function isInteractiveTarget(el) {
+  if (!el || el.nodeType !== 1) return false;
+  return Boolean(el.closest('button, a[href], summary, [role="button"]'));
+}
+
 function releaseHeldKeys() {
   heldKeys.clear();
 }
@@ -1629,7 +1641,10 @@ window.addEventListener('keydown', (ev) => {
     return;
   }
   if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
-  if (ev.key === 'Enter' && focusRadioInput()) {
+  if (ev.key === 'Enter'
+      && !isInteractiveTarget(ev.target)
+      && !isInteractiveTarget(document.activeElement)
+      && focusRadioInput()) {
     ev.preventDefault();
     return;
   }
@@ -1858,7 +1873,7 @@ function showEventBanner(a, kind, verb) {
 
 if (eventBanner) {
   eventBanner.addEventListener('click', () => {
-    selectAndFollowAircraft(Number(eventBanner.dataset.aircraftId));
+    selectAircraft(Number(eventBanner.dataset.aircraftId));
   });
 }
 
@@ -1984,23 +1999,139 @@ function handleStateChange(a, from, to) {
 
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
-let downPos = null;
+const CLICK_DRAG_SQ = 36; // 6px movement threshold distinguishing click from orbit drag
+const MIN_SCREEN_PICK_PX = 20;
+const _pickWorld = new THREE.Vector3();
+const _pickNdc = new THREE.Vector3();
 
-canvas.addEventListener('pointerdown', (ev) => { downPos = [ev.clientX, ev.clientY]; });
-canvas.addEventListener('pointerup', (ev) => {
-  if (!downPos) return;
-  const [dx, dy] = [ev.clientX - downPos[0], ev.clientY - downPos[1]];
-  downPos = null;
-  if (dx * dx + dy * dy > 25) return;
+let downPos = null;
+let downPointerId = null;
+let pointerDragged = false;
+
+function isVisibleInHierarchy(obj, root) {
+  let cur = obj;
+  while (cur) {
+    if (!cur.visible) return false;
+    if (cur === root) return true;
+    cur = cur.parent;
+  }
+  return true;
+}
+
+function pickAircraftAt(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  const localX = clientX - rect.left;
+  const localY = clientY - rect.top;
 
   pointer.set(
-    (ev.clientX / window.innerWidth) * 2 - 1,
-    -(ev.clientY / window.innerHeight) * 2 + 1,
+    (localX / rect.width) * 2 - 1,
+    -(localY / rect.height) * 2 + 1,
   );
+  camera.updateMatrixWorld();
   raycaster.setFromCamera(pointer, camera);
-  const groups = [...meshes.values()].map((e) => e.group);
-  const hits = raycaster.intersectObjects(groups, true);
-  if (hits.length === 0) {
+
+  // Tier 1: exact raycast on visible airframe meshes + visible labels.
+  // Tier 2: per-aircraft invisible airframe hit proxy (fuselage/wings/tail envelope).
+  // Both tiers choose the NEAREST aircraft along the ray.
+  let bestDirectId = null;
+  let bestDirectDist = Infinity;
+  let bestProxyId = null;
+  let bestProxyDist = Infinity;
+
+  for (const [id, entry] of meshes.entries()) {
+    if (!entry.group.visible) continue;
+    entry.group.updateMatrixWorld();
+
+    const hits = raycaster.intersectObject(entry.group, true);
+    for (const h of hits) {
+      const obj = h.object;
+      if (obj === entry.ring || obj === entry.hoverRing) continue;
+      if (obj === entry.hitProxy || obj.userData?.isHitProxy) {
+        if (h.distance < bestProxyDist) {
+          bestProxyDist = h.distance;
+          bestProxyId = id;
+        }
+        continue;
+      }
+      if (obj === entry.label && entry.label.material.opacity <= 0.05) continue;
+      if (!isVisibleInHierarchy(obj, entry.group)) continue;
+      if (h.distance < bestDirectDist) {
+        bestDirectDist = h.distance;
+        bestDirectId = id;
+      }
+      break;
+    }
+  }
+
+  if (bestDirectId !== null) return bestDirectId;
+  if (bestProxyId !== null) return bestProxyId;
+
+  // Tier 3: minimum screen-space pick radius for small/distant aircraft in overview.
+  let bestScreenId = null;
+  let bestScreenDepth = Infinity;
+  const maxSq = MIN_SCREEN_PICK_PX * MIN_SCREEN_PICK_PX;
+
+  for (const [id, entry] of meshes.entries()) {
+    if (!entry.group.visible) continue;
+    if (entry.airframeCenter) {
+      _pickWorld.copy(entry.airframeCenter).applyMatrix4(entry.group.matrixWorld);
+    } else {
+      _pickWorld.copy(entry.group.position);
+    }
+    _pickNdc.copy(_pickWorld).project(camera);
+    if (_pickNdc.z < -1 || _pickNdc.z > 1) continue;
+    const sx = (_pickNdc.x * 0.5 + 0.5) * rect.width;
+    const sy = (-_pickNdc.y * 0.5 + 0.5) * rect.height;
+    const ddx = sx - localX;
+    const ddy = sy - localY;
+    if (ddx * ddx + ddy * ddy <= maxSq) {
+      const camDist = camera.position.distanceTo(_pickWorld);
+      if (camDist < bestScreenDepth) {
+        bestScreenDepth = camDist;
+        bestScreenId = id;
+      }
+    }
+  }
+
+  return bestScreenId;
+}
+
+canvas.addEventListener('pointerdown', (ev) => {
+  if (ev.button !== 0) return;
+  if (downPointerId !== null && ev.pointerId !== downPointerId) {
+    pointerDragged = true;
+    return;
+  }
+  downPos = [ev.clientX, ev.clientY];
+  downPointerId = ev.pointerId;
+  pointerDragged = false;
+});
+canvas.addEventListener('pointermove', (ev) => {
+  if (!downPos || ev.pointerId !== downPointerId || pointerDragged) return;
+  const dx = ev.clientX - downPos[0];
+  const dy = ev.clientY - downPos[1];
+  if (dx * dx + dy * dy > CLICK_DRAG_SQ) pointerDragged = true;
+});
+canvas.addEventListener('pointercancel', (ev) => {
+  if (ev.pointerId === downPointerId) {
+    downPos = null;
+    downPointerId = null;
+    pointerDragged = false;
+  }
+});
+canvas.addEventListener('pointerup', (ev) => {
+  if (!downPos || ev.pointerId !== downPointerId) return;
+  const dx = ev.clientX - downPos[0];
+  const dy = ev.clientY - downPos[1];
+  const wasDrag = pointerDragged || (dx * dx + dy * dy > CLICK_DRAG_SQ);
+  downPos = null;
+  downPointerId = null;
+  pointerDragged = false;
+  if (wasDrag) return;
+
+  const id = pickAircraftAt(ev.clientX, ev.clientY);
+  if (id === null) {
     // Clicking empty sky/water disengages follow cam.
     if (followId !== null) {
       stopFollow(false);
@@ -2008,18 +2139,7 @@ canvas.addEventListener('pointerup', (ev) => {
     }
     return;
   }
-  let obj = hits[0].object;
-  while (obj.parent && !groups.includes(obj)) obj = obj.parent;
-  if (!groups.includes(obj)) return;
-
-  const id = [...meshes.entries()].find(([, e]) => e.group === obj)?.[0];
-  if (id === undefined) return;
-
-  const a = currentSnapshot.get(id);
-  if (a) {
-    openRadio(a);
-    startFollow(id);
-  }
+  selectAircraft(id);
 });
 
 /* ----------------------------------------------------------- main loop */
@@ -2273,6 +2393,7 @@ function animate() {
   }
 
   // Follow camera: track the selected aircraft while keeping OrbitControls active.
+  const camDt = Math.min(dt, 0.1);
   if (followId !== null) {
     const entry = meshes.get(followId);
     if (entry) {
@@ -2285,7 +2406,7 @@ function animate() {
       }
       followLastPos = pos.clone();
 
-      const camK = 1 - Math.exp(-5.5 * dt);
+      const camK = 1 - Math.exp(-5.5 * camDt);
       controls.target.lerp(pos, camK);
 
       if (followSwoop) {
@@ -2297,7 +2418,7 @@ function animate() {
       }
     }
   } else if (airportGlideTarget) {
-    const camK = 1 - Math.exp(-5.0 * dt);
+    const camK = 1 - Math.exp(-5.0 * camDt);
     camera.position.lerp(airportGlideTarget.cam, camK);
     controls.target.lerp(airportGlideTarget.target, camK);
     if (camera.position.distanceTo(airportGlideTarget.cam) < 2.0
@@ -2305,7 +2426,7 @@ function animate() {
       airportGlideTarget = null;
     }
   } else if (returnOverview) {
-    const camK = 1 - Math.exp(-4.5 * dt);
+    const camK = 1 - Math.exp(-4.5 * camDt);
     camera.position.lerp(OVERVIEW_CAM, camK);
     controls.target.lerp(OVERVIEW_TARGET, camK);
     if (camera.position.distanceTo(OVERVIEW_CAM) < 2.0 && controls.target.distanceTo(OVERVIEW_TARGET) < 1.0) {

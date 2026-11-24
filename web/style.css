@@ -346,6 +346,11 @@ html, body {
   color: #ffffff;
   letter-spacing: 0.03em;
 }
+.alert-card:hover .alert-callsign,
+.alert-card:focus-visible .alert-callsign {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 .alert-title {
   color: var(--text);
   font-weight: 500;
@@ -534,6 +539,26 @@ button.tick-line:focus-visible {
   background: rgba(30, 36, 46, 0.96);
   border-color: rgba(255, 255, 255, 0.4);
   outline: none;
+}
+button.tick-line:focus-visible {
+  box-shadow: inset 0 0 0 1px #fff;
+}
+button.tick-line .tick-callsign {
+  color: #8be0ff;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: rgba(139, 224, 255, 0.55);
+}
+button.tick-line:hover .tick-callsign,
+button.tick-line:focus-visible .tick-callsign {
+  text-decoration-color: currentColor;
+}
+.tick-line.tick-gone {
+  opacity: 0.55;
+  cursor: default;
+}
+.tick-line.tick-gone .tick-callsign {
+  text-decoration: line-through;
 }
 button.tick-line.active {
   border-color: rgba(255, 255, 255, 0.55);
