@@ -19,6 +19,7 @@ import {
 } from './aircraft.js';
 import { liveryFor } from './livery.js';
 import { createLocalFlair } from './local-flair.js';
+import { createAlertManager, classifyAircraftUrgency, isPassiveHold } from './alerts.js';
 
 const WORLD_SIZE = 820;
 const INTERP_RATE = 10; // exponential smoothing constant (per second)
@@ -864,6 +865,19 @@ function makeHoldRing(scale) {
   return ring;
 }
 
+function makeHoverRing(scale) {
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(16 / scale, 21 / scale, 36),
+    new THREE.MeshBasicMaterial({
+      color: 0x5cf2ff, transparent: true, opacity: 0.92, side: THREE.DoubleSide, depthTest: false,
+    }),
+  );
+  ring.rotation.x = -Math.PI / 2;
+  ring.renderOrder = 11;
+  ring.visible = false;
+  return ring;
+}
+
 /* ----------------------------------------------------------- contrails */
 
 // Shared 2D vapor texture: soft Gaussian cross-section across V and smooth
@@ -1352,12 +1366,17 @@ function ensureMesh(a) {
   built.group.add(label);
   built.label = label;
   built.labelBaseY = label.position.y;
+  built.labelBaseScale = label.scale.clone();
   built.labelKey = null;
   updateAircraftLabel(built, a);
 
   const ring = makeHoldRing(s);
   ring.visible = false;
   built.group.add(ring);
+
+  const hoverRing = makeHoverRing(s);
+  built.group.add(hoverRing);
+  built.hoverRing = hoverRing;
 
   // Server position is [x, z, altitude]; Three.js is (x, y=altitude, z).
   const y = worldYForAircraft(a, built.wheelDrop);
@@ -1428,37 +1447,55 @@ function disposeMesh(id) {
   meshes.delete(id);
 }
 
-/* --------------------------------------------------------------- ticker */
+/* --------------------------------------------------------------- alerts */
 
-const tickerEl = document.getElementById('ticker-lines');
-const pinnedHold = new Map();
+const reducedMotionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+let hoveredAlertAircraftId = null;
+let hoveredAlertAirportId = null;
+let airportGlideTarget = null;
 
-function addTickerLine(text, holding = false, aircraftId = null, kind = '') {
-  const line = document.createElement('div');
-  line.className = 'tick-line' + (holding ? ' hold' : '') + (kind ? ` ${kind}` : '');
-  line.textContent = text;
-  line._aircraftId = aircraftId;
-  tickerEl.appendChild(line);
-  if (holding && aircraftId !== null) {
-    pinnedHold.set(aircraftId, line);
-  }
-  while (tickerEl.children.length > 5) {
-    const first = tickerEl.firstElementChild;
-    if (pinnedHold.has(first._aircraftId) && pinnedHold.get(first._aircraftId) === first) {
-      tickerEl.appendChild(first);
-      break;
+function selectAndFollowAircraft(id) {
+  const a = currentSnapshot.get(id);
+  if (!a) return false;
+  openRadio(a);
+  startFollow(a.id);
+  return true;
+}
+
+function focusAirport(airportId) {
+  const ap = airportGroups.get(airportId);
+  if (!ap) return false;
+  stopFollow(false);
+  closeRadio();
+  returnOverview = false;
+  const [cx, cz] = ap.center;
+  airportGlideTarget = {
+    target: new THREE.Vector3(cx, 12, cz),
+    cam: new THREE.Vector3(cx, 185, cz + 175),
+  };
+  return true;
+}
+
+const alerts = createAlertManager({
+  onSelectAircraft: (id) => selectAndFollowAircraft(id),
+  onFocusAirport: (airportId) => focusAirport(airportId),
+  onHoverAircraft: (id, prevId = null) => {
+    if (id != null) {
+      hoveredAlertAircraftId = id;
+      hoveredAlertAirportId = null;
+    } else if (prevId == null || hoveredAlertAircraftId === prevId) {
+      hoveredAlertAircraftId = null;
     }
-    tickerEl.removeChild(first);
-  }
-}
-
-function unpinHold(aircraftId) {
-  const line = pinnedHold.get(aircraftId);
-  if (line) {
-    line.classList.remove('hold');
-    pinnedHold.delete(aircraftId);
-  }
-}
+  },
+  onHoverAirport: (airportId, prevId = null) => {
+    if (airportId != null) {
+      hoveredAlertAirportId = airportId;
+      hoveredAlertAircraftId = null;
+    } else if (prevId == null || hoveredAlertAirportId === prevId) {
+      hoveredAlertAirportId = null;
+    }
+  },
+});
 
 /* ---------------------------------------------------------- websockets */
 
@@ -1512,6 +1549,7 @@ function startFollow(id) {
   followLastPos = entry.group.position.clone();
   followSwoop = true;
   returnOverview = false;
+  airportGlideTarget = null;
   updateFollowBadge(a);
 }
 
@@ -1521,6 +1559,7 @@ function stopFollow(glideToOverview = false) {
   followLastPos = null;
   followSwoop = false;
   returnOverview = glideToOverview;
+  airportGlideTarget = null;
   updateFollowBadge(null);
 }
 
@@ -1528,6 +1567,7 @@ function stopFollow(glideToOverview = false) {
 controls.addEventListener('start', () => {
   followSwoop = false;
   returnOverview = false;
+  airportGlideTarget = null;
 });
 
 followEl.addEventListener('click', () => {
@@ -1575,16 +1615,23 @@ window.addEventListener('keydown', (ev) => {
   if (ev.key === 'Home') {
     ev.preventDefault();
     stopFollow(false);
+    airportGlideTarget = null;
     returnOverview = true;
     return;
   }
   const key = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
+  if (key === 'n') {
+    ev.preventDefault();
+    alerts.jumpToNextAttention(followId ?? selectedAircraftId());
+    return;
+  }
   if (!CAMERA_KEYS.has(key)) return;
   ev.preventDefault();
   heldKeys.add(key);
   // Manual input takes over from automatic swoop/return glides.
   followSwoop = false;
   returnOverview = false;
+  airportGlideTarget = null;
 });
 
 window.addEventListener('keyup', (ev) => {
@@ -1738,7 +1785,7 @@ function applySnapshot(snapshot) {
     if (!seen.has(id)) {
       disposeMesh(id);
       lastStates.delete(id);
-      unpinHold(id);
+      if (hoveredAlertAircraftId === id) hoveredAlertAircraftId = null;
       if (followId === id) stopFollow(true);
     }
   }
@@ -1764,6 +1811,8 @@ function applySnapshot(snapshot) {
       closeRadio();
     }
   }
+
+  alerts.syncSnapshot(snapshot, followId ?? selectedAircraftId());
 }
 
 /* ------------------------------------------------- takeoff / landing */
@@ -1788,10 +1837,7 @@ function showEventBanner(a, kind, verb) {
 
 if (eventBanner) {
   eventBanner.addEventListener('click', () => {
-    const a = currentSnapshot.get(Number(eventBanner.dataset.aircraftId));
-    if (!a) return;
-    openRadio(a);
-    startFollow(a.id);
+    selectAndFollowAircraft(Number(eventBanner.dataset.aircraftId));
   });
 }
 
@@ -1832,30 +1878,69 @@ function detectRunwayEvent(a, entry, from, prevAlt) {
 }
 
 function handleStateChange(a, from, to) {
-  const tag = a.title ? `${a.callsign} (${formatTaskTitle(a)})` : a.callsign;
+  const base = {
+    aircraftId: a.id,
+    callsign: a.callsign,
+    title: a.title || '',
+  };
   if (a.kind === 'tanker' && from === undefined) {
-    addTickerLine(`${tag}: aerial refuelling tanker on station above airspace.`, true, a.id);
+    alerts.addRoutineEvent({
+      ...base,
+      eventKey: 'tanker-station',
+      reason: 'aerial refuelling tanker on station above airspace',
+      kind: 'refuel',
+    });
     return;
   }
   if (a.kind === 'fighter' && from === undefined) {
-    addTickerLine(`${tag}: fighter wingman on station.`);
+    alerts.addRoutineEvent({
+      ...base,
+      eventKey: 'wingman',
+      reason: 'fighter wingman on station',
+      kind: 'routine',
+    });
     return;
   }
   if (to === 'holding') {
-    addTickerLine(`${tag}: entering hold — awaiting approval`, true, a.id);
+    if (isPassiveHold(a)) {
+      alerts.addRoutineEvent({
+        ...base,
+        eventKey: `wait:${a.hold_reason}`,
+        reason: a.hold_reason,
+        kind: 'routine',
+      });
+    }
+    // Approval / input / sign-in holds are displayed in the urgent Needs You stack.
   } else if (to === 'refueling') {
-    addTickerLine(`${tag}: connecting to tanker — waiting for tokens`, true, a.id);
-  } else {
-    unpinHold(a.id);
-    if (to === 'takeoff') addTickerLine(`${tag}: rolling, Runway 36.`, false, a.id, 'takeoff');
-    else if (to === 'departing') addTickerLine(`${tag}: thread done — departing into the horizon.`, false, a.id, 'takeoff');
-    else if (to === 'landing') addTickerLine(`${tag}: on approach, Runway 36.`, false, a.id, 'landing');
-    else if (to === 'landed') addTickerLine(`${tag}: touchdown.`, false, a.id, 'landing');
-    else if (to === 'taxi') addTickerLine(`${tag}: taxiing.`);
-    else if (to === 'parked') addTickerLine(`${tag}: parked at the gate.`);
-    else if (to === 'ready') addTickerLine(`${tag}: lined up, ready for takeoff.`, true, a.id);
-    else if (to === 'cruising' && from === 'refueling') addTickerLine(`${tag}: provider wait ended — resuming patrol.`);
-    else if (to === 'cruising' && from !== undefined) addTickerLine(`${tag}: cruising.`);
+    // Active provider-limit waits stay visible in the informational refuelling strip.
+  } else if (to === 'ready') {
+    if (!classifyAircraftUrgency(a)) {
+      alerts.addRoutineEvent({
+        ...base,
+        eventKey: 'queued',
+        reason: a.hold_reason || 'queued on taxiway',
+        kind: 'routine',
+      });
+    }
+    // Failed runs (state=ready with failed reason) are displayed in the urgent Needs You stack.
+  } else if (to === 'takeoff') {
+    alerts.addRoutineEvent({ ...base, eventKey: 'takeoff', reason: 'rolling, Runway 36', kind: 'takeoff' });
+  } else if (to === 'departing') {
+    alerts.addRoutineEvent({ ...base, eventKey: 'departing', reason: 'thread done — departing into the horizon', kind: 'takeoff' });
+  } else if (to === 'landing') {
+    alerts.addRoutineEvent({ ...base, eventKey: 'landing', reason: 'on approach, Runway 36', kind: 'landing' });
+  } else if (to === 'landed') {
+    alerts.addRoutineEvent({ ...base, eventKey: 'landed', reason: 'touchdown', kind: 'landing' });
+  } else if (to === 'taxi') {
+    alerts.addRoutineEvent({ ...base, eventKey: 'taxi', reason: 'taxiing', kind: 'routine' });
+  } else if (to === 'parked') {
+    alerts.addRoutineEvent({ ...base, eventKey: 'parked', reason: 'parked at the gate', kind: 'routine' });
+  } else if (to === 'cruising' && from === 'refueling') {
+    alerts.addRoutineEvent({ ...base, eventKey: 'refuel-done', reason: 'provider wait ended — resuming patrol', kind: 'refuel' });
+  } else if (to === 'cruising' && from === 'holding') {
+    alerts.addRoutineEvent({ ...base, eventKey: 'hold-cleared', reason: 'hold cleared — resuming patrol', kind: 'takeoff' });
+  } else if (to === 'cruising' && from !== undefined) {
+    alerts.addRoutineEvent({ ...base, eventKey: 'cruising', reason: 'cruising', kind: 'routine' });
   }
   if (selectedAircraftId() === a.id && from !== undefined) {
     const note = {
@@ -1927,7 +2012,8 @@ function animate() {
   const k = 1 - Math.exp(-INTERP_RATE * dt);
 
   const now = performance.now() / 1000;
-  for (const entry of meshes.values()) {
+  const reduceMotion = reducedMotionQuery.matches;
+  for (const [id, entry] of meshes.entries()) {
     entry.group.position.y -= entry.clearanceAdjustment || 0;
     entry.clearanceAdjustment = 0;
     const wrapped = entry.state !== 'departing' && entry.group.position.distanceToSquared(entry.target) > 40000;
@@ -2101,11 +2187,34 @@ function animate() {
     }
 
     if (entry.ring.visible) {
-      const pulse = 1 + 0.25 * Math.sin(now * 4);
+      const pulse = reduceMotion ? 1.05 : 1 + 0.25 * Math.sin(now * 4);
       const baseScale = entry.kind === 'tanker' ? 1.85 : 1;
       entry.ring.scale.setScalar(pulse * baseScale);
       entry.ring.position.y = (0.8 - entry.group.position.y) / entry.scale;
-      entry.ring.material.opacity = 0.5 + 0.35 * Math.sin(now * 4);
+      entry.ring.material.opacity = reduceMotion ? 0.72 : 0.5 + 0.35 * Math.sin(now * 4);
+    }
+
+    const isAlertHovered = hoveredAlertAircraftId === id;
+    if (entry.hoverRing) {
+      entry.hoverRing.visible = isAlertHovered;
+      if (isAlertHovered) {
+        const hoverPulse = reduceMotion ? 1.08 : 1.05 + 0.16 * Math.sin(now * 6);
+        const hoverBase = entry.kind === 'tanker' ? 1.55 : 1;
+        entry.hoverRing.scale.setScalar(hoverPulse * hoverBase);
+        entry.hoverRing.material.opacity = reduceMotion ? 0.92 : 0.76 + 0.22 * Math.sin(now * 6);
+      }
+    }
+    if (entry.labelBaseScale) {
+      const factor = isAlertHovered ? 1.28 : 1;
+      const targetX = entry.labelBaseScale.x * factor;
+      const targetY = entry.labelBaseScale.y * factor;
+      if (reduceMotion) {
+        entry.label.scale.set(targetX, targetY, 1);
+      } else {
+        const lk = 1 - Math.exp(-12 * dt);
+        entry.label.scale.x += (targetX - entry.label.scale.x) * lk;
+        entry.label.scale.y += (targetY - entry.label.scale.y) * lk;
+      }
     }
   }
 
@@ -2135,7 +2244,9 @@ function animate() {
   updateAlpine(now);
 
   for (const ap of airportGroups.values()) {
-    const pulse = ap.online ? 0.85 + 0.3 * Math.sin(now * 3) : 0.7;
+    const isApHovered = hoveredAlertAirportId === ap.id;
+    const basePulse = ap.online ? (reduceMotion ? 1 : 0.85 + 0.3 * Math.sin(now * 3)) : 0.7;
+    const pulse = isApHovered ? (reduceMotion ? 1.7 : 1.5 + 0.35 * Math.sin(now * 6)) : basePulse;
     ap.beacon.scale.setScalar(pulse);
     ap.lights.update(now);
   }
@@ -2163,6 +2274,14 @@ function animate() {
           followSwoop = false;
         }
       }
+    }
+  } else if (airportGlideTarget) {
+    const camK = 1 - Math.exp(-5.0 * dt);
+    camera.position.lerp(airportGlideTarget.cam, camK);
+    controls.target.lerp(airportGlideTarget.target, camK);
+    if (camera.position.distanceTo(airportGlideTarget.cam) < 2.0
+        && controls.target.distanceTo(airportGlideTarget.target) < 1.0) {
+      airportGlideTarget = null;
     }
   } else if (returnOverview) {
     const camK = 1 - Math.exp(-4.5 * dt);

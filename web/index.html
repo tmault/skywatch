@@ -10,52 +10,80 @@
   <div id="app">
     <canvas id="scene"></canvas>
 
-    <header id="hud">
-      <h1>SKYWATCH</h1>
-      <span id="hud-status">connecting…</span>
-      <button id="hud-follow" hidden title="Exit follow camera (Esc) · Arrows orbit · +/− zoom"></button>
-      <span id="hud-count"></span>
-    </header>
-
-    <button id="event-banner" type="button" hidden title="Follow this aircraft">
-      <span class="event-icon" aria-hidden="true"></span>
-      <span class="event-kind"></span>
-      <span class="event-callsign"></span>
-      <span class="event-title"></span>
-    </button>
-
-    <aside id="radio-panel" hidden>
-      <button id="radio-close" title="Close">×</button>
-      <h2 id="radio-callsign">—</h2>
-      <div id="radio-meta">
-        <span id="radio-kind"></span>
-        <span id="radio-state"></span>
-      </div>
-      <div id="radio-hold-reason" hidden></div>
-      <div id="radio-conversation">
-        <div class="radio-conversation-actions">
-          <a id="radio-open-web" target="_blank" rel="noopener noreferrer" hidden>Open in T3 Web</a>
-          <a id="radio-open-desktop" hidden>Open in local harness</a>
+    <div id="hud-layer">
+      <header id="hud">
+        <h1>SKYWATCH</h1>
+        <span id="hud-status">connecting…</span>
+        <button id="hud-follow" hidden title="Exit follow camera (Esc) · Arrows orbit · +/− zoom"></button>
+        <div id="hud-right-meta">
+          <button id="hud-urgent" type="button" hidden title="Focus alerts needing attention (press N to jump to next)">
+            <svg class="hud-urgent-icon" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M8 2.2 14.2 13H1.8L8 2.2Z" />
+              <path d="M8 6.4v2.9" />
+              <circle cx="8" cy="11.3" r="0.6" fill="currentColor" stroke="none" />
+            </svg>
+            <span id="hud-urgent-text"></span>
+          </button>
+          <span id="hud-count"></span>
         </div>
-        <p id="radio-conversation-note"></p>
-        <details id="radio-thread-reference" hidden>
-          <summary>Thread reference</summary>
-          <code id="radio-thread-id"></code>
-        </details>
-      </div>
-      <div id="radio-log"></div>
-      <div id="radio-input-row">
-        <input id="radio-text" type="text" placeholder="Message aircraft…" autocomplete="off" />
-        <button id="radio-send">Send</button>
-      </div>
-      <div id="radio-actions" hidden>
-        <button id="radio-approve">Approve</button>
-        <button id="radio-reject">Reject</button>
-      </div>
-    </aside>
+      </header>
 
-    <div id="ticker">
-      <div id="ticker-lines"></div>
+      <div id="hud-body">
+        <button id="event-banner" type="button" hidden title="Follow this aircraft">
+          <span class="event-icon" aria-hidden="true"></span>
+          <span class="event-kind"></span>
+          <span class="event-callsign"></span>
+          <span class="event-title"></span>
+        </button>
+
+        <div id="hud-left">
+          <div id="ticker" aria-label="Airspace activity">
+            <div id="ticker-refuel" hidden></div>
+            <div id="ticker-lines"></div>
+          </div>
+        </div>
+
+        <div id="hud-right">
+          <section id="attention-stack" hidden aria-label="Needs your attention">
+            <div class="attention-header">
+              <span class="attention-heading">Needs you <span id="attention-count" class="attention-count">0</span></span>
+              <span class="attention-hint" title="Press N to jump to the next aircraft needing attention">N: next</span>
+              <button id="attention-toggle" type="button" aria-expanded="true" title="Collapse needs-you stack">−</button>
+            </div>
+            <div id="attention-list"></div>
+          </section>
+
+          <aside id="radio-panel" hidden>
+            <button id="radio-close" title="Close">×</button>
+            <h2 id="radio-callsign">—</h2>
+            <div id="radio-meta">
+              <span id="radio-kind"></span>
+              <span id="radio-state"></span>
+            </div>
+            <div id="radio-hold-reason" hidden></div>
+            <div id="radio-conversation">
+              <div class="radio-conversation-actions">
+                <a id="radio-open-web" target="_blank" rel="noopener noreferrer" hidden>Open in T3 Web</a>
+                <a id="radio-open-desktop" hidden>Open in local harness</a>
+              </div>
+              <p id="radio-conversation-note"></p>
+              <details id="radio-thread-reference" hidden>
+                <summary>Thread reference</summary>
+                <code id="radio-thread-id"></code>
+              </details>
+            </div>
+            <div id="radio-log"></div>
+            <div id="radio-input-row">
+              <input id="radio-text" type="text" placeholder="Message aircraft…" autocomplete="off" />
+              <button id="radio-send">Send</button>
+            </div>
+            <div id="radio-actions" hidden>
+              <button id="radio-approve">Approve</button>
+              <button id="radio-reject">Reject</button>
+            </div>
+          </aside>
+        </div>
+      </div>
     </div>
   </div>
 
