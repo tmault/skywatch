@@ -1,3 +1,5 @@
 /server/target/
 *.swp
 .DS_Store
+.nightshift/
+__pycache__/
