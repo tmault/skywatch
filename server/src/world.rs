@@ -129,6 +129,16 @@ impl Default for RunwayLayout {
 }
 
 impl RunwayLayout {
+    /// Distance along the extended centerline from the final approach fix to touchdown.
+    pub fn final_len(&self) -> f32 {
+        wrap_centered(self.final_approach_fix[1] - self.touchdown_z).max(FLARE_DISTANCE)
+    }
+
+    /// A runway occupancy this close (u) to touchdown forces a go-around.
+    pub fn goaround_dist(&self) -> f32 {
+        if self.is_home { GOAROUND_BLOCKED_DIST } else { SATELLITE_GOAROUND_DIST }
+    }
+
     pub const fn home() -> Self {
         Self {
             is_home: true,
@@ -157,10 +167,11 @@ impl RunwayLayout {
             touchdown_z: cz + 22.0,
             liftoff_z: cz - 14.0,
             end_z: cz - 36.5,
-            // 85u south of threshold keeps southern satellites (cz=285 -> z=400)
-            // inside the ±410 map edge so final approaches never wrap visually.
-            final_approach_fix: [rx, wrap_centered(thresh_z + 85.0)],
-            approach_alt: 28.0,
+            // Same three-degree glide as home on a shorter final. Southern
+            // satellites' finals extend past the map edge over open water;
+            // approaches fly in the airport's chart, so they never wrap there.
+            final_approach_fix: [rx, wrap_centered(cz + 22.0 + SATELLITE_FINAL_LEN)],
+            approach_alt: GLIDE_SLOPE * (SATELLITE_FINAL_LEN - FLARE_DISTANCE / 2.0),
             taxiway_x: center[0] + 16.0,
             apron_x: center[0] + 16.0,
         }
@@ -190,6 +201,9 @@ pub struct Aircraft {
     pub position: [f32; 3],
     pub heading: f32,
     pub altitude: f32,
+    /// Landing attitude in radians, positive nose up; independent of snapshot cadence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_pitch: Option<f32>,
     pub hold_reason: Option<String>,
     /// Topic sector this aircraft works in (None = unassigned).
     #[serde(default)]
@@ -302,6 +316,9 @@ pub struct Aircraft {
     /// Landing: false while inbound to the final approach fix, true on final.
     #[serde(skip)]
     on_final: bool,
+    /// Arrival circuit: east entry, base leg, then aligned glide capture.
+    #[serde(skip)]
+    approach_leg: u8,
     /// Arrival hand-off: after rollout, backtrack the runway and park here
     /// `(position, heading)` in `State::Ready` instead of taxiing to a gate.
     #[serde(skip)]
@@ -408,19 +425,31 @@ const CLIMB_OUT_ALT: f32 = 45.0;
 /// Final approach fix on the extended Runway 36 centerline (south of the island).
 const FINAL_APPROACH_FIX: [f32; 2] = [RUNWAY_THRESHOLD[0], RUNWAY_THRESHOLD[1] + 230.0];
 /// Altitude crossing the final approach fix.
-const APPROACH_ALT: f32 = 42.0;
+const APPROACH_ALT: f32 = GLIDE_SLOPE * (FINAL_APPROACH_FIX[1] - TOUCHDOWN_Z - FLARE_DISTANCE / 2.0);
 /// Main-gear touchdown point just past the threshold.
 const TOUCHDOWN_Z: f32 = RUNWAY_THRESHOLD[1] - 12.0;
 /// Far end of Runway 36 in the landing direction; rollout must stop short of it.
 const RUNWAY_END_Z: f32 = -76.0;
-/// Glide-shape exponent: >1 flattens the final descent into a natural flare,
-/// easing the descent rate toward zero at the touchdown point.
-const FLARE_EXP: f32 = 1.35;
-/// Bounded vertical correction rates (u/s) while tracking the shaped glide.
-const GLIDE_DESCENT_RATE: f32 = 12.0;
-const GLIDE_CLIMB_RATE: f32 = 10.0;
+/// Three-degree final, tangent to a parabolic flare over the last 50 units.
+const GLIDE_SLOPE: f32 = 0.05240778;
+const FLARE_DISTANCE: f32 = 50.0;
+const GLIDE_DESCENT_RATE: f32 = 2.0;
+const GLIDE_CLIMB_RATE: f32 = 2.0;
+
+fn glide_height(distance: f32) -> f32 {
+    let d = distance.max(0.0);
+    if d < FLARE_DISTANCE {
+        GLIDE_SLOPE * d * d / (2.0 * FLARE_DISTANCE)
+    } else {
+        GLIDE_SLOPE * (d - FLARE_DISTANCE / 2.0)
+    }
+}
+
 /// A runway occupancy this close (u) to the touchdown point forces a go-around.
 const GOAROUND_BLOCKED_DIST: f32 = 150.0;
+/// Satellite final (touchdown to final approach fix) and go-around distance.
+const SATELLITE_FINAL_LEN: f32 = 170.0;
+const SATELLITE_GOAROUND_DIST: f32 = 100.0;
 /// Rollout braking (m/s^2): base wheel braking plus a speed-proportional fade
 /// so the stop eases out; the emergency cap guarantees stopping short of the end.
 const ROLLOUT_BRAKE_BASE: f32 = 3.0;
@@ -664,6 +693,8 @@ impl Aircraft {
             sep_alt: 0.0,
             joining: false,
             on_final: false,
+            approach_leg: 0,
+            landing_pitch: None,
             arrival_slot: None,
             runway_hold: false,
             airport_id: "local".to_string(),
@@ -761,6 +792,8 @@ impl Aircraft {
         }
         if self.state != State::Landing {
             self.on_final = false;
+            self.approach_leg = 0;
+            self.landing_pitch = None;
         }
         self.state = State::Landing;
         self.hold_reason = None;
@@ -778,6 +811,7 @@ impl Aircraft {
     /// Abort an arrival and climb back out to the sector (thread started again).
     pub fn go_around(&mut self) {
         self.arrival_slot = None;
+        self.landing_pitch = None;
         if self.state == State::Landing {
             self.state = State::Cruising;
             self.joining = true;
@@ -849,33 +883,55 @@ impl Aircraft {
         let layout = self.airport_layout;
         let target_speed = self.approach_speed();
         self.speed += (target_speed - self.speed).clamp(-4.0 * dt, 4.0 * dt);
-        let (px, pz) = (self.position[0], self.position[1]);
+        // All approach geometry is flown in a chart centred on this airport's
+        // touchdown point (torus-safe offsets), so satellites near the wrap
+        // boundary fly exactly the same circuit, glide and flare as home.
+        let lx = wrap_centered(self.position[0] - layout.runway_x);
+        let lz = wrap_centered(self.position[1] - layout.touchdown_z);
+        let final_len = layout.final_len();
+        let goaround_dist = layout.goaround_dist();
 
+        let old_alt = self.altitude;
         if !self.on_final {
-            let dx = wrap_centered(layout.final_approach_fix[0] - px);
-            let dz = wrap_centered(layout.final_approach_fix[1] - pz);
+            // Fly a circuit rather than diving directly at the runway from an
+            // arbitrary heading/height. Repeat it if still above glide capture.
+            let target = match self.approach_leg {
+                0 => [140.0, final_len + 70.0],
+                1 => [0.0, final_len + 70.0],
+                _ => [0.0, lz - 70.0],
+            };
+            let dx = target[0] - lx;
+            let dz = target[1] - lz;
             let dist = dx.hypot(dz);
-            self.turn_toward(dz.atan2(dx), (0.6 + 20.0 / dist.max(1.0)) * dt);
-            // Descend (or climb after a go-around) to cross the fix at approach altitude.
-            let time_left = (dist / self.speed.max(1.0)).max(1.0);
-            let rate = ((self.altitude - layout.approach_alt) / time_left)
-                .clamp(-GLIDE_CLIMB_RATE, GLIDE_DESCENT_RATE);
-            self.altitude -= rate * dt;
-            if dist < 30.0 {
-                self.on_final = true;
+            self.turn_toward(dz.atan2(dx), 0.65 * dt);
+            let target_alt = if self.approach_leg == 2 {
+                glide_height(lz + self.heading.sin() * self.speed * dt)
+            } else {
+                layout.approach_alt
+            };
+            let vertical_limit = self.speed * GLIDE_SLOPE;
+            self.altitude += (target_alt - self.altitude)
+                .clamp(-vertical_limit * dt, vertical_limit * dt);
+            if self.approach_leg < 2 && dist < 35.0 {
+                self.approach_leg += 1;
+            }
+            if self.approach_leg == 2 {
+                let aligned = (self.heading - RUNWAY_HEADING).sin().abs() < 0.12
+                    && self.heading.sin() < -0.98
+                    && lx.abs() < 5.0;
+                if aligned && (self.altitude - target_alt).abs() < 0.001 && lz <= final_len {
+                    self.on_final = true;
+                } else if lz < final_len - 45.0 {
+                    self.approach_leg = 0;
+                }
             }
         } else {
-            // Torus-safe offsets relative to touchdown so southern satellite
-            // airports near the wrap boundary behave identically to home.
-            let dx_rwy = wrap_centered(layout.runway_x - px);
-            let dz_to_td = wrap_centered(pz - layout.touchdown_z);
-            let final_len = wrap_centered(layout.final_approach_fix[1] - layout.touchdown_z).max(40.0);
             // Pure pursuit of a point on the centerline ahead lines us up smoothly.
             let look_ahead = if layout.is_home { 70.0 } else { 42.0 };
-            let aim_dz = (dz_to_td - look_ahead).max(-60.0) - dz_to_td;
+            let aim_dz = (lz - look_ahead).max(-60.0) - lz;
             let align_rate = if layout.is_home { 0.9 } else { 1.6 };
-            self.turn_toward(aim_dz.atan2(dx_rwy), align_rate * dt);
-            let frac = (dz_to_td / final_len).clamp(0.0, 1.0);
+            self.turn_toward(aim_dz.atan2(-lx), align_rate * dt);
+            let frac = (lz / final_len).clamp(0.0, 1.0);
             let mut dh = self.heading - RUNWAY_HEADING;
             while dh > std::f32::consts::PI {
                 dh -= std::f32::consts::TAU;
@@ -886,11 +942,10 @@ impl Aircraft {
             // Blocked runway: go around well before the threshold. The inbound
             // phase re-captures the fix; the window is finite, so a still-blocked
             // runway just starts the cycle again instead of stalling.
-            let goaround_dist = if layout.is_home { GOAROUND_BLOCKED_DIST } else { 85.0 };
-            if self.runway_occupied && dz_to_td < goaround_dist {
+            if self.runway_occupied && lz < goaround_dist {
                 self.on_final = false;
             } else if frac < 0.5
-                && (dx_rwy.abs() > 18.0 + 12.0 * frac
+                && (lx.abs() > 18.0 + 12.0 * frac
                     || dh.abs() > 0.3 + 0.6 * frac)
             {
                 // Committed to the approach and no longer recoverable: go
@@ -901,26 +956,29 @@ impl Aircraft {
                 self.on_final = false;
             }
             if self.on_final {
-                // Shaped glide: a power curve that flattens into a flare, so
+                // Three-degree glide, tangent to a parabolic flare, so
                 // the descent rate eases to zero at the touchdown point. The
                 // correction is bounded and works both ways — a too-low
                 // approach climbs back to the path instead of clipping short.
-                let desired = layout.approach_alt * frac.powf(FLARE_EXP);
+                let desired = glide_height(lz + self.heading.sin() * self.speed * dt);
                 self.altitude += (desired - self.altitude)
                     .clamp(-GLIDE_DESCENT_RATE * dt, GLIDE_CLIMB_RATE * dt);
-                if dz_to_td <= 1.0 {
+                if lz <= 1.0 {
                     // The pursuit oscillation damps out slowly, so the last
                     // gate is deliberately forgiving — a 6u / 0.25 rad
                     // touchdown is still well inside the runway.
-                    let lined_up = dx_rwy.abs() < 6.0 && dh.abs() < 0.25;
-                    if lined_up && self.altitude < 2.0 && !self.runway_occupied {
+                    let lined_up = lx.abs() < 6.0 && dh.abs() < 0.25;
+                    if lined_up && self.altitude < 0.02 && !self.runway_occupied {
                         // Touchdown: roll out along the centerline. The flare
                         // already has us on the deck — no position snap; the
                         // Landed state eases the heading onto the centerline.
+                        self.landing_pitch = Some(4.0_f32.to_radians());
                         self.state = State::Landed;
                         self.must_clear_runway = true;
                         self.on_final = false;
                         self.altitude = 0.0;
+                        self.position[0] = wrap_centered(self.position[0]);
+                        self.position[1] = wrap_centered(self.position[1]);
                         self.position[2] = 0.0;
                         self.ground_timer = 0.0;
                         return;
@@ -930,8 +988,38 @@ impl Aircraft {
                 }
             }
         }
-        self.advance(dt);
+        if !self.on_final && self.approach_leg == 2 && lz < goaround_dist {
+            self.approach_leg = 0;
+        }
+        let flight_angle = ((self.altitude - old_alt) / (self.speed * dt).max(0.001)).atan();
+        let flare = if self.on_final {
+            (1.0 - lz / FLARE_DISTANCE).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.landing_pitch = Some(flight_angle * (1.0 - flare) + 4.0_f32.to_radians() * flare);
+        self.advance_in_airport_chart(dt);
         self.position[2] = self.altitude;
+    }
+
+    /// Fly straight in the approach chart of this aircraft's airport. The
+    /// circuit is physical space, so an aircraft on it never teleports across
+    /// the patrol-map edge (it may fly past the edge over open water). An
+    /// aircraft whose shortest way to the airport crosses the map edge still
+    /// wraps once, at the edge, onto the airport's side.
+    fn advance_in_airport_chart(&mut self, dt: f32) {
+        let layout = self.airport_layout;
+        let origin = [layout.runway_x, layout.touchdown_z];
+        let step = [self.heading.cos() * self.speed * dt, self.heading.sin() * self.speed * dt];
+        for axis in 0..2 {
+            let p = self.position[axis] + step[axis];
+            let rel = p - origin[axis];
+            self.position[axis] = if p.abs() > AREA_SIZE / 2.0 && rel.abs() > AREA_SIZE / 2.0 {
+                origin[axis] + wrap_centered(rel)
+            } else {
+                p
+            };
+        }
     }
 
     /// Fly a smooth transit onto a moving patrol-path point after climb-out.
@@ -1225,7 +1313,7 @@ impl Aircraft {
 
     /// Advance the simulation by `dt` seconds using the current world sectors.
     pub fn tick_with_sectors(&mut self, dt: f32, sectors: &[Sector]) {
-        if self.kind == Kind::Tanker {
+        if self.kind == Kind::Tanker && self.state == State::Cruising {
             // Provider aerial refuelling tanker: smooth, stately elliptical track
             // high above all airspace zones, never wrapping across map edges.
             let key = self.refuel_scope.as_deref().unwrap_or("generic");
@@ -1384,6 +1472,7 @@ impl Aircraft {
                 self.position[1] = wrap_centered(self.position[1] + dy);
             }
             State::Landed => {
+                self.landing_pitch = None;
                 // Decelerate down the runway; once stopped, World::tick assigns a
                 // free gate (or the arrival slot) after the landing pause.
                 self.altitude = 0.0;
@@ -2962,6 +3051,93 @@ mod tests {
             }
             assert_eq!(a.speed, 0.0);
             assert!(a.position[1] > -70.0, "overran the runway: {:?}", a.position);
+        }
+    }
+
+    /// Every airframe flies the circuit, captures a ~3 degree final, flares
+    /// and touches down nose-up at home, at a satellite, and at a southern
+    /// satellite whose final crosses the wrap boundary of the patrol map.
+    #[test]
+    fn every_airframe_captures_a_shallow_final() {
+        let airports = [
+            Airport::home("local", "Tower"),
+            Airport::satellite("ne", "NE", SATELLITE_SLOTS[1], true),
+            Airport::satellite("south", "S", SATELLITE_SLOTS[2], true),
+        ];
+        for airport in &airports {
+            let layout = airport.runway_layout();
+            let [cx, cz] = airport.center;
+            // Near the airport, far away and high, and (for the southern
+            // satellite) across the north map edge so the shortest way wraps.
+            let starts = [
+                [cx + 0.0, wrap_centered(cz + 260.0), 60.0],
+                [wrap_centered(cx - 240.0), wrap_centered(cz - 220.0), 180.0],
+                [cx + 90.0, wrap_centered(cz + 240.0), 30.0],
+                [cx, -395.0, 50.0],
+            ];
+            for (kind, model) in [
+                (Kind::Agent, ModelClass::Local),
+                (Kind::Agent, ModelClass::Frontier),
+                (Kind::Drone, ModelClass::Local),
+                (Kind::Fighter, ModelClass::Frontier),
+                (Kind::Tanker, ModelClass::Frontier),
+            ] {
+                for start in starts {
+                    let mut a = Aircraft::with_model("GLIDE", kind, model);
+                    a.set_airport(airport);
+                    a.state = State::Cruising;
+                    a.position = start;
+                    a.altitude = start[2];
+                    a.heading = 1.2;
+                    a.speed = a.approach_speed();
+                    a.begin_approach(None);
+                    let mut final_samples = 0;
+                    let mut map_wraps = 0;
+                    let mut landed = false;
+                    let ctx = format!("{kind:?} at {} from {start:?}", airport.id);
+                    for _ in 0..30000 {
+                        let old = a.position;
+                        let was_final = a.on_final;
+                        let old_pitch = a.landing_pitch;
+                        if was_final && old[2] < 0.15 {
+                            assert!(old_pitch.unwrap() > 0.025, "{ctx}: no pre-touchdown flare");
+                        }
+                        a.tick(0.05);
+                        let raw = (a.position[0] - old[0]).hypot(a.position[1] - old[1]);
+                        let horizontal = wrap_centered(a.position[0] - old[0])
+                            .hypot(wrap_centered(a.position[1] - old[1]));
+                        assert!(horizontal < 1.5, "{ctx}: arrival position discontinuity");
+                        if raw > 1.5 {
+                            // Only the one crossing of the map edge on the way
+                            // in; never on the circuit or on final.
+                            map_wraps += 1;
+                            assert!(!was_final && !a.on_final, "{ctx}: wrapped on final");
+                            assert!(a.approach_leg == 0, "{ctx}: wrapped on the circuit");
+                        }
+                        assert!((a.altitude - old[2]).abs() < 0.11, "{ctx}: altitude discontinuity");
+                        let angle = ((a.altitude - old[2]) / horizontal.max(0.001)).atan().to_degrees();
+                        if was_final && a.on_final && a.altitude > 3.0 {
+                            assert!(angle > -4.0 && angle < -2.0, "{ctx}: glide {angle}");
+                            let pitch = a.landing_pitch.unwrap().to_degrees();
+                            assert!((pitch - angle).abs() < 0.2, "{ctx}: pitch {pitch} vs path {angle}");
+                            final_samples += 1;
+                        }
+                        if a.state == State::Landed {
+                            assert!((old[2] - a.altitude) / 0.05 < 0.5, "{ctx}: hard touchdown");
+                            assert!(a.landing_pitch.unwrap().to_degrees() > 3.5);
+                            assert!(a.altitude >= 0.0);
+                            let lz = wrap_centered(a.position[1] - layout.touchdown_z);
+                            let lx = wrap_centered(a.position[0] - layout.runway_x);
+                            assert!(lz.abs() < 3.0 && lx.abs() < 6.0, "{ctx}: touched down at {:?}", a.position);
+                            assert!(a.position[1].abs() <= AREA_SIZE / 2.0, "{ctx}: off-map touchdown");
+                            landed = true;
+                            break;
+                        }
+                    }
+                    assert!(map_wraps <= 1, "{ctx}: wrapped {map_wraps} times");
+                    assert!(landed && final_samples > 30, "{ctx}: failed arrival");
+                }
+            }
         }
     }
 

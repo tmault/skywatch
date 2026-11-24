@@ -2203,7 +2203,8 @@ mod tests {
             subagents: vec![],
         };
         let mut touched_down = false;
-        for _ in 0..3000 {
+        // Shallow arrivals may need an extra circuit before glide capture.
+        for _ in 0..8000 {
             world.tick(0.05);
             let a = world.iter().find(|a| a.id == sky_id).unwrap();
             touched_down |= a.state == State::Landed;
