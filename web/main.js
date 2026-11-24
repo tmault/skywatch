@@ -6,7 +6,7 @@ import * as THREE from './vendor/three.module.js';
 import { OrbitControls } from './vendor/OrbitControls.js';
 import {
   setupRadio, openRadio, closeRadio, updateRadio, selectedAircraftId, focusRadioInput,
-  appendHistory, stateColor, formatCountdown,
+  appendHistory, stateColor,
 } from './radio.js';
 import {
   buildAlpineIsland, buildAlpineBackdrop, makeSwissFlag, updateAlpine, SWISS_RED,
