@@ -5,7 +5,7 @@
 import * as THREE from './vendor/three.module.js';
 import { OrbitControls } from './vendor/OrbitControls.js';
 import {
-  setupRadio, openRadio, closeRadio, updateRadio, selectedAircraftId,
+  setupRadio, openRadio, closeRadio, updateRadio, selectedAircraftId, focusRadioInput,
   appendHistory, stateColor, formatCountdown,
 } from './radio.js';
 import {
@@ -1494,9 +1494,13 @@ const CAMERA_KEYS = new Set([
 const heldKeys = new Set();
 
 function isTypingTarget(el) {
-  if (!el) return false;
+  if (!el || el.nodeType !== 1) return false;
   const tag = el.tagName;
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+}
+
+function releaseHeldKeys() {
+  heldKeys.clear();
 }
 
 window.addEventListener('keydown', (ev) => {
@@ -1505,7 +1509,15 @@ window.addEventListener('keydown', (ev) => {
     closeRadio();
     return;
   }
-  if (isTypingTarget(ev.target) || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  if (isTypingTarget(ev.target) || isTypingTarget(document.activeElement)) {
+    releaseHeldKeys();
+    return;
+  }
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  if (ev.key === 'Enter' && focusRadioInput()) {
+    ev.preventDefault();
+    return;
+  }
   if (ev.key === 'Home') {
     ev.preventDefault();
     stopFollow(false);
@@ -1525,15 +1537,20 @@ window.addEventListener('keyup', (ev) => {
   const key = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
   heldKeys.delete(key);
 });
-window.addEventListener('blur', () => heldKeys.clear());
+// Never leave rotation stuck: drop held keys whenever focus or visibility changes.
+window.addEventListener('blur', releaseHeldKeys);
+window.addEventListener('focusin', (ev) => { if (isTypingTarget(ev.target)) releaseHeldKeys(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) releaseHeldKeys(); });
 
 const _kbOffset = new THREE.Vector3();
 const _kbSpherical = new THREE.Spherical();
 const _kbForward = new THREE.Vector3();
 const _kbRight = new THREE.Vector3();
 
-function applyKeyboardCamera(dt) {
+function applyKeyboardCamera(frameDt) {
   if (heldKeys.size === 0) return;
+  // Cap the step so a stalled frame cannot make the camera jump.
+  const dt = Math.min(frameDt, 0.1);
   const has = (k) => heldKeys.has(k);
 
   _kbOffset.copy(camera.position).sub(controls.target);
@@ -1547,7 +1564,7 @@ function applyKeyboardCamera(dt) {
   _kbSpherical.theta += yaw * 1.6 * dt;
   _kbSpherical.phi = THREE.MathUtils.clamp(
     _kbSpherical.phi + pitch * 1.0 * dt,
-    0.08,
+    Math.max(0.08, controls.minPolarAngle),
     controls.maxPolarAngle,
   );
   _kbSpherical.radius = THREE.MathUtils.clamp(

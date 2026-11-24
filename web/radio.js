@@ -59,7 +59,14 @@ export function openRadio(aircraft) {
   selectedId = aircraft.id;
   render(aircraft);
   panel.hidden = false;
-  if (aircraft.kind !== 'tanker') textEl.focus();
+  // Do not steal keyboard focus: arrow keys must keep orbiting the camera.
+  // Enter (handled in main.js) or a click focuses the message field.
+}
+
+export function focusRadioInput() {
+  if (selectedId === null || panel.hidden || inputRowEl.hidden || textEl.disabled) return false;
+  textEl.focus();
+  return true;
 }
 
 export function closeRadio(note) {
@@ -182,6 +189,8 @@ function submit() {
 sendBtn.addEventListener('click', submit);
 textEl.addEventListener('keydown', (ev) => {
   if (ev.key === 'Enter') submit();
+  // Escape leaves the field so camera keys work again.
+  if (ev.key === 'Escape') textEl.blur();
   ev.stopPropagation();
 });
 
