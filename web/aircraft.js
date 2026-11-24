@@ -324,11 +324,13 @@ function navLights(group, kit, tip, tail) {
 }
 
 // Distance from the group origin to its lowest point (world units after
-// scaling), so aircraft sit exactly on the apron.
+// scaling), so aircraft sit exactly on the apron. Also attaches an invisible
+// airframe hit proxy fitted to the model bounds for reliable pointer picking.
 function finish(group, scale, kit, extra = {}) {
+  group.updateMatrixWorld(true);
   const box = new THREE.Box3().setFromObject(group);
   // Conservative support hull for deck clearance under pitch/roll. Capture
-  // before adding labels/lights; geometry bounds include the deployed gear.
+  // before adding labels/lights/hit-proxy; geometry bounds include the deployed gear.
   const contactPoints = [];
   group.traverse((obj) => {
     if (!obj.isMesh) return;
@@ -339,10 +341,36 @@ function finish(group, scale, kit, extra = {}) {
         for (const z of [b.min.z, b.max.z])
           contactPoints.push(new THREE.Vector3(x, y, z).applyMatrix4(obj.matrixWorld));
   });
+
+  const size = new THREE.Vector3();
+  const center = new THREE.Vector3();
+  box.getSize(size);
+  box.getCenter(center);
+
+  const pad = 1.4 / scale;
+  const hitMat = new THREE.MeshBasicMaterial({ visible: false, side: THREE.DoubleSide });
+  kit.all.push(hitMat);
+  const hitProxy = new THREE.Mesh(
+    new THREE.BoxGeometry(
+      Math.max(size.x + pad, 6 / scale),
+      Math.max(size.y + pad, 4 / scale),
+      Math.max(size.z + pad, 6 / scale),
+    ),
+    hitMat,
+  );
+  hitProxy.name = 'hit-proxy';
+  hitProxy.position.copy(center);
+  hitProxy.castShadow = false;
+  hitProxy.receiveShadow = false;
+  hitProxy.userData.isHitProxy = true;
+  group.add(hitProxy);
+
   return {
     group, scale, contactPoints,
     tintMaterials: [kit.beacon], disposeMaterials: kit.all,
     wheelDrop: -box.min.y * scale,
+    airframeCenter: center,
+    hitProxy,
     ...extra,
   };
 }

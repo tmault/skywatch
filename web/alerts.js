@@ -182,12 +182,13 @@ export function createAlertManager({
     });
   }
 
-  function bindInteractive(el, getTarget) {
+  function bindInteractive(el, getTarget, { onMissingAircraft } = {}) {
     el.addEventListener('click', () => {
       const target = getTarget();
       if (!target) return;
       if (target.aircraftId != null) {
-        onSelectAircraft?.(target.aircraftId);
+        const ok = onSelectAircraft?.(target.aircraftId);
+        if (ok === false) onMissingAircraft?.();
       } else if (target.airportId != null) {
         onFocusAirport?.(target.airportId);
       }
@@ -215,6 +216,8 @@ export function createAlertManager({
     el.type = 'button';
     el.className = `alert-card severity-${item.severity} kind-${item.kind}`;
     el.dataset.alertKey = item.key;
+    if (item.aircraftId != null) el.dataset.aircraftId = String(item.aircraftId);
+    el.title = item.aircraftId != null ? 'Follow aircraft' : 'Focus airport';
 
     const head = document.createElement('div');
     head.className = 'alert-head';
@@ -283,6 +286,9 @@ export function createAlertManager({
     if (prev.reason !== nextItem.reason) {
       rec.reasonEl.textContent = nextItem.reason;
     }
+    if (nextItem.aircraftId != null) rec.el.dataset.aircraftId = String(nextItem.aircraftId);
+    else delete rec.el.dataset.aircraftId;
+    rec.el.title = nextItem.aircraftId != null ? 'Follow aircraft' : 'Focus airport';
     rec.item = nextItem;
     rec.el.classList.toggle('active', isSelected);
   }
@@ -292,6 +298,7 @@ export function createAlertManager({
     el.type = 'button';
     el.className = 'tick-line refuel-card';
     el.dataset.aircraftId = String(a.id);
+    el.title = 'Follow aircraft';
 
     const primaryEl = document.createElement('div');
     primaryEl.className = 'tick-primary';
@@ -492,6 +499,22 @@ export function createAlertManager({
       }
       refuelEl.hidden = refuelling.length === 0;
     }
+
+    for (const rec of routineRecords) {
+      rec.el.classList.toggle('active', activeAircraftId != null && rec.aircraftId === activeAircraftId);
+    }
+  }
+
+  function setActiveAircraft(activeAircraftId = null) {
+    for (const rec of urgentRecords.values()) {
+      rec.el.classList.toggle('active', activeAircraftId != null && rec.item.aircraftId === activeAircraftId);
+    }
+    for (const rec of refuelRecords.values()) {
+      rec.el.classList.toggle('active', activeAircraftId != null && rec.aircraft.id === activeAircraftId);
+    }
+    for (const rec of routineRecords) {
+      rec.el.classList.toggle('active', activeAircraftId != null && rec.aircraftId === activeAircraftId);
+    }
   }
 
   function renderRoutineContent(rec) {
@@ -531,6 +554,10 @@ export function createAlertManager({
     if (match) {
       match.count += 1;
       match.aircraftId = aircraftId ?? match.aircraftId;
+      if (match.aircraftId != null) {
+        match.el.dataset.aircraftId = String(match.aircraftId);
+        match.el.title = 'Follow aircraft';
+      }
       if (callsign) {
         match.callsign = callsign;
         if (!match.callsigns.includes(callsign)) match.callsigns.push(callsign);
@@ -539,7 +566,7 @@ export function createAlertManager({
       if (reason) match.reason = reason;
       match.updatedAt = now;
       match.expiresAt = now + ROUTINE_TTL_MS;
-      match.el.classList.remove('fading');
+      match.el.classList.remove('fading', 'tick-gone');
       renderRoutineContent(match);
       return;
     }
@@ -547,6 +574,10 @@ export function createAlertManager({
     const el = document.createElement(aircraftId != null ? 'button' : 'div');
     if (el.tagName === 'BUTTON') el.type = 'button';
     el.className = `tick-line routine-line kind-${kind}`;
+    if (aircraftId != null) {
+      el.dataset.aircraftId = String(aircraftId);
+      el.title = 'Follow aircraft';
+    }
 
     const primaryEl = document.createElement('div');
     primaryEl.className = 'tick-primary';
@@ -600,7 +631,16 @@ export function createAlertManager({
     });
 
     if (aircraftId != null) {
-      bindInteractive(el, () => ({ aircraftId: rec.aircraftId, airportId: null }));
+      bindInteractive(
+        el,
+        () => ({ aircraftId: rec.aircraftId, airportId: null }),
+        {
+          onMissingAircraft: () => {
+            el.classList.add('tick-gone');
+            el.title = 'No longer in the air';
+          },
+        },
+      );
     }
 
     routineRecords.push(rec);
@@ -625,22 +665,22 @@ export function createAlertManager({
     if (idx === -1 && lastJumpedKey != null) {
       idx = pool.findIndex((item) => item.key === lastJumpedKey);
     }
-    const next = pool[(idx + 1) % pool.length];
-    lastJumpedKey = next.key;
+    for (let step = 1; step <= pool.length; step++) {
+      const next = pool[(idx + step) % pool.length];
+      const rec = urgentRecords.get(next.key);
 
-    setCollapsed(false);
-    const rec = urgentRecords.get(next.key);
-    if (rec) {
-      rec.el.scrollIntoView({ block: 'nearest' });
-    }
-
-    if (next.aircraftId != null) {
-      onSelectAircraft?.(next.aircraftId);
-      return true;
-    }
-    if (next.airportId != null) {
-      onFocusAirport?.(next.airportId);
-      return true;
+      if (next.aircraftId != null && onSelectAircraft?.(next.aircraftId) !== false) {
+        lastJumpedKey = next.key;
+        setCollapsed(false);
+        if (rec) rec.el.scrollIntoView({ block: 'nearest' });
+        return true;
+      }
+      if (next.airportId != null && onFocusAirport?.(next.airportId) !== false) {
+        lastJumpedKey = next.key;
+        setCollapsed(false);
+        if (rec) rec.el.scrollIntoView({ block: 'nearest' });
+        return true;
+      }
     }
     return false;
   }
@@ -683,6 +723,7 @@ export function createAlertManager({
 
   return {
     syncSnapshot,
+    setActiveAircraft,
     addRoutineEvent,
     jumpToNextAttention,
     getUrgentCount: () => orderedUrgentItems.length,
