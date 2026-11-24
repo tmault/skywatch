@@ -133,6 +133,16 @@ html, body {
 }
 #radio-hold-reason[hidden] { display: none; }
 
+#radio-conversation {
+  font-size: 11px;
+  margin-bottom: 8px;
+}
+.radio-conversation-actions { display: flex; flex-wrap: wrap; gap: 6px 12px; }
+.radio-conversation-actions a { color: var(--cyan); padding: 4px 0; }
+#radio-conversation-note { margin: 3px 0; opacity: 0.8; }
+#radio-thread-reference summary { cursor: pointer; }
+#radio-thread-id { overflow-wrap: anywhere; white-space: pre-wrap; user-select: text; }
+
 #radio-log {
   flex: 1;
   min-height: 100px;

@@ -99,6 +99,12 @@ impl Airport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatLinks {
+    pub web: String,
+    pub desktop: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Aircraft {
     pub id: u64,
     pub callsign: String,
@@ -129,6 +135,8 @@ pub struct Aircraft {
     pub environment_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_links: Option<ChatLinks>,
     #[serde(default)]
     pub data_stale: bool,
     /// Parent aircraft id for escorting fighter wingmen (sub-agents).
@@ -542,6 +550,7 @@ impl Aircraft {
             device: None,
             environment_id: None,
             thread_id: None,
+            chat_links: None,
             data_stale: false,
             parent_id: None,
             wing_slot: None,
