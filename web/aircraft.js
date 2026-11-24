@@ -620,7 +620,8 @@ export function makeJetMesh(model) {
 
   return finish(group, 0.74, kit, {
     refuelPort: new THREE.Vector3(0, 1.82, 8.4),
-    landingLightPos: new THREE.Vector3(0, -0.62, 12.45),
+    landingLightPos: new THREE.Vector3(0, -0.5, 13.9), // just ahead of the nose tip (z=13.0)
+    landingGlowScale: 0.6,
   });
 }
 
@@ -992,6 +993,7 @@ export function makeTankerMesh(model) {
       port: new THREE.Vector3(podX, podY, podZ - 2.35),
       starboard: new THREE.Vector3(-podX, podY, podZ - 2.35),
     },
-    landingLightPos: new THREE.Vector3(0, -0.82, 16.3),
+    landingLightPos: new THREE.Vector3(0, -0.7, 17.9), // just ahead of the nose tip (z=17.0)
+    landingGlowScale: 0.6,
   });
 }

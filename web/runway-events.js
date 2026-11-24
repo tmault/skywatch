@@ -147,6 +147,8 @@ function makeBeamMesh(rTop, rBottom, len, mat, origin, pitchDown) {
  */
 export function addLandingLights(built, { groundY = 3.22 } = {}) {
   const s = built.scale;
+  // Large airframes shrink the halo so it doesn't wash over the nose.
+  const glowK = built.landingGlowScale ?? 1;
   let origin;
   if (built.landingLightPos) {
     origin = built.landingLightPos.clone();
@@ -176,7 +178,7 @@ export function addLandingLights(built, { groundY = 3.22 } = {}) {
   });
   const glow = new THREE.Sprite(glowMat);
   glow.position.copy(origin);
-  glow.scale.setScalar(11 / s);
+  glow.scale.setScalar((11 * glowK) / s);
   glow.renderOrder = 5;
   glow.raycast = NOOP_RAYCAST;
   group.add(glow);
@@ -192,7 +194,7 @@ export function addLandingLights(built, { groundY = 3.22 } = {}) {
   });
   const coreGlow = new THREE.Sprite(coreGlowMat);
   coreGlow.position.copy(origin);
-  coreGlow.scale.setScalar(3.6 / s);
+  coreGlow.scale.setScalar((3.6 * glowK) / s);
   coreGlow.renderOrder = 6;
   coreGlow.raycast = NOOP_RAYCAST;
   group.add(coreGlow);
