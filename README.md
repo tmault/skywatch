@@ -58,7 +58,7 @@ A 3D air-traffic-control view of AI agent threads, sub-agents, and provider rate
 │  • Demo script (seed.rs) when SKYWATCH_T3=0                        │
 │  • T3 adapter (adapters/t3.rs + remote.rs) when SKYWATCH_T3=1      │
 └───────┬───────────────────────────┬────────────────────────┬───────┘
-        │ sqlite3 -readonly -json   │ python3 t3_bridge.py   │ t3 CLI (host)
+        │ bundled SQLite (RO)       │ Python t3_bridge.py    │ t3 CLI (host)
         ▼                           ▼                        ▼
   ~/.t3/userdata/             T3 MCP endpoint         Local reachability
   statev2.sqlite (RO)         (linked devices &       probe & local
@@ -95,9 +95,10 @@ Live T3 mode is enabled by default (`SKYWATCH_T3=1`, or whenever `SKYWATCH_T3` i
 ### Host Requirements
 
 - T3 running locally with its projection database at `~/.t3/userdata/statev2.sqlite` (or `$T3CODE_HOME/userdata/statev2.sqlite`).
-- `sqlite3` on `PATH` (invoked with `-readonly -json`).
-- `t3` CLI on `PATH` (used for linked-device reachability probes and relaying radio messages to local threads).
-- `python3` on `PATH` (used by the embedded MCP bridge for linked-device polling and remote message relay).
+- The `t3` CLI, found on `PATH` (including the `t3.cmd` shim on Windows) or in `~/.t3/bin`, the launcher T3 Code installs. Used for linked-device reachability probes and relaying radio messages to local threads. Override with `SKYWATCH_T3_CLI`.
+- Python 3 (used by the embedded MCP bridge for linked-device polling and remote message relay). Skywatch uses the first of `python3` or `python` that works, or `py -3` first on Windows. Override with `SKYWATCH_PYTHON`.
+
+T3's projection database is read with SQLite compiled into the server, so no `sqlite3` binary is needed.
 
 ### Pairing Linked Devices (Optional)
 
@@ -116,23 +117,41 @@ cd server
 SKYWATCH_PORT=8422 cargo run
 ```
 
+### Running on Windows
+
+Run the server natively from PowerShell. The Docker live overlay needs host networking, which Docker Desktop on Windows doesn't provide in the same way, so use Docker only for the demo fleet.
+
+```powershell
+py scripts\pair_t3.py            # optional: linked devices
+cd server
+$env:SKYWATCH_HOST = "127.0.0.1"  # optional: local-only, no firewall prompt
+cargo run --release
+```
+
+Building needs the Rust MSVC toolchain (its C compiler builds the bundled SQLite). Skywatch reads T3 data from `%USERPROFILE%\.t3`, finds `t3.cmd` on `PATH` or in `%USERPROFILE%\.t3\bin`, and talks to T3 on loopback without going through any configured proxy. A T3 origin of `0.0.0.0` (from `t3 --lan`) is rewritten to `127.0.0.1`, since Windows can't connect to a wildcard address.
+
+If a work machine still doesn't connect, the server log names the cause: a missing `t3` CLI or Python, a missing or expired token, or the connection error. Point Skywatch at the right pieces with `SKYWATCH_T3_CLI`, `SKYWATCH_PYTHON`, `T3CODE_HOME`, or `SKYWATCH_T3_MCP_URL`.
+
 ### Environment Variables
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `SKYWATCH_PORT` | `8422` | TCP port the HTTP/WebSocket server listens on (`0.0.0.0:<port>`) |
+| `SKYWATCH_PORT` | `8422` | TCP port the HTTP/WebSocket server listens on |
+| `SKYWATCH_HOST` | `0.0.0.0` | Interface to listen on. Set `127.0.0.1` to keep Skywatch local-only (this also avoids the Windows Firewall prompt) |
 | `SKYWATCH_T3` | `1` (enabled) | Set to `0` or `false` to disable the T3 adapter and fall back to demo mode |
 | `SKYWATCH_DEMO` | `1` (enabled) | Set to `0` or `false` to disable demo seeding when `SKYWATCH_T3=0` |
-| `T3CODE_HOME` | `~/.t3` | Base directory containing `userdata/statev2.sqlite`, `userdata/environment-id`, and `userdata/server-runtime.json` |
+| `T3CODE_HOME` | `~/.t3` (`%USERPROFILE%\.t3` on Windows) | Base directory containing `userdata/statev2.sqlite`, `userdata/environment-id`, and `userdata/server-runtime.json` |
 | `SKYWATCH_T3_MCP_URL` | from `server-runtime.json` | Explicit T3 MCP endpoint URL (e.g. `http://127.0.0.1:3773/mcp`) |
 | `SKYWATCH_T3_TOKEN_FILE` | `~/.config/skywatch/t3-mcp-token` | Path to the paired MCP bearer token file |
+| `SKYWATCH_T3_CLI` | found on `PATH`, then `~/.t3/bin` | Full path to the `t3` CLI, such as `t3.cmd` on Windows |
+| `SKYWATCH_PYTHON` | `python3`, `python`, or `py -3` | Python 3 interpreter for the MCP bridge |
 | `SKYWATCH_SUBAGENT_LINGER_SECS` | `600` | Seconds recently finished sub-agents stay on their parent's wing before peeling off |
 
 When the number of active threads exceeds display capacity, the HUD status bar reports how many threads are omitted. Remote aircraft and actions carry both environment and thread identity so IDs never collide across devices.
 
 ## Docker Usage
 
-The repository ships a multi-stage `Dockerfile` (digest-pinned Rust build stage with `cargo build --locked`, then a slim Debian runtime holding `skywatch-server`, `web/` assets, `python3`, and `sqlite3`), a default demo `docker-compose.yml`, and a live-T3 overlay `docker-compose.live.yml`.
+The repository ships a multi-stage `Dockerfile` (digest-pinned Rust build stage with `cargo build --locked`, then a slim Debian runtime holding `skywatch-server`, `web/` assets, and `python3`), a default demo `docker-compose.yml`, and a live-T3 overlay `docker-compose.live.yml`.
 
 Nothing credential- or database-related is baked into the image (`.dockerignore` excludes `.git`, `target/`, SQLite files, tokens, and `.env*`). The container runs as a non-root user (`UID`/`GID` 1000 by default) with a read-only root filesystem, all Linux capabilities dropped, `no-new-privileges`, and a `/health` healthcheck.
 
@@ -161,7 +180,7 @@ docker compose -f docker-compose.yml -f docker-compose.live.yml up -d --build
 Overrides: `T3_USERDATA` (default `~/.t3/userdata`), `SKYWATCH_T3_TOKEN_PATH` (default `~/.config/skywatch/t3-mcp-token`), `SKYWATCH_T3_MCP_URL` (default `http://127.0.0.1:3773/mcp`), and `SKYWATCH_UID`/`SKYWATCH_GID` (must match the owner of those host files).
 
 **What works from the container:**
-- **Local threads**: `~/.t3/userdata` is bind-mounted read-only so `sqlite3 -readonly` can read `statev2.sqlite` along with its adjacent `-wal`/`-shm` files. (Because the whole `userdata` directory is mounted read-only, other files in that directory are also readable inside the container.)
+- **Local threads**: `~/.t3/userdata` is bind-mounted read-only so the server can open `statev2.sqlite` read-only along with its adjacent `-wal`/`-shm` files. (Because the whole `userdata` directory is mounted read-only, other files in that directory are also readable inside the container.)
 - **Linked devices & remote messages**: The bundled Python MCP bridge reads the paired token from a Compose secret (`/run/secrets/skywatch_t3_token`, never an image layer or environment variable) and talks to T3's loopback MCP listener via `network_mode: host`.
 
 **What does not work from the container:**

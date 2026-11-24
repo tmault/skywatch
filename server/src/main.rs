@@ -1,4 +1,5 @@
 mod adapters;
+mod platform;
 mod seed;
 mod time;
 mod world;
@@ -133,7 +134,8 @@ async fn main() {
         }));
 
     let port = std::env::var("SKYWATCH_PORT").unwrap_or_else(|_| "8422".to_string());
-    let addr = format!("0.0.0.0:{port}");
+    let host = std::env::var("SKYWATCH_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let addr = if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     tracing::info!("listening on {addr}");
     axum::serve(listener, app).await.unwrap();
