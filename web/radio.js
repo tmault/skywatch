@@ -16,6 +16,11 @@ const actionsEl = document.getElementById('radio-actions');
 const approveBtn = document.getElementById('radio-approve');
 const rejectBtn = document.getElementById('radio-reject');
 const closeBtn = document.getElementById('radio-close');
+const openWeb = document.getElementById('radio-open-web');
+const openDesktop = document.getElementById('radio-open-desktop');
+const conversationNote = document.getElementById('radio-conversation-note');
+const threadReference = document.getElementById('radio-thread-reference');
+const threadId = document.getElementById('radio-thread-id');
 
 const history = new Map();
 
@@ -45,6 +50,7 @@ export function appendHistory(id, who, text) {
 }
 
 export function openRadio(aircraft) {
+  if (selectedId !== aircraft.id) threadReference.open = false;
   selectedId = aircraft.id;
   render(aircraft);
   panel.hidden = false;
@@ -140,7 +146,34 @@ function render(a) {
 
   if (inputRowEl) inputRowEl.hidden = a.kind === 'tanker';
   actionsEl.hidden = a.state !== 'holding';
+  renderConversation(a);
   renderLog();
+}
+
+function setDestination(link, href) {
+  if (href && link.getAttribute('href') !== href) link.setAttribute('href', href);
+  if (!href && link.hasAttribute('href')) link.removeAttribute('href');
+  link.hidden = !href;
+}
+
+function renderConversation(aircraft) {
+  const links = aircraft.data_stale ? null : aircraft.chat_links;
+  setDestination(openWeb, links?.web);
+  setDestination(openDesktop, links?.desktop);
+
+  const reference = aircraft.thread_id
+    ? [aircraft.environment_id && `Environment ${aircraft.environment_id}`, `Thread ${aircraft.thread_id}`]
+        .filter(Boolean).join('\n')
+    : '';
+  if (threadId.textContent !== reference) threadId.textContent = reference;
+  threadReference.hidden = !reference;
+
+  let note;
+  if (!reference) note = 'No separate chat is available for this aircraft.';
+  else if (aircraft.data_stale) note = 'Owning device is offline. Keep the thread reference to open it later.';
+  else if (!links) note = 'This chat cannot be opened from Skywatch. Use the thread reference in T3.';
+  else note = 'Web requires access to the owning device. The local harness requires the T3 Code desktop handler on this device.';
+  if (conversationNote.textContent !== note) conversationNote.textContent = note;
 }
 
 function renderLog() {
