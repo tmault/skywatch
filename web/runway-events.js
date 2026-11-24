@@ -253,7 +253,7 @@ export function addLandingLights(built, { groundY = 3.22 } = {}) {
 
 /**
  * Event layer for one runway. `opts` = { x, zMin, zMax, deckY,
- * glideFrom: [z, alt] (final approach fix), touchdownZ }.
+ * glideFrom: [z] (final approach fix on the extended centerline), touchdownZ }.
  */
 export function createRunwayEvents(scene, opts) {
   const { x, zMin, zMax, deckY, glideFrom, touchdownZ } = opts;
@@ -395,11 +395,15 @@ export function createRunwayEvents(scene, opts) {
   const BEADS = 22;
   const beadPos = new Float32Array(BEADS * 3);
   const beadCol = new Float32Array(BEADS * 3);
-  const [fafZ, fafAlt] = glideFrom;
+  const [fafZ] = glideFrom;
+  // Mirrors the server's glide_height(): a three-degree final tangent to a
+  // parabolic flare over the last FLARE units before touchdown.
+  const GLIDE_SLOPE = 0.05240778, FLARE = 50;
+  const glideHeight = (d) => (d < FLARE ? GLIDE_SLOPE * d * d / (2 * FLARE) : GLIDE_SLOPE * (d - FLARE / 2));
   for (let i = 0; i < BEADS; i++) {
     const f = i / (BEADS - 1); // 0 at the fix, 1 at touchdown
     beadPos[i * 3] = x;
-    beadPos[i * 3 + 1] = (1 - f) * fafAlt + f * deckY + 1.5;
+    beadPos[i * 3 + 1] = deckY + glideHeight(Math.abs(fafZ - touchdownZ) * (1 - f)) + 1.5;
     beadPos[i * 3 + 2] = fafZ + (touchdownZ - fafZ) * f;
   }
   const beadGeo = new THREE.BufferGeometry();

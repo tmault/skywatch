@@ -125,7 +125,7 @@ scene.add(rim);
 let homeRunwayLights = null;
 const runwayEvents = createRunwayEvents(scene, {
   x: 56, zMin: -76, zMax: 56, halfWidth: 10.6, deckY: TARMAC_TOP_Y,
-  glideFrom: [276, 42], touchdownZ: 34,
+  glideFrom: [276], touchdownZ: 34,
 });
 
 /* ----------------------------------------------------------- airports */
@@ -296,6 +296,18 @@ function buildHomeAirport(ap) {
     island.add(makeMarking(20, 0.8, 72, cz, markY, yellowLineMat));
   }
 
+  // Arrival return loop passes north of Alpha's six holding slots.
+  // Matches the server route: (56,-66) -> (70,-66) -> (70,-88)
+  // -> (103,-88) -> apron. Departures keep the south threshold entrance.
+  for (const [w, h, x, z] of [[14, 22, 70, -77], [33, 12, 86.5, -88]]) {
+    const loop = makeDeckSlab(w, h, TARMAC_TOP_Y, 0.4, taxiMat);
+    loop.position.set(x, loop.position.y, z);
+    island.add(loop);
+  }
+  island.add(makeMarking(14, 0.8, 63, -66, markY, yellowLineMat));
+  island.add(makeMarking(0.8, 22, 70, -77, markY, yellowLineMat));
+  island.add(makeMarking(33, 0.8, 86.5, -88, markY, yellowLineMat));
+
   // Wide South Departure Holding Bay at [74, 46] with hold-short bars & guard lights.
   const holdBay = makeDeckSlab(24, 22, TARMAC_TOP_Y, 0.4, taxiMat);
   holdBay.position.set(74, holdBay.position.y, 46);
@@ -457,6 +469,18 @@ function buildSatelliteAirport(ap, idx) {
     }
   }
 
+  // Painted lead-in/lead-off lines matching the server's satellite routes:
+  // departures join at the south threshold (z = 30) from the apron lane
+  // (x = 16); arrivals vacate at the far (north) end (z = -30.5).
+  for (const z of [30, -30.5]) {
+    const connector = makeDeckSlab(12, 6, TARMAC_TOP_Y - 0.03, 0.35, apronMat);
+    connector.position.set(10, connector.position.y, z);
+    island.add(connector);
+  }
+  island.add(makeMarking(12, 0.7, 10, 30, markY, yellowLineMat));
+  island.add(makeMarking(12, 0.7, 10, -30.5, markY, yellowLineMat));
+  island.add(makeMarking(0.7, 61.2, 16, -0.25, markY, yellowLineMat));
+
   // Elevated apron + small terminal + 4 gates.
   // Apron and terminal sit far enough east that a nose-in jet (gate x = +24,
   // nose up to ~15u ahead of it) stops well short of the terminal glass.
@@ -497,7 +521,7 @@ function buildSatelliteAirport(ap, idx) {
   scene.add(island);
   const satRunwayEvents = createRunwayEvents(scene, {
     x: cx + 4, zMin: cz - 36.5, zMax: cz + 36.5, halfWidth: 8.1, deckY: TARMAC_TOP_Y,
-    glideFrom: [cz + 115, 28], touchdownZ: cz + 22,
+    glideFrom: [cz + 192], touchdownZ: cz + 22,
   });
   const entry = {
     id: ap.id,
@@ -1283,7 +1307,13 @@ function worldYForAircraft(a, wheelDrop) {
   if (['landed', 'taxi', 'ready', 'parked'].includes(a.state)) {
     return a.position[2] + groundOffset;
   }
-  if (a.state === 'departing' || a.state === 'takeoff' || a.state === 'landing') {
+  if (a.state === 'landing') {
+    // Keep a constant deck datum throughout final; blend only during the
+    // high-altitude circuit so entering landing from cruise remains smooth.
+    const liftBlend = THREE.MathUtils.smoothstep(a.position[2], 15, 45);
+    return a.position[2] + groundOffset * (1 - liftBlend);
+  }
+  if (a.state === 'departing' || a.state === 'takeoff') {
     // Seamlessly blend wheel contact on the elevated runway deck into world altitude during climb-out.
     const liftBlend = Math.min(1, Math.max(0, a.position[2] / 15));
     return a.position[2] + groundOffset * (1 - liftBlend);
@@ -1692,6 +1722,7 @@ function applySnapshot(snapshot) {
     entry.snapZ = a.position[1];
     entry.altitude = a.position[2];
     entry.speed = a.speed ?? 0;
+    entry.landingPitch = a.landing_pitch ?? null;
 
     if (lastStates.get(a.id) !== a.state) {
       handleStateChange(a, lastStates.get(a.id), a.state);
@@ -1779,7 +1810,7 @@ function runwayEventsForAircraft(a) {
 // Fire one-shot effects on takeoff roll, liftoff, approach and touchdown.
 // `from` is undefined the first time an aircraft is seen (no event then).
 function detectRunwayEvent(a, entry, from, prevAlt) {
-  if (from === undefined || a.kind === 'fighter' || a.kind === 'tanker') return;
+  if (from === undefined) return;
   const [x, z, alt] = a.position;
   const rolling = a.state === 'takeoff' || a.state === 'departing';
   const rwy = runwayEventsForAircraft(a);
@@ -1897,6 +1928,8 @@ function animate() {
 
   const now = performance.now() / 1000;
   for (const entry of meshes.values()) {
+    entry.group.position.y -= entry.clearanceAdjustment || 0;
+    entry.clearanceAdjustment = 0;
     const wrapped = entry.state !== 'departing' && entry.group.position.distanceToSquared(entry.target) > 40000;
     if (wrapped) {
       entry.group.position.copy(entry.target);
@@ -1939,7 +1972,9 @@ function animate() {
     let targetPitch = 0;
     if (airborne) {
       targetPitch = THREE.MathUtils.clamp((entry.flightPitch || 0) * 1.15, -maxClimb, maxDescent);
-      if (entry.state === 'landing' && alt < 6 && targetPitch > 0) {
+      if (entry.state === 'landing' && entry.landingPitch !== null) {
+        targetPitch = -entry.landingPitch;
+      } else if (entry.state === 'landing' && alt < 6 && targetPitch > 0) {
         // Flare gently out of the nose-down glideslope over the threshold so main gear touches first.
         const f = Math.max(0, alt / 6);
         targetPitch = -0.05 * (1 - f) + targetPitch * f;
@@ -1954,8 +1989,25 @@ function animate() {
     const pitchRate = (entry.state === 'takeoff' || entry.state === 'departing' || entry.state === 'landing' || entry.state === 'landed')
       ? 5.5
       : 4.0;
-    entry.pitch = (entry.pitch || 0) + (targetPitch - (entry.pitch || 0)) * (1 - Math.exp(-pitchRate * dt));
+    const pitchDelta = (targetPitch - (entry.pitch || 0)) * (1 - Math.exp(-pitchRate * dt));
+    const landingRate = entry.state === 'landed' ? 0.035 : 0.12;
+    entry.pitch = (entry.pitch || 0) + (['landing', 'landed'].includes(entry.state)
+      ? THREE.MathUtils.clamp(pitchDelta, -landingRate * dt, landingRate * dt)
+      : pitchDelta);
     entry.group.rotation.x = entry.pitch + (stunt ? stunt.pitch : 0);
+
+    // Preserve wheel/deck clearance as the airframe rotates around its origin.
+    // Remove this adjustment before the next interpolation step to avoid drift.
+    if (['landing', 'landed'].includes(entry.state)) {
+      const sx = Math.sin(entry.pitch), cx = Math.cos(entry.pitch);
+      const sz = Math.sin(totalRoll), cz = Math.cos(totalRoll);
+      let bottom = Infinity;
+      for (const p of entry.contactPoints) {
+        bottom = Math.min(bottom, cx * (sz * p.x + cz * p.y) - sx * p.z);
+      }
+      entry.clearanceAdjustment = -bottom * entry.scale - entry.wheelDrop;
+      entry.group.position.y += entry.clearanceAdjustment;
+    }
 
     // Keep floating label hovering upright above the fuselage during barrel rolls.
     if (stunt && stunt.roll !== 0) {
