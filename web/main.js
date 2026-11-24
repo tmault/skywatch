@@ -357,7 +357,17 @@ function buildHomeAirport(ap) {
 
   enableShadows(island);
   scene.add(island);
-  return { group: island, beacon, lights, online: ap.online };
+  return {
+    id: ap.id,
+    name: ap.name,
+    isHome: true,
+    center: [0, 0],
+    group: island,
+    beacon,
+    lights,
+    runwayEvents,
+    online: ap.online,
+  };
 }
 
 function buildSatelliteAirport(ap, idx) {
@@ -483,10 +493,18 @@ function buildSatelliteAirport(ap, idx) {
   island.position.set(cx, 0, cz);
   enableShadows(island);
   scene.add(island);
+  const satRunwayEvents = createRunwayEvents(scene, {
+    x: cx + 4, zMin: cz - 36.5, zMax: cz + 36.5, halfWidth: 8.1, deckY: TARMAC_TOP_Y,
+    glideFrom: [cz + 115, 28], touchdownZ: cz + 22,
+  });
   const entry = {
+    id: ap.id,
+    isHome: false,
+    center: [cx, cz],
     group: island,
     beacon,
     lights,
+    runwayEvents: satRunwayEvents,
     label,
     glassMat,
     name: ap.name,
@@ -1744,25 +1762,38 @@ if (eventBanner) {
   });
 }
 
+function runwayEventsForAircraft(a) {
+  if (a?.environment_id && airportGroups.has(a.environment_id)) {
+    return airportGroups.get(a.environment_id).runwayEvents || runwayEvents;
+  }
+  if (a?.device) {
+    for (const ap of airportGroups.values()) {
+      if (ap.name === a.device && ap.runwayEvents) return ap.runwayEvents;
+    }
+  }
+  return runwayEvents;
+}
+
 // Fire one-shot effects on takeoff roll, liftoff, approach and touchdown.
 // `from` is undefined the first time an aircraft is seen (no event then).
 function detectRunwayEvent(a, entry, from, prevAlt) {
   if (from === undefined || a.kind === 'fighter' || a.kind === 'tanker') return;
   const [x, z, alt] = a.position;
   const rolling = a.state === 'takeoff' || a.state === 'departing';
+  const rwy = runwayEventsForAircraft(a);
 
   if (rolling && from !== a.state && from !== 'takeoff' && alt <= 0) {
-    runwayEvents.takeoffRoll(x, z);
+    rwy.takeoffRoll(x, z);
     showEventBanner(a, 'takeoff', a.state === 'departing' ? 'Final departure' : 'Departure');
   }
   if (rolling && prevAlt <= 0 && alt > 0) {
-    runwayEvents.liftoff(x, z, entry.group.position.y);
+    rwy.liftoff(x, z, entry.group.position.y);
   }
   if (a.state === 'landing' && from !== 'landing') {
     showEventBanner(a, 'landing', 'Arrival · on approach');
   }
   if (from === 'landing' && a.state === 'landed') {
-    runwayEvents.touchdown(x, z);
+    rwy.touchdown(x, z);
     showEventBanner(a, 'landing', 'Touchdown');
   }
 }
@@ -2026,12 +2057,23 @@ function animate() {
 
   updateRefuelPipes(now);
 
-  let approachActive = false;
-  for (const entry of meshes.values()) {
-    if (entry.state === 'landing') { approachActive = true; break; }
+  const approaching = new Set();
+  for (const a of currentSnapshot.values()) {
+    if (a.state === 'landing') {
+      const rwy = runwayEventsForAircraft(a);
+      approaching.add(rwy);
+    }
   }
-  const runwayBusy = runwayEvents.update(dt, now, { approachActive });
-  if (homeRunwayLights) homeRunwayLights.setBoost(Math.max(runwayBusy, approachActive ? 0.35 : 0));
+  for (const ap of airportGroups.values()) {
+    const approachActive = ap.runwayEvents ? approaching.has(ap.runwayEvents) : false;
+    const busy = ap.runwayEvents
+      ? ap.runwayEvents.update(dt, now, { approachActive })
+      : 0;
+    if (ap.lights) ap.lights.setBoost(Math.max(busy, approachActive ? 0.35 : 0));
+  }
+  if (airportGroups.size === 0) {
+    runwayEvents.update(dt, now, { approachActive: false });
+  }
 
   for (const radar of radars) {
     radar.rotation.y = now * 0.8;

@@ -72,14 +72,18 @@ struct ThreadListEntry {
     settled: bool,
     #[serde(rename = "settledAt", alias = "settled_at", default)]
     settled_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "latestRunId")]
     latest_run_id: Option<String>,
     #[serde(default)]
     latest_run_provider: Option<String>,
     #[serde(default)]
     latest_run_model: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "providerInstanceId")]
     latest_run_provider_instance: Option<String>,
+    #[serde(default, alias = "parentThreadId")]
+    parent_thread_id: Option<String>,
+    #[serde(default, alias = "relationshipToParent")]
+    relationship_to_parent: Option<String>,
     #[serde(default)]
     limit_recovery_run_id: Option<String>,
     #[serde(default)]
@@ -154,6 +158,8 @@ struct SubagentRow {
     thread_id: String,
     child_thread_id: Option<String>,
     chat_thread_id: Option<String>,
+    #[serde(default)]
+    environment_id: Option<String>,
     status: String,
     updated_at: Option<String>,
     title: Option<String>,
@@ -218,12 +224,27 @@ impl GateCallsigns {
 }
 
 impl GateCallsigns {
-    /// Give every parked thread a gate that never changes while it stays parked;
-    /// new arrivals take the lowest free gate at their airport.
-    fn assign_slots(&mut self, entries: &[ThreadListEntry], airports: &[Airport]) {
-        let ids: HashSet<&String> = entries.iter().map(|e| &e.thread_id).collect();
+    /// Give every parked thread (and every ground thread at a satellite airport,
+    /// where taxiway-ready and stale threads share the 4 terminal gates) a sticky
+    /// non-overlapping gate index that never changes while it stays on the ground.
+    fn assign_ground_slots(
+        &mut self,
+        taxiway: &[ThreadListEntry],
+        stale: &[ThreadListEntry],
+        airports: &[Airport],
+    ) {
+        let sat_taxi: Vec<&ThreadListEntry> = taxiway
+            .iter()
+            .filter(|e| remote::owner(&e.thread_id).is_some())
+            .collect();
+        let ids: HashSet<&String> = sat_taxi
+            .iter()
+            .map(|e| &e.thread_id)
+            .chain(stale.iter().map(|e| &e.thread_id))
+            .collect();
         self.slots.retain(|id, _| ids.contains(id));
-        for e in entries {
+
+        for e in sat_taxi.iter().copied().chain(stale.iter()) {
             if self.slots.contains_key(&e.thread_id) {
                 continue;
             }
@@ -234,14 +255,23 @@ impl GateCallsigns {
                 .map(|ap| ap.gates.len())
                 .unwrap_or(HOME_GATES.len())
                 .max(1);
-            let used: HashSet<usize> = entries
+            let used: HashSet<usize> = sat_taxi
                 .iter()
+                .copied()
+                .chain(stale.iter())
                 .filter(|o| remote::owner(&o.thread_id).map(|x| x.0) == env)
                 .filter_map(|o| self.slots.get(&o.thread_id).copied())
                 .collect();
-            let slot = (0..capacity).find(|s| !used.contains(s)).unwrap_or(self.slots.len() % capacity);
+            let slot = (0..capacity)
+                .find(|s| !used.contains(s))
+                .unwrap_or(self.slots.len() % capacity);
             self.slots.insert(e.thread_id.clone(), slot);
         }
+    }
+
+    #[cfg(test)]
+    fn assign_slots(&mut self, entries: &[ThreadListEntry], airports: &[Airport]) {
+        self.assign_ground_slots(&[], entries, airports);
     }
 }
 
@@ -700,43 +730,86 @@ struct PollData {
     subagents: Vec<SubagentRow>,
 }
 
-/// Fetch airports, threads, pending-request counts, and sub-agents off-lock.
-fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>, cache: &mut remote::Cache) -> Option<PollData> {
-    let local_environment_id = state_dir()
-        .and_then(|dir| std::fs::read_to_string(dir.join("environment-id")).ok())
-        .map(|id| id.trim().to_owned())
-        .filter(|id| !id.is_empty());
-    let mut airports = discover_airports_fast(home_name, reachability);
-    let local_poll = poll_threads();
-    if let Some(home) = airports.first_mut() { home.online = local_poll.is_some(); }
-    if let Some(ref result) = local_poll { cache.local = serde_json::to_value(result).ok(); }
-    let (mut entries, mut done_or_archived) = local_poll.or_else(|| cache.local.as_ref().and_then(|v| serde_json::from_value(v.clone()).ok())).unwrap_or_default();
-    let local_ids = entries.iter().map(|entry| entry.thread_id.clone()).collect();
-    let updates = remote::bridge(&serde_json::json!({"action":"poll"}))
-        .and_then(|v| serde_json::from_value::<Vec<remote::Peer>>(v).ok()).unwrap_or_default();
-    for peer in cache.merge(updates) {
-        if let Some(ap) = airports.iter_mut().find(|a| a.id == peer.environment_id) {
-            ap.online = peer.online;
-        }
-        for value in peer.threads.unwrap_or_default() {
-            if let Ok(mut entry) = serde_json::from_value::<ThreadListEntry>(value) {
-                entry.thread_id = remote::key(&peer.environment_id, &entry.thread_id);
-                if entry.settled || entry.settled_at.is_some() {
-                    done_or_archived.insert(entry.thread_id);
-                } else { entries.push(entry); }
+fn subagent_linger_secs() -> i64 {
+    std::env::var("SKYWATCH_SUBAGENT_LINGER_SECS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(SUBAGENT_LINGER_SECS)
+}
+
+/// Separate a remote peer's threads into top-level active threads, settled/done
+/// IDs, and active/lingering sub-agent wingmen (matching local SQLite filtering).
+fn extract_peer_threads(
+    peer: &remote::Peer,
+    now: i64,
+    linger: i64,
+) -> (Vec<ThreadListEntry>, HashSet<String>, Vec<SubagentRow>) {
+    let mut entries = Vec::new();
+    let mut done_or_archived = HashSet::new();
+    let mut subagents = Vec::new();
+    for value in peer.threads.as_deref().unwrap_or(&[]) {
+        let Ok(mut entry) = serde_json::from_value::<ThreadListEntry>(value.clone()) else {
+            continue;
+        };
+        let is_subagent = entry
+            .relationship_to_parent
+            .as_deref()
+            .is_some_and(|r| r.eq_ignore_ascii_case("subagent"));
+        if is_subagent {
+            if entry.settled || entry.settled_at.is_some() {
+                continue;
             }
+            let Some(parent_id) = entry.parent_thread_id.clone() else {
+                continue;
+            };
+            let active = is_working_status(&entry.status);
+            let recent = entry
+                .updated_at
+                .as_deref()
+                .and_then(parse_rfc3339)
+                .map(|t| now - t <= linger)
+                .unwrap_or(false);
+            if active || recent {
+                let raw_id = entry.thread_id.clone();
+                let keyed = remote::key(&peer.environment_id, &raw_id);
+                subagents.push(SubagentRow {
+                    subagent_id: keyed.clone(),
+                    thread_id: remote::key(&peer.environment_id, &parent_id),
+                    child_thread_id: Some(keyed),
+                    chat_thread_id: Some(raw_id),
+                    environment_id: Some(peer.environment_id.clone()),
+                    status: entry.status,
+                    updated_at: entry.updated_at,
+                    title: Some(entry.title),
+                    model: entry.model,
+                });
+            }
+            continue;
+        }
+        entry.thread_id = remote::key(&peer.environment_id, &entry.thread_id);
+        if entry.settled || entry.settled_at.is_some() {
+            done_or_archived.insert(entry.thread_id);
+        } else {
+            entries.push(entry);
         }
     }
+    (entries, done_or_archived, subagents)
+}
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
-    let total_entries = entries.len();
-    // A thread whose sub-agents are still working is airborne even when its own
-    // run reads idle or finished: the parent flies with its fighter escort.
-    let all_subagents = poll_subagents(&local_ids, now);
+/// Partition top-level threads into airborne, taxiway-ready, and gate-parked
+/// pools respecting each airport's physical ground capacity.
+fn partition_pools(
+    entries: Vec<ThreadListEntry>,
+    all_subagents: Vec<SubagentRow>,
+    airports: &[Airport],
+    now: i64,
+) -> (
+    Vec<(ThreadListEntry, i64)>,
+    Vec<ThreadListEntry>,
+    Vec<ThreadListEntry>,
+    Vec<SubagentRow>,
+    usize,
+) {
     let parents_with_active_subagents: HashSet<String> = all_subagents
         .iter()
         .filter(|r| is_working_status(&r.status))
@@ -749,22 +822,24 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>, cache:
         .into_iter()
         .filter(|e| shown_on_its_own(e, &parents_with_active_subagents))
         .collect();
-    let nested = total_entries - entries.len();
-    let total_entries = total_entries - nested;
+    let total_entries = entries.len();
     let mut flying = Vec::new();
     let mut working_count = HashMap::<String, usize>::new();
     let mut refuel_count = HashMap::<String, usize>::new();
     let mut taxiway = Vec::new();
     let mut stale = Vec::new();
     for e in entries {
-        let env = remote::owner(&e.thread_id).map(|o| o.0).unwrap_or_else(|| "local".into());
+        let env = remote::owner(&e.thread_id)
+            .map(|o| o.0)
+            .unwrap_or_else(|| "local".into());
         if detect_token_wait(&e).is_some() {
             if *refuel_count.entry(env.clone()).or_default() < MAX_REFUELING {
                 let pending = e.pending;
                 flying.push((e, pending));
-                *refuel_count.entry(env.clone()).or_default() += 1;
+                *refuel_count.entry(env).or_default() += 1;
             }
-        } else if is_working_status(&e.status) || parents_with_active_subagents.contains(&e.thread_id) {
+        } else if is_working_status(&e.status) || parents_with_active_subagents.contains(&e.thread_id)
+        {
             if *working_count.entry(env.clone()).or_default() < MAX_AIRCRAFT {
                 let mut e = e;
                 if !is_working_status(&e.status) {
@@ -772,22 +847,43 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>, cache:
                 }
                 let pending = e.pending;
                 flying.push((e, pending));
-                *working_count.entry(env.clone()).or_default() += 1;
+                *working_count.entry(env).or_default() += 1;
             }
         } else {
-            // Recent threads queue on Taxiway Alpha; when its slots are full (and for
-            // threads idle >24h) they park at the terminal gates instead of vanishing.
             let count_in = |v: &Vec<ThreadListEntry>| {
                 v.iter()
-                    .filter(|x| remote::owner(&x.thread_id).map(|o| o.0).unwrap_or_else(|| "local".into()) == env)
+                    .filter(|x| {
+                        remote::owner(&x.thread_id)
+                            .map(|o| o.0)
+                            .unwrap_or_else(|| "local".into())
+                            == env
+                    })
                     .count()
             };
-            let taxi_cap = if env == "local" { MAX_TAXIWAY_QUEUE } else { 4 };
-            let gate_cap = if env == "local" { MAX_GATE_PARKED } else { 4 };
-            if !is_stale(&e.updated_at, now) && count_in(&taxiway) < taxi_cap {
-                taxiway.push(e);
-            } else if count_in(&stale) < gate_cap {
-                stale.push(e);
+            if env == "local" {
+                // Home island has 6 Taxiway Alpha slots + 10 terminal gates.
+                // Overflow recent threads park at gates instead of vanishing.
+                if !is_stale(&e.updated_at, now) && count_in(&taxiway) < MAX_TAXIWAY_QUEUE {
+                    taxiway.push(e);
+                } else if count_in(&stale) < MAX_GATE_PARKED {
+                    stale.push(e);
+                }
+            } else {
+                // Satellite islands share their terminal gates (4 stands) across
+                // both recent ready threads and stale parked threads so no two
+                // aircraft ever overlap on the same stand.
+                let sat_cap = airports
+                    .iter()
+                    .find(|a| a.id == env)
+                    .map(|a| a.gates.len())
+                    .unwrap_or(4);
+                if count_in(&taxiway) + count_in(&stale) < sat_cap {
+                    if !is_stale(&e.updated_at, now) {
+                        taxiway.push(e);
+                    } else {
+                        stale.push(e);
+                    }
+                }
             }
         }
     }
@@ -797,9 +893,47 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>, cache:
         .into_iter()
         .filter(|r| flying_ids.contains(&r.thread_id))
         .collect();
+    let omitted = total_entries.saturating_sub(flying.len() + taxiway.len() + stale.len());
+    (flying, taxiway, stale, subagents, omitted)
+}
+
+/// Fetch airports, threads, pending-request counts, and sub-agents off-lock.
+fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>, cache: &mut remote::Cache) -> Option<PollData> {
+    let local_environment_id = state_dir()
+        .and_then(|dir| std::fs::read_to_string(dir.join("environment-id")).ok())
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty());
+    let mut airports = discover_airports_fast(home_name, reachability);
+    let local_poll = poll_threads();
+    if let Some(home) = airports.first_mut() { home.online = local_poll.is_some(); }
+    if let Some(ref result) = local_poll { cache.local = serde_json::to_value(result).ok(); }
+    let (mut entries, mut done_or_archived) = local_poll.or_else(|| cache.local.as_ref().and_then(|v| serde_json::from_value(v.clone()).ok())).unwrap_or_default();
+    let local_ids = entries.iter().map(|entry| entry.thread_id.clone()).collect();
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let linger = subagent_linger_secs();
+    let mut all_subagents = poll_subagents(&local_ids, now);
+
+    let updates = remote::bridge(&serde_json::json!({"action":"poll"}))
+        .and_then(|v| serde_json::from_value::<Vec<remote::Peer>>(v).ok()).unwrap_or_default();
+    for peer in cache.merge(updates) {
+        if let Some(ap) = airports.iter_mut().find(|a| a.id == peer.environment_id) {
+            ap.online = peer.online;
+        }
+        let (peer_entries, peer_done, peer_subs) = extract_peer_threads(&peer, now, linger);
+        entries.extend(peer_entries);
+        done_or_archived.extend(peer_done);
+        all_subagents.extend(peer_subs);
+    }
+
+    let (flying, taxiway, stale, subagents, omitted) =
+        partition_pools(entries, all_subagents, &airports, now);
 
     Some(PollData {
-        omitted: total_entries.saturating_sub(flying.len() + taxiway.len() + stale.len()),
+        omitted,
         local_environment_id,
         airports,
         flying,
@@ -836,10 +970,32 @@ fn retarget_ground(a: &mut Aircraft, slot: [f32; 2], heading: f32, next: State) 
     a.taxi_to(slot, next);
 }
 
-fn ground_slot(entries: &[ThreadListEntry], i: usize, airports: &[Airport], taxi: bool) -> ([f32;2], f32) {
-    let env = remote::owner(&entries[i].thread_id).map(|o| o.0);
-    let slot = entries[..i].iter().filter(|e| remote::owner(&e.thread_id).map(|o|o.0) == env).count();
-    slot_position(&entries[i].thread_id, slot, airports, taxi)
+fn airport_for_key<'a>(airports: &'a [Airport], key: &str) -> Option<&'a Airport> {
+    if let Some((env, _)) = remote::owner(key) {
+        airports.iter().find(|ap| ap.id == env)
+    } else {
+        airports.iter().find(|ap| ap.id == "local")
+    }
+}
+
+fn taxiway_slot(
+    entries: &[ThreadListEntry],
+    i: usize,
+    airports: &[Airport],
+    gates: &GateCallsigns,
+) -> ([f32; 2], f32) {
+    let tid = &entries[i].thread_id;
+    if let Some((env, _)) = remote::owner(tid) {
+        if let Some(ap) = airports.iter().find(|ap| ap.id == env) {
+            let slot = gates.slots.get(tid).copied().unwrap_or(0);
+            return (ap.gates[slot % ap.gates.len()], GATE_HEADING);
+        }
+    }
+    let local_idx = entries[..i]
+        .iter()
+        .filter(|e| remote::owner(&e.thread_id).is_none())
+        .count();
+    TAXIWAY_QUEUE[local_idx % TAXIWAY_QUEUE.len()]
 }
 
 fn slot_position(thread_id: &str, slot: usize, airports: &[Airport], taxi: bool) -> ([f32;2], f32) {
@@ -912,6 +1068,9 @@ fn apply_poll(
 ) -> Vec<(String, String)> {
     world.omitted_threads = data.omitted;
     world.airports = data.airports;
+    // Assign sticky non-overlapping gate slots across all satellite ground
+    // aircraft (both recent ready and stale parked) plus local stale gates.
+    gates.assign_ground_slots(&data.taxiway, &data.stale, &world.airports);
 
     let mut keep: HashMap<String, KeepInfo> = HashMap::new();
     let mut new_threads: Vec<(String, String, ModelClass)> = Vec::new();
@@ -1029,19 +1188,35 @@ fn apply_poll(
         .collect();
     for id in drop {
         if let Some(cs) = callsigns.by_thread.remove(&id) {
+            let owning_ap = airport_for_key(&world.airports, &id).cloned();
+            if let Some(ap) = &owning_ap {
+                if let Some(a) = world.get_mut(&cs) {
+                    a.set_airport(ap);
+                }
+            }
             if !all_active_ids.contains(&id) && data.done_or_archived.contains(&id) {
                 world.depart_by_callsign(&cs);
                 radio_events.push((cs, "thread done — departing into the horizon".to_string()));
-            } else if runway.primed
-                && taxi_ids.contains(&id)
-                && world
+            } else if runway.primed && taxi_ids.contains(&id) {
+                let arrival_slot = owning_ap
+                    .as_ref()
+                    .filter(|ap| !ap.is_home && !ap.gates.is_empty())
+                    .map(|ap| {
+                        let idx = gates.slots.get(&id).copied().unwrap_or(0);
+                        (ap.gates[idx % ap.gates.len()], GATE_HEADING)
+                    })
+                    .unwrap_or(TAXIWAY_QUEUE[0]);
+                if world
                     .get_mut(&cs)
-                    .map(|a| a.begin_approach(Some(TAXIWAY_QUEUE[0])))
+                    .map(|a| a.begin_approach(Some(arrival_slot)))
                     .unwrap_or(false)
-            {
-                // Turn finished: fly the approach, land and backtrack to the taxiway.
-                runway.arrivals.insert(id, cs.clone());
-                radio_events.push((cs, "on approach, Runway 36".to_string()));
+                {
+                    // Turn finished: fly the approach, land and backtrack to the owning airport's slot.
+                    runway.arrivals.insert(id, cs.clone());
+                    radio_events.push((cs, "on approach, Runway 36".to_string()));
+                } else {
+                    world.remove_by_callsign(&cs);
+                }
             } else {
                 world.remove_by_callsign(&cs);
             }
@@ -1056,7 +1231,11 @@ fn apply_poll(
             continue;
         };
         let cs = callsigns.get(thread_id);
+        let owning_ap = airport_for_key(&world.airports, thread_id).cloned();
         if let Some(a) = world.get_mut(&cs) {
+            if let Some(ap) = &owning_ap {
+                a.set_airport(ap);
+            }
             // Let takeoffs and go-arounds finish; the steady state applies after.
             if !a.in_runway_sequence() {
                 if a.state != info.state {
@@ -1092,10 +1271,15 @@ fn apply_poll(
             a.model_class = info.model_class;
             a.provider = info.provider.clone();
             a.refuel_scope = info.refuel_scope.clone();
-            a.device = Some(home_name.to_string());
+            a.device = Some(
+                owning_ap
+                    .as_ref()
+                    .map(|ap| ap.name.clone())
+                    .unwrap_or_else(|| home_name.to_string()),
+            );
         } else if let Some((_, t, mc)) = new_threads.iter().find(|(id, _, _)| id == thread_id) {
             // Woken from the taxiway queue or a gate: the same airframe taxis
-            // out and takes off instead of a new one popping into the sky.
+            // out and takes off from its owning airport instead of popping into the sky.
             let ground_cs = taxiway_cs
                 .by_thread
                 .get(thread_id)
@@ -1104,6 +1288,9 @@ fn apply_poll(
             if let Some(gcs) = ground_cs {
                 if world.rename(&gcs, &cs) {
                     if let Some(a) = world.get_mut(&cs) {
+                        if let Some(ap) = &owning_ap {
+                            a.set_airport(ap);
+                        }
                         a.title = info.title.clone();
                         a.model = info.model.clone();
                         a.model_class = *mc;
@@ -1119,20 +1306,32 @@ fn apply_poll(
                 }
             }
             let mut a = Aircraft::with_model(&cs, Kind::Agent, *mc);
+            if let Some(ap) = &owning_ap {
+                a.set_airport(ap);
+            }
             a.title = info.title.clone().or_else(|| Some(t.clone()));
             a.model = info.model.clone();
             a.provider = info.provider.clone();
             a.refuel_scope = info.refuel_scope.clone();
-            a.device = Some(home_name.to_string());
+            a.device = Some(
+                owning_ap
+                    .as_ref()
+                    .map(|ap| ap.name.clone())
+                    .unwrap_or_else(|| home_name.to_string()),
+            );
             a.hold_reason = info.reason.clone();
             a.refuel_reset_at = info.reset_at.clone();
             a.assign(&info.zone);
             a.state = info.state;
             let a_reason = a.hold_reason.clone();
             let a_reset = a.refuel_reset_at.clone();
-            if runway.primed && info.state != State::Refueling && remote::owner(thread_id).is_none() {
-                // Brand-new thread: line up on Runway 36 and take off.
-                a.position = [RUNWAY_THRESHOLD[0], RUNWAY_THRESHOLD[1], 0.0];
+            if runway.primed && info.state != State::Refueling {
+                // Brand-new thread: line up on the owning airport's runway and take off.
+                let thresh = owning_ap
+                    .as_ref()
+                    .map(|ap| ap.runway_layout().threshold)
+                    .unwrap_or(RUNWAY_THRESHOLD);
+                a.position = [thresh[0], thresh[1], 0.0];
                 a.altitude = 0.0;
                 a.heading = RUNWAY_HEADING;
                 a.state = State::Ready;
@@ -1145,7 +1344,7 @@ fn apply_poll(
         }
     }
 
-    // --- Taxiway Alpha Departure Queue: recent (<24h) non-working threads waiting for takeoff ---
+    // --- Taxiway Alpha / Satellite Stand Departure Queue: recent (<24h) non-working threads ---
     let taxi_drop: Vec<String> = taxiway_cs
         .by_thread
         .keys()
@@ -1154,6 +1353,11 @@ fn apply_poll(
         .collect();
     for id in taxi_drop {
         if let Some(cs) = taxiway_cs.by_thread.remove(&id) {
+            if let Some(ap) = airport_for_key(&world.airports, &id).cloned() {
+                if let Some(a) = world.get_mut(&cs) {
+                    a.set_airport(&ap);
+                }
+            }
             if !all_active_ids.contains(&id) && data.done_or_archived.contains(&id) {
                 world.depart_by_callsign(&cs);
                 radio_events.push((
@@ -1187,19 +1391,31 @@ fn apply_poll(
             }
             runway.arrivals.remove(&entry.thread_id);
         }
-        let (slot_pos, slot_hdg) = ground_slot(&data.taxiway, i, &world.airports, true);
+        let owning_ap = airport_for_key(&world.airports, &entry.thread_id).cloned();
+        let (slot_pos, slot_hdg) = taxiway_slot(&data.taxiway, i, &world.airports, gates);
         let (_, reason) = flight_state(&entry.status, entry.pending);
         let (zone, _) = classify_zone(entry.project.as_deref(), &entry.title);
         if let Some(a) = world.get_mut(&cs) {
+            if let Some(ap) = &owning_ap {
+                a.set_airport(ap);
+            }
             a.title = Some(entry.title.clone());
             a.hold_reason = reason;
             a.topic = Some(zone);
             a.model = entry.model.clone();
-            a.device = Some(home_name.to_string());
+            a.device = Some(
+                owning_ap
+                    .as_ref()
+                    .map(|ap| ap.name.clone())
+                    .unwrap_or_else(|| home_name.to_string()),
+            );
             // Queued threads shuffle to their new slot by taxi, not by teleport.
             retarget_ground(a, slot_pos, slot_hdg, State::Ready);
         } else {
             let mut a = Aircraft::with_model(&cs, Kind::Agent, model_class(&entry.model));
+            if let Some(ap) = &owning_ap {
+                a.set_airport(ap);
+            }
             a.title = Some(entry.title.clone());
             a.model = entry.model.clone();
             a.hold_reason = reason;
@@ -1208,7 +1424,12 @@ fn apply_poll(
             a.position = [slot_pos[0], slot_pos[1], 0.0];
             a.altitude = 0.0;
             a.heading = slot_hdg;
-            a.device = Some(home_name.to_string());
+            a.device = Some(
+                owning_ap
+                    .as_ref()
+                    .map(|ap| ap.name.clone())
+                    .unwrap_or_else(|| home_name.to_string()),
+            );
             world.add(a);
             radio_events.push((cs, format!("queued on Taxiway Alpha #{}", i + 1)));
         }
@@ -1235,7 +1456,7 @@ fn apply_poll(
         }
     }
 
-    // --- Extended Terminal Gates: STRICTLY threads untouched for >24 hours ---
+    // --- Extended Terminal Gates: threads parked at gates (>24h or home overflow) ---
     let stale_ids: HashSet<String> = data.stale.iter().map(|e| e.thread_id.clone()).collect();
     let gate_drop: Vec<String> = gates
         .by_thread
@@ -1245,6 +1466,11 @@ fn apply_poll(
         .collect();
     for id in gate_drop {
         if let Some(cs) = gates.by_thread.remove(&id) {
+            if let Some(ap) = airport_for_key(&world.airports, &id).cloned() {
+                if let Some(a) = world.get_mut(&cs) {
+                    a.set_airport(&ap);
+                }
+            }
             if !all_active_ids.contains(&id) && data.done_or_archived.contains(&id) {
                 world.depart_by_callsign(&cs);
                 radio_events.push((
@@ -1258,19 +1484,30 @@ fn apply_poll(
         }
     }
 
-    gates.assign_slots(&data.stale, &world.airports);
     for entry in data.stale.iter() {
         let cs = gates.get(&entry.thread_id);
         let gate_index = gates.slots.get(&entry.thread_id).copied().unwrap_or(0);
+        let owning_ap = airport_for_key(&world.airports, &entry.thread_id).cloned();
         let (slot, _) = slot_position(&entry.thread_id, gate_index, &world.airports, false);
         if let Some(a) = world.get_mut(&cs) {
+            if let Some(ap) = &owning_ap {
+                a.set_airport(ap);
+            }
             a.title = Some(entry.title.clone());
             a.model = entry.model.clone();
-            a.device = Some(home_name.to_string());
+            a.device = Some(
+                owning_ap
+                    .as_ref()
+                    .map(|ap| ap.name.clone())
+                    .unwrap_or_else(|| home_name.to_string()),
+            );
             // Stale threads shuffle between gates by taxi, not by teleport.
             retarget_ground(a, slot, GATE_HEADING, State::Parked);
         } else {
             let mut a = Aircraft::with_model(&cs, Kind::Agent, model_class(&entry.model));
+            if let Some(ap) = &owning_ap {
+                a.set_airport(ap);
+            }
             a.title = Some(entry.title.clone());
             a.model = entry.model.clone();
             a.state = State::Parked;
@@ -1278,7 +1515,12 @@ fn apply_poll(
             a.altitude = 0.0;
             a.heading = GATE_HEADING;
             a.topic = None;
-            a.device = Some(home_name.to_string());
+            a.device = Some(
+                owning_ap
+                    .as_ref()
+                    .map(|ap| ap.name.clone())
+                    .unwrap_or_else(|| home_name.to_string()),
+            );
             world.add(a);
             radio_events.push((cs.clone(), format!("parked at gate {}", gate_index + 1)));
         }
@@ -1294,7 +1536,7 @@ fn apply_poll(
     }
 
     let previous_wingmen = std::mem::take(&mut wingmen.by_subagent);
-    let mut child_chats = HashMap::new();
+    let mut child_chats: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
     let suffixes = ["A", "B", "C", "D"];
 
     for (parent_tid, subs) in by_parent {
@@ -1308,6 +1550,7 @@ fn apply_poll(
         let Some((parent_id, p_pos, p_heading, p_state, p_model)) = parent_info else {
             continue;
         };
+        let parent_ap = airport_for_key(&world.airports, &parent_tid).cloned();
         let on_ground = matches!(
             p_state,
             State::Parked | State::Landed | State::Taxi | State::Ready
@@ -1319,7 +1562,11 @@ fn apply_poll(
                 .clone()
                 .unwrap_or_else(|| parent_tid.clone());
             let cs = format!("{parent_cs}-{}", suffixes[slot % suffixes.len()]);
-            child_chats.insert(cs.clone(), sub.chat_thread_id);
+            let sub_env = sub
+                .environment_id
+                .clone()
+                .or_else(|| remote::owner(&parent_tid).map(|o| o.0));
+            child_chats.insert(cs.clone(), (sub_env, sub.chat_thread_id));
             wingmen
                 .by_subagent
                 .insert(sub.subagent_id.clone(), (cs.clone(), relay_tid));
@@ -1327,17 +1574,33 @@ fn apply_poll(
             // Wingmen wear their own model's livery, falling back to the parent's.
             let model = sub.model.clone().or_else(|| p_model.clone());
             if let Some(a) = world.get_mut(&cs) {
+                if let Some(ap) = &parent_ap {
+                    a.set_airport(ap);
+                }
                 a.parent_id = Some(parent_id);
                 a.wing_slot = Some(slot);
                 a.title = sub.title.clone();
                 a.model = model;
-                a.device = Some(home_name.to_string());
+                a.device = Some(
+                    parent_ap
+                        .as_ref()
+                        .map(|ap| ap.name.clone())
+                        .unwrap_or_else(|| home_name.to_string()),
+                );
             } else {
                 let start = formation_position(p_pos, p_heading, on_ground, slot);
                 let mut fighter = Aircraft::wingman(&cs, parent_id, slot, start, p_heading);
+                if let Some(ap) = &parent_ap {
+                    fighter.set_airport(ap);
+                }
                 fighter.title = sub.title.clone();
                 fighter.model = model;
-                fighter.device = Some(home_name.to_string());
+                fighter.device = Some(
+                    parent_ap
+                        .as_ref()
+                        .map(|ap| ap.name.clone())
+                        .unwrap_or_else(|| home_name.to_string()),
+                );
                 world.add(fighter);
                 radio_events.push((cs, format!("scrambled on {parent_cs}'s wing")));
             }
@@ -1373,8 +1636,12 @@ fn apply_poll(
             } else {
                 bind_conversation(aircraft, local_airport, local_environment, Some(key));
             }
-        } else if let Some(child) = child_chats.get(&aircraft.callsign) {
-            bind_conversation(aircraft, local_airport, local_environment, child.as_deref());
+        } else if let Some((sub_env, child)) = child_chats.get(&aircraft.callsign) {
+            if let Some(env) = sub_env.as_deref() {
+                bind_conversation(aircraft, airport_for(env), Some(env), child.as_deref());
+            } else {
+                bind_conversation(aircraft, local_airport, local_environment, child.as_deref());
+            }
         } else {
             // A departing thread can have been deleted. Keep its reference only.
             aircraft.chat_links = None;
@@ -1594,6 +1861,7 @@ mod tests {
                     thread_id: "same".into(),
                     child_thread_id: Some("child".into()),
                     chat_thread_id: Some("child".into()),
+                    environment_id: None,
                     status: "running".into(),
                     updated_at: None,
                     title: Some("Local wingman".into()),
@@ -1604,6 +1872,7 @@ mod tests {
                     thread_id: "same".into(),
                     child_thread_id: None,
                     chat_thread_id: None,
+                    environment_id: None,
                     status: "running".into(),
                     updated_at: None,
                     title: Some("Wingman without chat".into()),
@@ -1764,6 +2033,8 @@ mod tests {
             latest_run_provider: Some("claudeAgent".to_string()),
             latest_run_model: Some("claude-opus-5-5".to_string()),
             latest_run_provider_instance: None,
+            parent_thread_id: None,
+            relationship_to_parent: None,
             limit_recovery_run_id: None,
             limit_recovery_reset_at: None,
             limit_recovery_auto_resume: None,
@@ -1796,6 +2067,7 @@ mod tests {
                 thread_id: "t-fly".to_string(),
                 child_thread_id: None,
                 chat_thread_id: None,
+                environment_id: None,
                 status: "running".to_string(),
                 updated_at: None,
                 title: Some("Scout".to_string()),
@@ -2281,6 +2553,299 @@ mod tests {
         assert_eq!(sky1.state, State::Cruising);
         assert!(sky1.tanker_id.is_none());
         assert_eq!(world.iter().filter(|a| a.kind == Kind::Tanker).count(), 0);
+    }
+
+    #[test]
+    fn satellite_taxiway_and_stale_threads_never_overlap_on_same_gate() {
+        let now = parse_rfc3339("2026-11-24T21:00:00Z").unwrap();
+        let airports = vec![
+            Airport::home("local", "omarchy"),
+            Airport::satellite("mac", "Tom's M5 Air", [0.0, 285.0], true),
+        ];
+        let mut recent1 = make_entry(&remote::key("mac", "r1"), "Recent 1", "completed");
+        recent1.updated_at = Some("2026-11-24T20:00:00Z".into());
+        let mut recent2 = make_entry(&remote::key("mac", "r2"), "Recent 2", "completed");
+        recent2.updated_at = Some("2026-11-24T19:00:00Z".into());
+        let mut stale1 = make_entry(&remote::key("mac", "s1"), "Stale 1", "completed");
+        stale1.updated_at = Some("2026-11-22T10:00:00Z".into());
+        let mut stale2 = make_entry(&remote::key("mac", "s2"), "Stale 2", "completed");
+        stale2.updated_at = Some("2026-11-22T09:00:00Z".into());
+        let mut stale3 = make_entry(&remote::key("mac", "s3"), "Stale 3", "completed");
+        stale3.updated_at = Some("2026-11-20T08:00:00Z".into());
+
+        let (flying, taxiway, stale, subagents, omitted) = partition_pools(
+            vec![recent1, recent2, stale1, stale2, stale3],
+            vec![],
+            &airports,
+            now,
+        );
+        assert_eq!(taxiway.len(), 2);
+        assert_eq!(stale.len(), 2, "remaining 2 of 4 satellite gates hold stale threads");
+        assert_eq!(omitted, 1, "5th ground thread is omitted instead of overlapping");
+
+        let mut world = World::new();
+        let (mut sky, mut taxi, mut gates, mut wing, mut runway) = (
+            Callsigns::default(),
+            TaxiwayCallsigns::default(),
+            GateCallsigns::default(),
+            Wingmen::default(),
+            RunwayOps::default(),
+        );
+        apply_poll(
+            &mut world,
+            "omarchy",
+            PollData {
+                omitted,
+                local_environment_id: Some("pc".into()),
+                airports,
+                flying,
+                taxiway,
+                stale,
+                done_or_archived: HashSet::new(),
+                subagents,
+            },
+            &mut sky,
+            &mut taxi,
+            &mut gates,
+            &mut wing,
+            &mut runway,
+        );
+        assert_eq!(world.aircraft.len(), 4);
+        for (i, a) in world.aircraft.iter().enumerate() {
+            assert_eq!(a.device.as_deref(), Some("Tom's M5 Air"));
+            for b in &world.aircraft[i + 1..] {
+                let d = (a.position[0] - b.position[0]).hypot(a.position[1] - b.position[1]);
+                assert!(
+                    d >= 14.0,
+                    "satellite aircraft {} and {} overlapped at {:?} vs {:?}",
+                    a.callsign,
+                    b.callsign,
+                    a.position,
+                    b.position
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remote_subagents_are_filtered_from_top_level_and_active_ones_fly_as_wingmen() {
+        let now = parse_rfc3339("2026-11-24T21:00:00Z").unwrap();
+        let peer = remote::Peer {
+            environment_id: "mac".into(),
+            label: "Tom's M5 Air".into(),
+            online: true,
+            threads: Some(vec![
+                serde_json::json!({
+                    "threadId": "parent-1",
+                    "title": "Main M5 Task",
+                    "status": "running",
+                    "model": "gpt-6-luna",
+                    "updatedAt": "2026-11-24T20:59:00Z",
+                    "settled": false,
+                    "parentThreadId": null,
+                    "relationshipToParent": null
+                }),
+                serde_json::json!({
+                    "threadId": "sub-live",
+                    "title": "Active M5 Scout",
+                    "status": "running",
+                    "model": "gpt-6.1-sol",
+                    "updatedAt": "2026-11-24T20:59:30Z",
+                    "settled": false,
+                    "parentThreadId": "parent-1",
+                    "relationshipToParent": "subagent"
+                }),
+                serde_json::json!({
+                    "threadId": "sub-old-1",
+                    "title": "Old Completed Subagent",
+                    "status": "completed",
+                    "model": "gpt-6.1-sol",
+                    "updatedAt": "2026-11-22T10:00:00Z",
+                    "settled": false,
+                    "parentThreadId": "old-parent",
+                    "relationshipToParent": "subagent"
+                }),
+                serde_json::json!({
+                    "threadId": "real-stale",
+                    "title": "Real M5 Stale Thread",
+                    "status": "completed",
+                    "model": "gpt-6.1-sol",
+                    "updatedAt": "2026-11-20T08:00:00Z",
+                    "settled": false,
+                    "parentThreadId": null,
+                    "relationshipToParent": null
+                }),
+            ]),
+        };
+
+        let (entries, done, subs) = extract_peer_threads(&peer, now, SUBAGENT_LINGER_SECS);
+        assert!(done.is_empty());
+        assert_eq!(entries.len(), 2, "only top-level threads become aircraft");
+        assert!(entries.iter().all(|e| e.title != "Old Completed Subagent"));
+        assert!(entries.iter().all(|e| e.title != "Active M5 Scout"));
+        assert_eq!(subs.len(), 1, "only active/lingering subagent becomes wingman");
+        assert_eq!(subs[0].title.as_deref(), Some("Active M5 Scout"));
+
+        let airports = vec![
+            Airport::home("local", "omarchy"),
+            Airport::satellite("mac", "Tom's M5 Air", [0.0, 285.0], true),
+        ];
+        let (flying, taxiway, stale, subagents, omitted) =
+            partition_pools(entries, subs, &airports, now);
+        let mut world = World::new();
+        let (mut sky, mut taxi, mut gates, mut wing, mut runway) = (
+            Callsigns::default(),
+            TaxiwayCallsigns::default(),
+            GateCallsigns::default(),
+            Wingmen::default(),
+            RunwayOps::default(),
+        );
+        apply_poll(
+            &mut world,
+            "omarchy",
+            PollData {
+                omitted,
+                local_environment_id: Some("pc".into()),
+                airports,
+                flying,
+                taxiway,
+                stale,
+                done_or_archived: HashSet::new(),
+                subagents,
+            },
+            &mut sky,
+            &mut taxi,
+            &mut gates,
+            &mut wing,
+            &mut runway,
+        );
+
+        let fighter = world
+            .iter()
+            .find(|a| a.kind == Kind::Fighter)
+            .expect("active remote subagent should spawn as fighter wingman");
+        assert_eq!(fighter.title.as_deref(), Some("Active M5 Scout"));
+        assert_eq!(fighter.device.as_deref(), Some("Tom's M5 Air"));
+        assert_eq!(fighter.environment_id.as_deref(), Some("mac"));
+        assert_eq!(fighter.thread_id.as_deref(), Some("sub-live"));
+        assert_eq!(
+            fighter.chat_links.as_ref().unwrap().web,
+            "https://app.t3.codes/threads/mac/sub-live"
+        );
+        let parked = world
+            .iter()
+            .find(|a| a.title.as_deref() == Some("Real M5 Stale Thread"))
+            .expect("real top-level thread should occupy a gate");
+        assert_eq!(parked.state, State::Parked);
+        assert_eq!(parked.device.as_deref(), Some("Tom's M5 Air"));
+    }
+
+    #[test]
+    fn remote_running_thread_takes_off_and_lands_at_its_satellite_airport() {
+        let mac = Airport::satellite("mac", "Tom's M5 Air", [0.0, 285.0], true);
+        let mac_thresh = mac.runway_layout().threshold;
+        let airports = vec![Airport::home("local", "omarchy"), mac.clone()];
+        let mut world = World::new();
+        let (mut sky, mut taxi, mut gates, mut wing, mut runway) = (
+            Callsigns::default(),
+            TaxiwayCallsigns::default(),
+            GateCallsigns::default(),
+            Wingmen::default(),
+            RunwayOps::default(),
+        );
+
+        // Poll 1: remote thread starts parked on M5 Air gate 0.
+        let t1 = remote::key("mac", "t1");
+        let t2 = remote::key("mac", "t2");
+        apply_poll(
+            &mut world,
+            "omarchy",
+            PollData {
+                omitted: 0,
+                local_environment_id: Some("pc".into()),
+                airports: airports.clone(),
+                flying: vec![],
+                taxiway: vec![make_entry(&t1, "M5 Thread 1", "completed")],
+                stale: vec![],
+                done_or_archived: HashSet::new(),
+                subagents: vec![],
+            },
+            &mut sky,
+            &mut taxi,
+            &mut gates,
+            &mut wing,
+            &mut runway,
+        );
+        let tx = world.get_mut("TX1").unwrap();
+        assert_eq!([tx.position[0], tx.position[1]], mac.gates[0]);
+
+        // Poll 2: t1 wakes up, AND brand-new t2 starts running on M5 Air.
+        apply_poll(
+            &mut world,
+            "omarchy",
+            PollData {
+                omitted: 0,
+                local_environment_id: Some("pc".into()),
+                airports: airports.clone(),
+                flying: vec![
+                    (make_entry(&t1, "M5 Thread 1", "running"), 0),
+                    (make_entry(&t2, "M5 Thread 2", "running"), 0),
+                ],
+                taxiway: vec![],
+                stale: vec![],
+                done_or_archived: HashSet::new(),
+                subagents: vec![],
+            },
+            &mut sky,
+            &mut taxi,
+            &mut gates,
+            &mut wing,
+            &mut runway,
+        );
+        let sky1 = world.get_mut("SKY1").unwrap();
+        assert_eq!(sky1.airport_id(), "mac");
+        assert_eq!(sky1.taxi_destination(), Some(mac_thresh));
+        let sky2 = world.get_mut("SKY2").unwrap();
+        assert_eq!(sky2.airport_id(), "mac");
+        assert_eq!([sky2.position[0], sky2.position[1]], mac_thresh);
+
+        // Advance until SKY2 is cruising, then finish SKY2's turn -> must approach M5 Air!
+        for _ in 0..1000 {
+            world.tick(0.05);
+            if world.get_mut("SKY2").unwrap().state == State::Cruising {
+                break;
+            }
+        }
+        assert_eq!(world.get_mut("SKY2").unwrap().state, State::Cruising);
+
+        apply_poll(
+            &mut world,
+            "omarchy",
+            PollData {
+                omitted: 0,
+                local_environment_id: Some("pc".into()),
+                airports,
+                flying: vec![(make_entry(&t1, "M5 Thread 1", "running"), 0)],
+                taxiway: vec![make_entry(&t2, "M5 Thread 2", "completed")],
+                stale: vec![],
+                done_or_archived: HashSet::new(),
+                subagents: vec![],
+            },
+            &mut sky,
+            &mut taxi,
+            &mut gates,
+            &mut wing,
+            &mut runway,
+        );
+        let arriving = world.get_mut("SKY2").unwrap();
+        assert_eq!(arriving.state, State::Landing);
+        assert_eq!(arriving.airport_id(), "mac");
+        let (slot_pos, _) = arriving.arrival_slot().unwrap();
+        assert!(
+            mac.gates.contains(&slot_pos),
+            "remote arrival slot should be a gate on M5 Air, got {:?}",
+            slot_pos
+        );
     }
 
 }

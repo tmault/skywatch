@@ -62,6 +62,66 @@ class Client:
         return json.loads(next(c['text'] for c in result['content'] if c['type'] == 'text'))
 
 
+def list_peer_threads(client, environment_id):
+    projects = {}
+    try:
+        cursor = None
+        while True:
+            args = {'environmentId': environment_id, 'limit': 100}
+            if cursor is not None:
+                args['cursor'] = cursor
+            page = client.call('t3_project_list', args)
+            for proj in page.get('projects', []):
+                title = (proj.get('title') or '').strip()
+                if proj.get('id') and title:
+                    projects[proj['id']] = title
+            cursor = page.get('nextCursor')
+            if cursor is None:
+                break
+    except Exception:
+        pass
+
+    rows = []
+    seen = set()
+
+    def attach(threads):
+        for thread in threads:
+            tid = thread.get('threadId')
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            if not thread.get('project') and thread.get('projectId') in projects:
+                thread = dict(thread)
+                thread['project'] = projects[thread['projectId']]
+            rows.append(thread)
+
+    # Fetch all unsettled threads (typically 1 fast page), including active subagents.
+    cursor = 0
+    while cursor is not None:
+        page = client.call('t3_thread_list', {
+            'environmentId': environment_id,
+            'allProjects': True,
+            'settled': False,
+            'includeSubagents': True,
+            'limit': 100,
+            'cursor': cursor,
+        })
+        attach(page.get('threads', []))
+        cursor = page.get('nextCursor')
+
+    # Fetch the most recent settled page so freshly completed/settled threads trigger departure.
+    settled_page = client.call('t3_thread_list', {
+        'environmentId': environment_id,
+        'allProjects': True,
+        'settled': True,
+        'includeSubagents': False,
+        'limit': 50,
+        'cursor': 0,
+    })
+    attach(settled_page.get('threads', []))
+    return rows
+
+
 def main():
     request = json.load(sys.stdin)
     client = Client()
@@ -74,13 +134,7 @@ def main():
                 'online': peer['status'] == 'reachable', 'threads': None}
         if item['online']:
             try:
-                rows, cursor = [], 0
-                while cursor is not None:
-                    page = client.call('t3_thread_list', {'environmentId': peer['environmentId'],
-                        'allProjects': True, 'includeSubagents': True, 'limit': 100, 'cursor': cursor})
-                    rows.extend(page['threads'])
-                    cursor = page.get('nextCursor')
-                item['threads'] = rows
+                item['threads'] = list_peer_threads(client, peer['environmentId'])
             except Exception:
                 item['online'] = False
         result.append(item)
