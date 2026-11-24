@@ -14,6 +14,20 @@ import * as THREE from './vendor/three.module.js';
 const SERIF = '"Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif';
 const SANS = '"Inter", "Helvetica Neue", Arial, sans-serif';
 
+export const TANKER_GREY = {
+  body: '#8e97a0',      // matte mid-grey military transport airframe (A400M / MRTT)
+  belly: '#6f7882',     // darker tactical underside
+  wing: '#848d96',      // matte grey flying surfaces
+  engine: '#5c646d',    // darker matte grey engine nacelles & hose pods
+  radome: '#454c54',    // dark dielectric nose radome
+  antiGlare: '#383e45', // matte charcoal anti-glare panel ahead of cockpit
+  panel: 'rgba(26, 32, 38, 0.24)',
+  stencil: '#323a42',   // low-visibility military stencil text
+  roundelOuter: '#4c555f',
+  roundelMid: '#adb6bf',
+  roundelCore: '#3f4750',
+};
+
 const PROVIDERS = {
   anthropic: {
     title: 'Claude', operator: 'ANTHROPIC', titleFont: `600 1px ${SERIF}`,
@@ -158,10 +172,13 @@ function cachedTexture(key, draw, w, h) {
 // Layout of a fuselage, all in world units of the airframe:
 //   zmin/zmax  extent along the body, circ: circumference at the widest point
 //   windows:   { kind: 'row' | 'highwing', ... } (a = radians from top)
-//   cockpit:   { z0, z1, a } windscreen centred on the top
+//   cockpit:   { z0, z1, a, frames?, frameColor? } windscreen centred on the top
 //   titles:    { a, z, size }, nose: { a, z, size } for the variant name
 //   stripeA:   cheatline angle from top; bellyA: where the belly colour starts
 //   swooshZ:   z where the tail colour starts sweeping up over the spine
+//   radomeZ:   optional z where a dark dielectric nose radome starts
+//   antiGlare: optional { z0, z1, a, color } matte panel ahead of cockpit
+//   military:  optional low-visibility roundels, panel lines and stencils
 export function fuselageTexture(livery, airframe, L) {
   return cachedTexture(`fus|${airframe}|${livery.key}`, (ctx, W, H) => {
     const len = L.zmax - L.zmin;
@@ -172,13 +189,18 @@ export function fuselageTexture(livery, airframe, L) {
     const X = (a) => ((Math.PI - a) / (2 * Math.PI)) * C;
     const Y = (z) => L.zmax - z;
 
-    ctx.fillStyle = livery.body;
+    const bodyColor = L.bodyColor ?? livery.body;
+    const bellyColor = L.bellyColor ?? livery.belly;
+
+    ctx.fillStyle = bodyColor;
     ctx.fillRect(0, 0, C, len);
 
     // Belly.
-    ctx.fillStyle = livery.belly;
-    ctx.fillRect(0, 0, X(L.bellyA), len);
-    ctx.fillRect(X(-L.bellyA), 0, C - X(-L.bellyA), len);
+    if (L.bellyA !== undefined) {
+      ctx.fillStyle = bellyColor;
+      ctx.fillRect(0, 0, X(L.bellyA), len);
+      ctx.fillRect(X(-L.bellyA), 0, C - X(-L.bellyA), len);
+    }
 
     // Tail colour sweeping up over the spine toward the fin.
     if (L.swooshZ !== undefined) {
@@ -202,66 +224,164 @@ export function fuselageTexture(livery, airframe, L) {
     }
 
     // Cheatline stripes along both sides (stacked downward).
-    const sw = L.stripeW ?? 0.12;
-    livery.stripes.forEach((col, i) => {
-      ctx.fillStyle = col;
-      const a = L.stripeA + i * sw;
-      const y0 = Y(L.stripeZ1 ?? L.zmax - 0.15 * len);
-      const y1 = Y(L.swooshZ ?? L.zmin + 0.1 * len);
-      for (const side of [1, -1]) {
-        const xa = X(side * a);
-        const xb = X(side * (a + sw * 0.85));
-        ctx.fillRect(Math.min(xa, xb), y0, Math.abs(xb - xa), y1 - y0);
-      }
-    });
+    if (L.stripeA !== undefined) {
+      const sw = L.stripeW ?? 0.12;
+      livery.stripes.forEach((col, i) => {
+        ctx.fillStyle = col;
+        const a = L.stripeA + i * sw;
+        const y0 = Y(L.stripeZ1 ?? L.zmax - 0.15 * len);
+        const y1 = Y(L.swooshZ ?? L.zmin + 0.1 * len);
+        for (const side of [1, -1]) {
+          const xa = X(side * a);
+          const xb = X(side * (a + sw * 0.85));
+          ctx.fillRect(Math.min(xa, xb), y0, Math.abs(xb - xa), y1 - y0);
+        }
+      });
+    }
 
-    // Windows.
-    ctx.fillStyle = '#1b2a3a';
-    const wnd = L.windows;
-    if (wnd?.kind === 'row') {
+    // Darker grey dielectric nose radome cap (military transport / tanker).
+    if (L.radomeZ !== undefined) {
+      ctx.fillStyle = L.radomeColor ?? TANKER_GREY.radome;
+      ctx.fillRect(0, 0, C, Y(L.radomeZ));
+      ctx.fillStyle = TANKER_GREY.panel;
+      ctx.fillRect(0, Y(L.radomeZ), C, 0.08);
+    }
+
+    // Matte anti-glare strip directly ahead of the cockpit windscreen.
+    if (L.antiGlare) {
+      const { z0, z1, a, color = TANKER_GREY.antiGlare } = L.antiGlare;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(X(a), Y(z0));
+      ctx.lineTo(X(a * 0.7), Y(z1));
+      ctx.lineTo(X(-a * 0.7), Y(z1));
+      ctx.lineTo(X(-a), Y(z0));
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // Low-visibility military panel seams, fuselage rings, roundels & walkways.
+    if (L.military) {
+      const M = L.military;
+      ctx.strokeStyle = TANKER_GREY.panel;
+      ctx.lineWidth = 0.06;
+      // Subtle fuselage frame seams (spaced clear of the flank roundel).
+      for (const z of M.frameZs ?? [-11.0, -2.0, 3.4, 8.2, 11.6]) {
+        ctx.beginPath();
+        ctx.moveTo(0, Y(z));
+        ctx.lineTo(C, Y(z));
+        ctx.stroke();
+      }
+      // Subtle lower-flank tactical separation pinstripe.
+      if (L.bellyA !== undefined) {
+        for (const side of [1, -1]) {
+          const x = X(side * L.bellyA);
+          ctx.beginPath();
+          ctx.moveTo(x, Y(L.radomeZ ?? L.zmax - 2));
+          ctx.lineTo(x, Y(L.zmin + 2));
+          ctx.stroke();
+        }
+      }
+      // Low-visibility dorsal walkway lines on the upper spine.
+      ctx.strokeStyle = 'rgba(42, 49, 56, 0.34)';
+      ctx.lineWidth = 0.07;
       for (const side of [1, -1]) {
-        const xc = X(side * wnd.a);
-        for (let z = wnd.z1; z >= wnd.z0; z -= wnd.pitch) {
-          roundRect(ctx, xc - wnd.h / 2, Y(z) - wnd.w / 2, wnd.h, wnd.w, Math.min(wnd.h, wnd.w) * 0.45);
+        const x = X(side * 0.34);
+        ctx.beginPath();
+        ctx.moveTo(x, Y(11.0));
+        ctx.lineTo(x, Y(-8.0));
+        ctx.stroke();
+      }
+      // Low-visibility military roundels with horizontal tactical bars on both flanks.
+      if (M.roundelZ !== undefined) {
+        const r = M.roundelR ?? 0.94;
+        const barW = r * 1.75;
+        const barH = r * 0.44;
+        for (const side of [1, -1]) {
+          const cx = X(side * M.roundelA);
+          const cy = Y(M.roundelZ);
+          ctx.fillStyle = TANKER_GREY.roundelOuter;
+          ctx.fillRect(cx - barH / 2, cy - barW, barH, barW * 2);
+          ctx.fillStyle = TANKER_GREY.roundelMid;
+          ctx.fillRect(cx - barH * 0.24, cy - barW * 0.88, barH * 0.48, barW * 1.76);
+          ctx.beginPath();
+          ctx.arc(cx, cy, r, 0, Math.PI * 2);
+          ctx.fillStyle = TANKER_GREY.roundelOuter;
+          ctx.fill();
+          ctx.beginPath();
+          ctx.arc(cx, cy, r * 0.66, 0, Math.PI * 2);
+          ctx.fillStyle = TANKER_GREY.roundelMid;
+          ctx.fill();
+          ctx.beginPath();
+          ctx.arc(cx, cy, r * 0.36, 0, Math.PI * 2);
+          ctx.fillStyle = TANKER_GREY.roundelCore;
           ctx.fill();
         }
       }
-    } else if (wnd?.kind === 'highwing') {
-      // Light high-wing cabin: windscreen wrapping round to a raked
-      // A-pillar, door window, tapering rear side window and a skylight
-      // behind the wing. Points are [angle from top, z].
-      const poly = (pts) => {
-        ctx.beginPath();
-        pts.forEach(([a, z]) => ctx.lineTo(X(a), Y(z)));
-        ctx.closePath();
-        ctx.fill();
-        ctx.stroke(); // rounds the corners a touch
-      };
-      ctx.strokeStyle = ctx.fillStyle;
-      ctx.lineJoin = 'round';
-      ctx.lineWidth = wnd.post * 0.6;
-      const { top, sill, post, front, pillarTop, pillarBottom, doorEnd, rearEnd, rearTaper } = wnd;
-      for (const s of [1, -1]) {
-        poly([[s * top, pillarTop - post], [s * top, doorEnd + post / 2],
-          [s * sill, doorEnd + post / 2], [s * sill, pillarBottom - post]]);
-        poly([[s * top, doorEnd - post / 2], [s * top, rearEnd],
-          [s * (sill - 0.08), rearEnd + rearTaper], [s * sill, doorEnd - post / 2]]);
+    }
+
+    // Subtle cabin door outlines (widebody detail).
+    if (L.doors) {
+      ctx.strokeStyle = 'rgba(20, 28, 36, 0.32)';
+      ctx.lineWidth = 0.055;
+      for (const side of [1, -1]) {
+        const xc = X(side * L.doors.a);
+        for (const z of L.doors.zs) {
+          roundRect(ctx, xc - L.doors.h / 2, Y(z) - L.doors.w / 2, L.doors.h, L.doors.w, 0.1);
+          ctx.stroke();
+        }
       }
-      const wsA = top * 0.9;
-      poly([[-wsA, front], [wsA, front], [sill - 0.06, pillarBottom + post],
-        [top, pillarTop + post], [-top, pillarTop + post], [-(sill - 0.06), pillarBottom + post]]);
-      const [k0, k1, ka] = wnd.skylight;
-      poly([[-ka, k0], [ka, k0], [ka * 0.75, k1], [-ka * 0.75, k1]]);
-      // Windscreen centre strip.
-      ctx.strokeStyle = livery.body;
-      ctx.lineWidth = post * 0.7;
-      ctx.beginPath();
-      ctx.moveTo(X(0), Y(pillarTop + post));
-      ctx.lineTo(X(0), Y(front));
-      ctx.stroke();
+    }
+
+    // Windows (supports a single window layout or an array of rows, e.g. 747 upper + main decks).
+    ctx.fillStyle = '#1b2a3a';
+    const windowSets = Array.isArray(L.windows) ? L.windows : (L.windows ? [L.windows] : []);
+    for (const wnd of windowSets) {
+      if (wnd?.kind === 'row') {
+        for (const side of [1, -1]) {
+          const xc = X(side * wnd.a);
+          for (let z = wnd.z1; z >= wnd.z0; z -= wnd.pitch) {
+            roundRect(ctx, xc - wnd.h / 2, Y(z) - wnd.w / 2, wnd.h, wnd.w, Math.min(wnd.h, wnd.w) * 0.45);
+            ctx.fill();
+          }
+        }
+      } else if (wnd?.kind === 'highwing') {
+        // Light high-wing cabin: windscreen wrapping round to a raked
+        // A-pillar, door window, tapering rear side window and a skylight
+        // behind the wing. Points are [angle from top, z].
+        const poly = (pts) => {
+          ctx.beginPath();
+          pts.forEach(([a, z]) => ctx.lineTo(X(a), Y(z)));
+          ctx.closePath();
+          ctx.fill();
+          ctx.stroke(); // rounds the corners a touch
+        };
+        ctx.strokeStyle = ctx.fillStyle;
+        ctx.lineJoin = 'round';
+        ctx.lineWidth = wnd.post * 0.6;
+        const { top, sill, post, front, pillarTop, pillarBottom, doorEnd, rearEnd, rearTaper } = wnd;
+        for (const s of [1, -1]) {
+          poly([[s * top, pillarTop - post], [s * top, doorEnd + post / 2],
+            [s * sill, doorEnd + post / 2], [s * sill, pillarBottom - post]]);
+          poly([[s * top, doorEnd - post / 2], [s * top, rearEnd],
+            [s * (sill - 0.08), rearEnd + rearTaper], [s * sill, doorEnd - post / 2]]);
+        }
+        const wsA = top * 0.9;
+        poly([[-wsA, front], [wsA, front], [sill - 0.06, pillarBottom + post],
+          [top, pillarTop + post], [-top, pillarTop + post], [-(sill - 0.06), pillarBottom + post]]);
+        const [k0, k1, ka] = wnd.skylight;
+        poly([[-ka, k0], [ka, k0], [ka * 0.75, k1], [-ka * 0.75, k1]]);
+        // Windscreen centre strip.
+        ctx.strokeStyle = bodyColor;
+        ctx.lineWidth = post * 0.7;
+        ctx.beginPath();
+        ctx.moveTo(X(0), Y(pillarTop + post));
+        ctx.lineTo(X(0), Y(front));
+        ctx.stroke();
+      }
     }
     if (L.cockpit) {
-      const { z0, z1, a } = L.cockpit;
+      const { z0, z1, a, frames = [-0.33, 0, 0.33], frameColor = bodyColor } = L.cockpit;
       ctx.beginPath();
       ctx.moveTo(X(a), Y(z0));
       ctx.lineTo(X(a * 0.8), Y(z1));
@@ -270,11 +390,11 @@ export function fuselageTexture(livery, airframe, L) {
       ctx.closePath();
       ctx.fill();
       // Window frames.
-      ctx.strokeStyle = livery.body;
-      ctx.lineWidth = 0.05;
-      for (const f of [-0.33, 0, 0.33]) {
+      ctx.strokeStyle = frameColor;
+      ctx.lineWidth = 0.055;
+      for (const f of frames) {
         ctx.beginPath();
-        ctx.moveTo(X(a * f * 1.6), Y(z0));
+        ctx.moveTo(X(a * f * 1.5), Y(z0));
         ctx.lineTo(X(a * f * 1.2), Y(z1));
         ctx.stroke();
       }
@@ -315,7 +435,21 @@ export function fuselageTexture(livery, airframe, L) {
     if (L.nose && livery.variant) {
       sideText(livery.variant, L.nose.a, L.nose.z, L.nose.size, `600 1px ${SANS}`, livery.titleColor);
     }
-  }, 512, 1024);
+    // Low-visibility military stencil markings for tankers (small tactical text).
+    if (L.military) {
+      const M = L.military;
+      const stencilFont = `700 1px "IBM Plex Mono", ui-monospace, ${SANS}`;
+      const labTag = (livery.operator || livery.title || livery.provider || 'AIR').toUpperCase();
+      if (M.stencilZ !== undefined) {
+        sideText(`AIR REFUEL · ${labTag}`, M.stencilA, M.stencilZ, M.stencilSize ?? 0.44,
+          stencilFont, TANKER_GREY.stencil, 0.14);
+      }
+      if (M.forwardStencilZ !== undefined) {
+        sideText('KC-TANKER // NO STEP', M.forwardStencilA, M.forwardStencilZ, M.forwardStencilSize ?? 0.25,
+          stencilFont, TANKER_GREY.stencil, 0.1);
+      }
+    }
+  }, L.texW ?? 512, L.texH ?? 1024);
 }
 
 /* ------------------------------------------------------ tail fin skin */
@@ -350,34 +484,57 @@ export function surfaceTexture(livery, base, kind = 'wing') {
   return cachedTexture(`surf|${kind}|${base}|${livery.key}`, (ctx, W, H) => {
     const U = (u) => u * W;
     const V = (v) => (1 - v) * H;
+    const isWing = kind === 'wing' || kind === 'tanker-wing';
+    const isMilitary = kind === 'tanker-wing' || kind === 'tanker-tail';
     ctx.fillStyle = base;
     ctx.fillRect(0, 0, W, H);
-    const line = 'rgba(0, 0, 0, 0.26)';
-    const hingeU = kind === 'wing' ? 0.74 : 0.7;
+    const line = isMilitary ? 'rgba(20, 26, 32, 0.32)' : 'rgba(0, 0, 0, 0.26)';
+    const hingeU = isWing ? 0.74 : 0.7;
 
-    // Leading edge: brighter erosion strip.
-    ctx.fillStyle = 'rgba(200, 208, 216, 0.32)';
-    ctx.fillRect(0, 0, U(kind === 'wing' ? 0.08 : 0.06), H);
+    // Leading edge: subtle de-icer / erosion strip (matte dark grey on military tankers).
+    ctx.fillStyle = isMilitary ? 'rgba(42, 48, 56, 0.28)' : 'rgba(200, 208, 216, 0.32)';
+    ctx.fillRect(0, 0, U(isWing ? 0.08 : 0.06), H);
 
     // Control surfaces, a shade darker behind the hinge line.
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.06)';
+    ctx.fillStyle = isMilitary ? 'rgba(0, 0, 0, 0.1)' : 'rgba(0, 0, 0, 0.06)';
     ctx.fillRect(U(hingeU), 0, W - U(hingeU), H);
     ctx.fillStyle = line;
     ctx.fillRect(U(hingeU), 0, 2, H);
 
-    if (kind === 'wing') {
+    if (isWing) {
       // Flap / aileron splits.
       for (const v of [0.08, 0.38, 0.66, 0.94]) ctx.fillRect(U(hingeU), V(v), W - U(hingeU), 2);
       // Spoiler panels ahead of the flaps.
-      ctx.strokeStyle = 'rgba(0, 0, 0, 0.18)';
+      ctx.strokeStyle = isMilitary ? 'rgba(20, 26, 32, 0.24)' : 'rgba(0, 0, 0, 0.18)';
       ctx.lineWidth = 1.5;
       for (let i = 0; i < 5; i++) {
         const v0 = 0.1 + i * 0.11;
         ctx.strokeRect(U(0.6), V(v0 + 0.1), U(hingeU) - U(0.6), V(v0) - V(v0 + 0.1));
       }
       // Front spar / slat line.
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.12)';
+      ctx.fillStyle = isMilitary ? 'rgba(20, 26, 32, 0.2)' : 'rgba(0, 0, 0, 0.12)';
       ctx.fillRect(U(0.14), 0, 1.5, H);
+
+      if (isMilitary) {
+        // Low-visibility tactical wing roundel & walkway boundary line.
+        ctx.strokeStyle = 'rgba(42, 49, 56, 0.34)';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(U(0.24), V(0.54), U(0.32), V(0.08) - V(0.54));
+        const rx = U(0.42);
+        const ry = V(0.74);
+        ctx.beginPath();
+        ctx.arc(rx, ry, 20, 0, Math.PI * 2);
+        ctx.fillStyle = TANKER_GREY.roundelOuter;
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(rx, ry, 13.5, 0, Math.PI * 2);
+        ctx.fillStyle = TANKER_GREY.roundelMid;
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(rx, ry, 7, 0, Math.PI * 2);
+        ctx.fillStyle = TANKER_GREY.roundelCore;
+        ctx.fill();
+      }
     }
   }, 256, 256);
 }

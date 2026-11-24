@@ -9,7 +9,7 @@
 
 import * as THREE from './vendor/three.module.js';
 import {
-  liveryFor, fuselageTexture, finTexture, logoTexture, surfaceTexture,
+  TANKER_GREY, liveryFor, fuselageTexture, finTexture, logoTexture, surfaceTexture,
 } from './livery.js';
 
 /* --------------------------------------------------------------- helpers */
@@ -274,21 +274,40 @@ function dot(mat, x, y, z, r) {
 
 // Livery materials for one aircraft. Painted textures are shared between
 // aircraft with the same livery (see livery.js), materials are per aircraft.
+// Tankers wear a matte grey military transport scheme (A400M / MRTT style)
+// across fuselage, wings, and engines while keeping the AI lab's tail livery.
 function paintKit(model, airframe, layout) {
   const livery = liveryFor(model);
+  const military = airframe === 'tanker';
   const std = (opts) => new THREE.MeshStandardMaterial({ roughness: 0.42, metalness: 0.08, ...opts });
+  const airframeFinish = military ? { roughness: 0.72, metalness: 0.04 } : {};
+  const wingFinish = military ? { roughness: 0.74, metalness: 0.04 } : {};
+  const bodyColor = military ? TANKER_GREY.body : livery.body;
+  const wingColor = military ? TANKER_GREY.wing : livery.wing;
+  const engineColor = military ? TANKER_GREY.engine : livery.engine;
   const kit = {
     livery,
-    body: std({ map: fuselageTexture(livery, airframe, layout) }),
-    plain: std({ color: livery.body }),
-    wing: std({ color: livery.wing }),
+    body: std({ map: fuselageTexture(livery, airframe, layout), ...airframeFinish }),
+    plain: std({ color: bodyColor, ...airframeFinish }),
+    wing: std({ color: wingColor, ...wingFinish }),
+    // Vertical fin always carries the AI lab's full tail colours and emblem.
     fin: std({ map: finTexture(livery) }),
     // Flying-surface skins with hinge lines (see surfaceTexture).
-    wingSkin: std({ map: surfaceTexture(livery, livery.wing, 'wing') }),
-    wingPlainSkin: std({ map: surfaceTexture(livery, livery.body, 'wing') }),
-    tailSkin: std({ map: surfaceTexture(livery, livery.wing, 'tail') }),
-    tailPlainSkin: std({ map: surfaceTexture(livery, livery.body, 'tail') }),
-    engine: std({ color: livery.engine, roughness: 0.35, metalness: 0.25 }),
+    wingSkin: std({
+      map: surfaceTexture(livery, wingColor, military ? 'tanker-wing' : 'wing'),
+      ...wingFinish,
+    }),
+    wingPlainSkin: std({ map: surfaceTexture(livery, bodyColor, 'wing'), ...wingFinish }),
+    tailSkin: std({
+      map: surfaceTexture(livery, wingColor, military ? 'tanker-tail' : 'tail'),
+      ...wingFinish,
+    }),
+    tailPlainSkin: std({ map: surfaceTexture(livery, bodyColor, 'tail'), ...wingFinish }),
+    engine: std({
+      color: engineColor,
+      roughness: military ? 0.62 : 0.35,
+      metalness: military ? 0.14 : 0.25,
+    }),
     logo: new THREE.MeshBasicMaterial({
       map: logoTexture(livery), transparent: true, depthWrite: false,
       polygonOffset: true, polygonOffsetFactor: -2,
@@ -625,6 +644,293 @@ export function makeJetMesh(model) {
   });
 }
 
+/* ------------------------------- Boeing 747 jumbo jet (flagship models) */
+
+// Smooth polynomial maximum: equals max(a, b) everywhere except a C1-smooth
+// fillet of width k where a and b cross. Used to blend the 747's upper-deck
+// lobe seamlessly into the main widebody cylinder with zero crease or seam.
+function smax(a, b, k) {
+  const h = Math.max(k - Math.abs(a - b), 0) / k;
+  return Math.max(a, b) + h * h * k * 0.25;
+}
+
+// Single seamless double-bubble Boeing 747 fuselage: circular widebody main
+// deck smoothly fused via polynomial smooth-max with the iconic raised
+// stretched upper-deck hump, raked flight-deck forehead, protruding lower nose
+// cone, and upswept aft belly. Same UV layout as fuselage().
+function jumboFuselage(profile, humpProfile, { sy = 1.04, warp = null, segments = 48 } = {}) {
+  const mainCurve = new THREE.CatmullRomCurve3(
+    profile.map(([z, r]) => new THREE.Vector3(r, z, 0)), false, 'centripetal',
+  );
+  const humpCurve = new THREE.CatmullRomCurve3(
+    humpProfile.map(([z, s]) => new THREE.Vector3(z, s, 0)), false, 'catmullrom', 0.5,
+  );
+  const zmin = profile[0][0];
+  const zmax = profile[profile.length - 1][0];
+  const N = 96;
+  const S = segments;
+
+  // Sample both curves on a uniform Z grid (with extra density across nose & hump).
+  const mainSamples = mainCurve.getPoints(240);
+  const humpSamples = humpCurve.getPoints(160);
+  const sampleAtZ = (pts, z, getZ, getV) => {
+    if (z <= getZ(pts[0])) return getV(pts[0]);
+    if (z >= getZ(pts[pts.length - 1])) return getV(pts[pts.length - 1]);
+    let lo = 0;
+    let hi = pts.length - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (getZ(pts[mid]) <= z) lo = mid; else hi = mid;
+    }
+    const z0 = getZ(pts[lo]);
+    const z1 = getZ(pts[hi]);
+    const f = z1 > z0 ? (z - z0) / (z1 - z0) : 0;
+    return getV(pts[lo]) + (getV(pts[hi]) - getV(pts[lo])) * f;
+  };
+
+  // Ray distance from (0, 0) along (dx, dy) to ellipse centered at (0, cy) with radii (a, b).
+  const rayEllipse = (dx, dy, cy, a, b) => {
+    const A = (dx * dx) / (a * a) + (dy * dy) / (b * b);
+    const B = (-2 * cy * dy) / (b * b);
+    const C = (cy * cy) / (b * b) - 1;
+    const disc = B * B - 4 * A * C;
+    if (disc < 0) return 0;
+    return (-B + Math.sqrt(disc)) / (2 * A);
+  };
+
+  const pos = [];
+  const uv = [];
+  const idx = [];
+  for (let i = 0; i <= N; i++) {
+    const t = i / N;
+    // Slight cosine clustering near tail & nose for silky nose cone curvature.
+    const z = zmin + (zmax - zmin) * (0.5 - 0.5 * Math.cos(Math.PI * t));
+    const r = Math.max(sampleAtZ(mainSamples, z, (p) => p.y, (p) => p.x), 0.0001);
+    const s = Math.max(sampleAtZ(humpSamples, z, (p) => p.x, (p) => p.y), 0);
+    const wy = warp ? warp(z) : 0;
+    const a1 = r;
+    const b1 = r * sy;
+    // Upper-deck ellipse scales smoothly with hump envelope s ∈ [0..1].
+    // Center sits at cy = 1.56 * s with b2 = 2.08 * s (top at +3.64 * s, bottom
+    // at -0.52 * s < 0 so the origin is always strictly inside the ellipse).
+    const useHump = s > 0.02 && r > 0.3;
+    const cy2 = 1.56 * s;
+    const a2 = Math.max(1.58 * s, 0.01);
+    const b2 = Math.max(2.08 * s, 0.01);
+    const blendK = 0.26 * Math.min(1, s * 1.4);
+
+    for (let j = 0; j <= S; j++) {
+      // phi = 0 is belly, PI/2 is +X port, PI is top spine (matches LatheGeometry).
+      const phi = (j / S) * Math.PI * 2;
+      const dx = Math.sin(phi);
+      const dy = -Math.cos(phi);
+      let rad = rayEllipse(dx, dy, 0, a1, b1);
+      if (useHump && dy > -0.15) {
+        const r2 = rayEllipse(dx, dy, cy2, a2, b2);
+        rad = smax(rad, r2, blendK);
+      }
+      pos.push(dx * rad, wy + dy * rad, z);
+      uv.push(j / S, (z - zmin) / (zmax - zmin));
+    }
+  }
+  for (let i = 0; i < N; i++) {
+    for (let j = 0; j < S; j++) {
+      const a = i * (S + 1) + j;
+      const b = a + S + 1;
+      idx.push(a, a + 1, b, a + 1, b + 1, b);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  geo.setIndex(idx);
+  geo.computeVertexNormals();
+  const rmax = Math.max(...profile.map(([, r]) => r));
+  return { geo, zmin, zmax, circ: 2 * Math.PI * rmax * (1 + sy) / 2 };
+}
+
+// Quad-engine widebody Boeing 747 ("Queen of the Sky"): reserved exclusively
+// for top-tier flagship models (see flagship.js). Features a single seamless
+// double-bubble fuselage with the iconic raised stretched upper-deck hump and
+// high 6-pane flight deck, strongly swept wings with four underwing turbofans
+// on pylons, canted 747-400 winglets, tall swept vertical tail, and the
+// signature 18-wheel (4x4 main bogies + twin nose) landing gear.
+export function makeJumboMesh(model) {
+  const group = new THREE.Group();
+  const warp = (z) => (z < -5.8 ? (-5.8 - z) * 0.145 : 0) - (z > 10.6 ? (z - 10.6) * 0.085 : 0);
+  const body = jumboFuselage([
+    [-16.0, 0.18], [-14.8, 0.72], [-12.2, 1.44], [-8.8, 2.04], [-5.8, 2.26],
+    [10.2, 2.26], [12.0, 2.12], [13.6, 1.76], [14.9, 1.24], [15.8, 0.66],
+    [16.25, 0.28], [16.45, 0.0001],
+  ], [
+    // Upper-deck hump envelope s(z): 0 aft of wing box, rising smoothly into
+    // the long 747-400 upper deck, then sloping steeply down across the
+    // forward-facing cockpit forehead into the lower nose cone.
+    [-16.0, 0.0], [-2.8, 0.0], [-1.4, 0.50], [0.2, 0.74], [1.8, 0.90],
+    [3.8, 0.99], [6.8, 1.0], [9.8, 0.99], [11.1, 0.92], [12.0, 0.77],
+    [12.8, 0.58], [13.5, 0.32], [14.2, 0.0], [16.45, 0.0],
+  ], { sy: 1.04, warp, segments: 52 });
+
+  const kit = paintKit(model, 'jumbo', {
+    zmin: body.zmin, zmax: body.zmax, circ: body.circ,
+    texW: 1024, texH: 1024,
+    bellyA: 2.02, stripeA: 1.56, stripeW: 0.11, stripeZ1: 14.4, swooshZ: -7.2,
+    // Iconic 6-pane flight deck high on the forward-facing brow of the hump.
+    cockpit: { z0: 11.45, z1: 12.65, a: 0.50, frames: [-0.54, -0.27, 0, 0.27, 0.54] },
+    // Both upper-deck cabin windows AND full-length main-deck windows extending
+    // all the way forward beneath the cockpit into the nose.
+    windows: [
+      { kind: 'row', a: 1.26, z0: -9.8, z1: 12.8, pitch: 0.56, w: 0.21, h: 0.27 },
+      { kind: 'row', a: 0.55, z0: 3.4, z1: 10.2, pitch: 0.56, w: 0.22, h: 0.16 },
+    ],
+    doors: { a: 1.32, zs: [-9.2, -3.6, 2.4, 8.2, 12.9], w: 0.52, h: 1.02 },
+    titles: { a: 0.74, z: -2.4, size: 1.36 },
+    operator: { a: 0.84, z: 2.2, size: 0.35 },
+    nose: { a: 1.02, z: 11.2, size: 0.34 },
+  });
+  const bodyMesh = new THREE.Mesh(body.geo, kit.body);
+  bodyMesh.name = 'fuselage';
+  group.add(bodyMesh);
+
+  // APU exhaust in the tail cone.
+  const apu = new THREE.Mesh(new THREE.CircleGeometry(0.16, 12), kit.dark);
+  apu.rotation.y = Math.PI;
+  apu.position.set(0, warp(-16.0), -16.02);
+  group.add(apu);
+
+  // Strongly swept 747 wing (~37 deg) with broad inboard Yehudi crank,
+  // pronounced dihedral, wing-body belly fairing, and canted 747-400 winglets.
+  const wingY = -1.25;
+  const wingSpan = 14.9;
+  const kinkX = 5.3;
+  const wingDihedral = 0.095;
+  const rise = Math.tan(wingDihedral);
+  const kink = { le: 0.6, chord: 4.7, t: 0.12 };
+  const tip = { le: -6.2, chord: 1.52, t: 0.095 };
+  for (const w of surfacePair(kit.wingSkin, {
+    span: kinkX, dihedral: wingDihedral,
+    root: { le: 4.8, chord: 8.8, y: wingY, t: 0.145 }, tip: kink,
+  })) group.add(w);
+  for (const w of surfacePair(kit.wingSkin, {
+    span: wingSpan - kinkX, x0: kinkX, dihedral: wingDihedral,
+    root: { ...kink, y: wingY + rise * kinkX }, tip,
+  })) group.add(w);
+
+  const wingYAt = (x) => wingY + rise * x;
+  const kinkTe = kink.le - kink.chord;
+  const tipTe = tip.le - tip.chord;
+  const leAt = (x) => (x < kinkX
+    ? 4.8 + (kink.le - 4.8) * (x / kinkX)
+    : kink.le + (tip.le - kink.le) * ((x - kinkX) / (wingSpan - kinkX)));
+  const teAt = (x) => (x < kinkX
+    ? -4.0 + (kinkTe + 4.0) * (x / kinkX)
+    : kinkTe + (tipTe - kinkTe) * ((x - kinkX) / (wingSpan - kinkX)));
+
+  // Canted 747-400 winglets in the provider's tail livery.
+  const tipY = wingYAt(wingSpan);
+  for (const side of [1, -1]) {
+    group.add(finMesh(kit.fin, {
+      height: 1.9, thickness: 0.08, base: [side * wingSpan, tipY], cant: 0.36, side,
+      root: { le: tip.le, chord: tip.chord }, tip: { le: -7.5, chord: 0.62 },
+    }));
+  }
+
+  // Prominent wing-body belly fairing bridging fuselage and wing roots.
+  group.add(new THREE.Mesh(fuselage([
+    [-5.2, 0.28], [-3.6, 1.18], [2.2, 1.28], [4.8, 0.72], [5.8, 0.0001],
+  ], { sx: 1.9, sy: 0.72, warp: () => -1.42 }).geo, kit.wing));
+
+  // Flap-track fairings under the trailing edge (4 per wing).
+  for (const side of [1, -1]) {
+    for (const x of [3.1, 6.6, 9.5, 12.1]) {
+      const pod = new THREE.Mesh(fuselage([
+        [-1.4, 0.0001], [-0.95, 0.14], [0.22, 0.18], [1.15, 0.0001],
+      ], { sx: 0.6, segments: 10 }).geo, kit.wing);
+      pod.position.set(side * x, wingYAt(x) - 0.12, teAt(x) + 0.55);
+      group.add(pod);
+    }
+  }
+
+  // Four high-bypass turbofan engines slung well forward on swept pylons.
+  const engines = [
+    { x: 5.1, drop: 1.22, fwd: 0.95, scale: 0.94, pylonH: 0.62 },
+    { x: 9.3, drop: 1.06, fwd: 0.80, scale: 0.88, pylonH: 0.54 },
+  ];
+  for (const side of [1, -1]) {
+    for (const e of engines) {
+      const ey = wingYAt(e.x) - e.drop;
+      const ez = leAt(e.x) + e.fwd;
+      const engine = turbofan(kit);
+      engine.scale.setScalar(e.scale);
+      engine.position.set(side * e.x, ey, ez);
+      group.add(engine);
+      group.add(finMesh(kit.wing, {
+        height: e.pylonH, thickness: 0.16, base: [side * e.x, wingYAt(e.x) + 0.04], cant: Math.PI,
+        root: { le: leAt(e.x) + 0.15, chord: 2.7 }, tip: { le: ez + 1.55, chord: 3.5 },
+      }));
+    }
+  }
+
+  // Swept horizontal stabilisers and tall, majestic 747 vertical tail fin.
+  const tailY = warp(-12.6);
+  for (const t of surfacePair(kit.tailSkin, {
+    span: 6.0, dihedral: 0.11,
+    root: { le: -10.2, chord: 3.9, y: tailY, t: 0.11 }, tip: { le: -14.0, chord: 1.45, t: 0.09 },
+  })) group.add(t);
+  group.add(finMesh(kit.fin, {
+    height: 6.9, thickness: 0.11, base: [0, tailY + 1.15],
+    root: { le: -7.8, chord: 6.2 }, tip: { le: -13.6, chord: 2.35 },
+    logo: kit.logo, logoAt: 0.44, logoScale: 0.76,
+  }));
+  group.add(finMesh(kit.fin, {
+    height: 0.85, thickness: 0.12, base: [0, 2.08],
+    root: { le: -5.2, chord: 3.2 }, tip: { le: -7.8, chord: 1.0 },
+  }));
+
+  // Iconic 18-wheel retractable 747 landing gear:
+  // 4 four-wheel main bogies (2 wing gear + 2 aft body gear) + twin-wheel nose gear.
+  const gear = new THREE.Group();
+  gear.name = 'gear';
+  const mainWheelY = -3.70;
+  const mainWheelR = 0.56; // bottom contact plane at y = -4.26
+  const addMainBogie = (x, z, strutTopY, braceX) => {
+    gear.add(rod(kit.metal, [x, strutTopY, z], [x, mainWheelY, z], 0.15, 8));
+    gear.add(rod(kit.metal, [braceX, -1.65, z], [x, -2.75, z], 0.07, 6));
+    // Longitudinal bogie beam carrying forward and aft dual-wheel pairs.
+    gear.add(rod(kit.metal, [x, mainWheelY, z - 0.62], [x, mainWheelY, z + 0.62], 0.09, 6));
+    for (const dz of [-0.56, 0.56]) {
+      gear.add(rod(kit.metal, [x - 0.34, mainWheelY, z + dz], [x + 0.34, mainWheelY, z + dz], 0.07, 6));
+      for (const dx of [-0.34, 0.34]) {
+        gear.add(wheel(kit, x + dx, mainWheelY, z + dz, mainWheelR, 0.28));
+      }
+    }
+  };
+  for (const side of [1, -1]) {
+    // Outboard wing main gear bogie.
+    addMainBogie(side * 3.55, -1.15, wingYAt(3.55) - 0.15, side * 2.1);
+    // Inboard body main gear bogie (staggered slightly aft, like the real 747).
+    addMainBogie(side * 1.42, -2.65, -1.65, side * 0.45);
+  }
+  // Twin-wheel nose gear (bottom contact matches main gear at y = -4.26).
+  gear.add(rod(kit.metal, [0, -1.8, 11.8], [0, -3.84, 11.8], 0.13, 8));
+  gear.add(rod(kit.metal, [0, -1.9, 10.6], [0, -2.9, 11.8], 0.06, 6));
+  gear.add(rod(kit.metal, [-0.32, -3.84, 11.8], [0.32, -3.84, 11.8], 0.07, 6));
+  gear.add(wheel(kit, 0.32, -3.84, 11.8, 0.42, 0.25));
+  gear.add(wheel(kit, -0.32, -3.84, 11.8, 0.42, 0.25));
+  group.add(gear);
+
+  // Nav lights on swept wingtips & tail cone, beacons on upper-deck crown & belly.
+  navLights(group, kit, [wingSpan - 0.2, tipY + 0.12, -6.5], [0, tailY + 0.32, -16.1]);
+  group.add(dot(kit.beacon, 0, 3.72, 6.2, 0.22));
+  group.add(dot(kit.beacon, 0, -2.42, 4.5, 0.24));
+
+  return finish(group, 0.67, kit, {
+    refuelPort: new THREE.Vector3(0, 1.92, 13.8),
+    landingLightPos: new THREE.Vector3(0, -0.65, 17.3), // just ahead of nose tip (z=16.45)
+    landingGlowScale: 0.6,
+  });
+}
+
 /* --------------------------------------------- fighter (sub-agent wingman) */
 
 // Short-range missile on a wingtip rail, nose along +Z.
@@ -836,9 +1142,9 @@ export function makeDroneMesh(model) {
 
 /* ------------------------------------ aerial refuelling tanker (provider) */
 
-// Heavy 4-engine widebody aerial refuelling tanker (KC-135 / A330-MRTT class)
-// painted in the provider's livery, with an aft flying boom and twin underwing
-// hose-and-drogue pods for threads waiting on tokens.
+// Heavy 4-engine widebody aerial refuelling tanker (A400M / A330-MRTT class)
+// in a matte grey military paint scheme with the AI lab's tail livery, an aft
+// flying boom, and twin underwing hose-and-drogue pods.
 export function makeTankerMesh(model) {
   const group = new THREE.Group();
   const warp = (z) => (z < -7.2 ? (-7.2 - z) * 0.14 : 0) - (z > 12.2 ? (z - 12.2) * 0.1 : 0);
@@ -848,10 +1154,17 @@ export function makeTankerMesh(model) {
   ], { sy: 1.06, warp, segments: 36 });
   const kit = paintKit(model, 'tanker', {
     zmin: body.zmin, zmax: body.zmax, circ: body.circ,
-    bellyA: 2.02, stripeA: 1.46, stripeW: 0.13, stripeZ1: 14.5, swooshZ: -6.5,
-    cockpit: { z0: 13.5, z1: 14.35, a: 0.78 },
-    titles: { a: 0.74, z: 3.6, size: 1.55 },
-    operator: { a: 0.86, z: 10.6, size: 0.44 },
+    bodyColor: TANKER_GREY.body, bellyColor: TANKER_GREY.belly, bellyA: 1.98,
+    radomeZ: 14.95, radomeColor: TANKER_GREY.radome,
+    antiGlare: { z0: 14.3, z1: 15.0, a: 0.44, color: TANKER_GREY.antiGlare },
+    cockpit: { z0: 13.5, z1: 14.35, a: 0.78, frameColor: TANKER_GREY.body },
+    // Small crew observation ports only (no civil passenger window row).
+    windows: { kind: 'row', a: 1.16, z0: 10.6, z1: 12.2, pitch: 0.8, w: 0.22, h: 0.26 },
+    military: {
+      roundelZ: -5.8, roundelA: 1.12, roundelR: 0.94,
+      stencilZ: 2.6, stencilA: 1.06, stencilSize: 0.46,
+      forwardStencilZ: 8.6, forwardStencilA: 1.24, forwardStencilSize: 0.26,
+    },
   });
   const bodyMesh = new THREE.Mesh(body.geo, kit.body);
   bodyMesh.name = 'fuselage';
@@ -897,10 +1210,10 @@ export function makeTankerMesh(model) {
     ? -4.0 + (kinkTe + 4.0) * (x / kinkX)
     : kinkTe + (tipTe - kinkTe) * ((x - kinkX) / (wingSpan - kinkX)));
 
-  // Winglets.
+  // Winglets in matte military grey (tail fin carries the AI lab livery).
   const tipY = wingYAt(wingSpan);
   for (const side of [1, -1]) {
-    group.add(finMesh(kit.fin, {
+    group.add(finMesh(kit.wing, {
       height: 1.9, thickness: 0.08, base: [side * wingSpan, tipY], cant: 0.32, side,
       root: { le: tip.le, chord: tip.chord }, tip: { le: -6.1, chord: 0.72 },
     }));
