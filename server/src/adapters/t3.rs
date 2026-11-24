@@ -889,6 +889,32 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>, cache:
     })
 }
 
+/// Move an already-placed ground aircraft to its newly assigned slot by
+/// taxiing it along the painted routes — a poll must never copy its
+/// coordinates (that is how queued planes used to teleport).
+fn retarget_ground(a: &mut Aircraft, slot: [f32; 2], heading: f32, next: State) {
+    // Airborne or mid runway sequence: the lifecycle owners handle it.
+    if a.altitude > 0.5 || !matches!(a.state, State::Ready | State::Parked | State::Taxi) {
+        return;
+    }
+    let cur = [a.position[0], a.position[1]];
+    let at_slot = (cur[0] - slot[0]).hypot(cur[1] - slot[1]) < 3.0;
+    let wants_this_slot = a.state == State::Taxi
+        && a
+            .taxi_destination()
+            .is_some_and(|d| (d[0] - slot[0]).hypot(d[1] - slot[1]) < 1.0);
+    if a.state == State::Taxi && wants_this_slot {
+        // Already taxiing here: the simulation owns the motion; never restart it.
+        return;
+    }
+    if at_slot {
+        a.state = next;
+        a.heading = heading;
+        return;
+    }
+    a.taxi_to(slot, next);
+}
+
 fn ground_slot(entries: &[ThreadListEntry], i: usize, airports: &[Airport], taxi: bool) -> ([f32;2], f32) {
     let env = remote::owner(&entries[i].thread_id).map(|o| o.0);
     let slot = entries[..i].iter().filter(|e| remote::owner(&e.thread_id).map(|o|o.0) == env).count();
@@ -1193,12 +1219,10 @@ fn apply_poll(
             a.title = Some(entry.title.clone());
             a.hold_reason = reason;
             a.topic = Some(zone);
-            a.state = State::Ready;
-            a.position = [slot_pos[0], slot_pos[1], 0.0];
-            a.altitude = 0.0;
-            a.heading = slot_hdg;
             a.model = entry.model.clone();
             a.device = Some(home_name.to_string());
+            // Queued threads shuffle to their new slot by taxi, not by teleport.
+            retarget_ground(a, slot_pos, slot_hdg, State::Ready);
         } else {
             let mut a = Aircraft::with_model(&cs, Kind::Agent, model_class(&entry.model));
             a.title = Some(entry.title.clone());
@@ -1264,12 +1288,10 @@ fn apply_poll(
         let (slot, _) = ground_slot(&data.stale, i, &world.airports, false);
         if let Some(a) = world.get_mut(&cs) {
             a.title = Some(entry.title.clone());
-            a.state = State::Parked;
-            a.position = [slot[0], slot[1], 0.0];
-            a.altitude = 0.0;
-            a.heading = GATE_HEADING;
             a.model = entry.model.clone();
             a.device = Some(home_name.to_string());
+            // Stale threads shuffle between gates by taxi, not by teleport.
+            retarget_ground(a, slot, GATE_HEADING, State::Parked);
         } else {
             let mut a = Aircraft::with_model(&cs, Kind::Agent, model_class(&entry.model));
             a.title = Some(entry.title.clone());

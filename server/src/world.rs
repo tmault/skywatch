@@ -171,6 +171,24 @@ pub struct Aircraft {
     /// Ground timer: auto-taxi after landing, hold-short before takeoff.
     #[serde(skip)]
     ground_timer: f32,
+    /// Current taxi speed (m/s) for bounded acceleration and braking.
+    #[serde(skip)]
+    ground_speed: f32,
+    /// Set by `World::tick` while another ground aircraft is within `GROUND_SEP`.
+    #[serde(skip)]
+    ground_blocked: bool,
+    /// Set by `World::tick` for arrivals on final while another aircraft uses the runway.
+    #[serde(skip)]
+    runway_occupied: bool,
+    /// Latched TCAS lateral side (±1) so avoidance never flip-flops mid-conflict.
+    #[serde(skip)]
+    avoid_side: f32,
+    /// Last tick's altitude, for vertical-rate estimation in CPA prediction.
+    #[serde(skip)]
+    prev_alt: f32,
+    /// Vertical rate (m/s) from the last tick.
+    #[serde(skip)]
+    vr: f32,
     /// True once marked done/archived: taxi to Runway 36, take off, and fly off forever.
     #[serde(skip)]
     departing_forever: bool,
@@ -226,6 +244,10 @@ const TCAS_HORIZ_BUFFER: f32 = 36.0; // begin smooth sidestep/climb below 36u ho
 const TCAS_VERT_BUFFER: f32 = 18.0;  // ...and within 18u vertical
 const TCAS_HARD_HORIZ: f32 = 28.0;   // hard minimum horizontal if within hard vertical
 const TCAS_HARD_VERT: f32 = 12.0;    // hard minimum vertical when crossing horizontally
+const CPA_LOOKAHEAD: f32 = 10.0;      // seconds of own velocity predicted for CPA
+const CPA_HORIZ_BUFFER: f32 = 26.0;   // predicted horizontal clearance that triggers avoidance
+const CPA_VERT_BUFFER: f32 = 14.0;    // ...and vertical
+const VERT_HARD_RATE: f32 = 40.0;     // u/s max rate of the hard vertical floor
 
 /// Home airport geometry (matches the client's island rendering).
 pub const RUNWAY_MID: [f32; 2] = [56.0, -10.0];
@@ -268,6 +290,9 @@ pub const GATE_HEADING: f32 = 0.0;
 
 const TAXI_SPEED: f32 = 6.0; // m/s on the ground
 const DEPARTURE_TAXI_SPEED: f32 = 14.0; // brisk taxi out for farewell departures
+const GROUND_ACCEL: f32 = 4.0; // m/s^2 taxi acceleration
+const GROUND_BRAKE: f32 = 6.0; // m/s^2 taxi braking
+const GROUND_SEP: f32 = 14.0; // minimum spacing between ground aircraft
 const TAXI_DELAY_AFTER_LANDING: f32 = 5.0; // s rolled out on runway, then taxi
 const HOLD_SHORT_TIME: f32 = 4.0; // s lined up before rolling
 /// Altitude at which a climbing aircraft turns toward its sector.
@@ -499,6 +524,12 @@ impl Aircraft {
             taxi_next: None,
             cleared_for_takeoff: false,
             ground_timer: 0.0,
+            ground_speed: 0.0,
+            ground_blocked: false,
+            runway_occupied: false,
+            avoid_side: 0.0,
+            prev_alt: alt,
+            vr: 0.0,
             departing_forever: false,
             departure_heading: None,
             sep_offset: [0.0, 0.0, 0.0],
@@ -615,9 +646,11 @@ impl Aircraft {
             State::Landing => self.on_final && self.position[1] < TOUCHDOWN_Z + 120.0,
             State::Landed => true,
             State::Departing => self.altitude <= 0.0,
+            // Any taxi on the runway band (backtracking, gate or queue) blocks ops.
             State::Taxi => {
-                self.arrival_slot.is_some()
-                    && (self.position[0] - RUNWAY_THRESHOLD[0]).abs() < 8.0
+                (self.position[0] - RUNWAY_THRESHOLD[0]).abs() < 8.0
+                    && self.position[1] <= RUNWAY_THRESHOLD[1] + 6.0
+                    && self.position[1] >= -76.0
             }
             _ => false,
         }
@@ -688,7 +721,7 @@ impl Aircraft {
                     dh += std::f32::consts::TAU;
                 }
                 let lined_up = (px - RUNWAY_THRESHOLD[0]).abs() < 5.0 && dh.abs() < 0.2;
-                if lined_up && self.altitude < 2.0 {
+                if lined_up && self.altitude < 2.0 && !self.runway_occupied {
                     // Touchdown: roll out along the centerline.
                     self.state = State::Landed;
                     self.on_final = false;
@@ -1113,13 +1146,13 @@ impl Aircraft {
                         return;
                     }
                 }
+                // Ease to the (possibly TCAS-offset) cruise altitude; never snap.
+                self.altitude += (base_alt + self.sep_offset[2] - self.altitude)
+                    .clamp(-10.0 * dt, 10.0 * dt);
                 if self.joining {
-                    // Unassigned: climb to cruise on the current heading.
-                    self.altitude += (base_alt - self.altitude).clamp(-10.0 * dt, 10.0 * dt);
+                    // Unassigned: still accelerating to cruise speed on the current heading.
                     self.speed += (self.cruise_speed() - self.speed).clamp(-5.0 * dt, 5.0 * dt);
                     self.joining = (base_alt - self.altitude).abs() > 0.5;
-                } else {
-                    self.altitude = base_alt;
                 }
                 self.position[2] = self.altitude;
                 let dx = self.heading.cos() * self.speed * dt;
@@ -1143,12 +1176,41 @@ impl Aircraft {
             State::Taxi => {
                 self.altitude = 0.0;
                 self.position[2] = 0.0;
-                let taxi_speed = if self.departing_forever {
+                let v_max = if self.departing_forever {
                     DEPARTURE_TAXI_SPEED
                 } else {
                     TAXI_SPEED
                 };
-                let mut rem = taxi_speed * dt;
+                // Decelerate along a braking curve so the plane arrives at each
+                // waypoint at zero speed; brake hard while blocked by traffic.
+                let dist_to_wp = self
+                    .taxi_waypoints
+                    .first()
+                    .map(|w| (w[0] - self.position[0]).hypot(w[1] - self.position[1]))
+                    .unwrap_or(0.0);
+                let v_arrive = (2.0 * GROUND_BRAKE * dist_to_wp).sqrt();
+                let want = if self.ground_blocked { 0.0 } else { v_max.min(v_arrive) };
+                self.ground_speed += (want - self.ground_speed)
+                    .clamp(-GROUND_BRAKE * dt, GROUND_ACCEL * dt);
+                if self.ground_speed < 0.05 {
+                    // Stationary: transition only when the route is exhausted.
+                    if self.taxi_waypoints.is_empty() {
+                        self.state = self.taxi_next.take().unwrap_or(State::Parked);
+                        self.ground_timer = 0.0;
+                        if let (State::Ready, Some((_, h))) = (self.state, self.arrival_slot) {
+                            self.heading = h;
+                        } else if self.state == State::Ready {
+                            self.heading = RUNWAY_HEADING;
+                        } else if self.state == State::Parked {
+                            self.heading = GATE_HEADING;
+                        } else if self.state == State::Departing {
+                            self.heading = RUNWAY_HEADING;
+                            self.speed = 6.0;
+                        }
+                    }
+                    return;
+                }
+                let mut rem = self.ground_speed * dt;
                 while rem > 0.0 {
                     let Some(&target) = self.taxi_waypoints.first() else {
                         self.state = self.taxi_next.take().unwrap_or(State::Parked);
@@ -1404,6 +1466,10 @@ pub struct World {
     pub airports: Vec<Airport>,
     pub omitted_threads: usize,
     pub sectors: Vec<Sector>,
+    /// Aircraft currently granted the runway (rolling or on final).
+    runway_active: Option<u64>,
+    /// FIFO of cleared, lined-up aircraft waiting to depart, in arrival order.
+    departure_queue: std::collections::VecDeque<u64>,
 }
 
 impl Default for World {
@@ -1413,6 +1479,8 @@ impl Default for World {
             airports: vec![Airport::home("local", "Tower")],
             omitted_threads: 0,
             sectors: default_sectors(),
+            runway_active: None,
+            departure_queue: std::collections::VecDeque::new(),
         }
     }
 }
@@ -1626,16 +1694,87 @@ impl World {
         self.sync_tankers();
         let sectors = self.sectors.clone();
 
-        // Runway occupancy: hold departures short while anyone else is rolling,
-        // on short final, or backtracking after landing.
+        // Runway occupancy: who is rolling, on short final, or backtracking now.
         let runway_users: Vec<u64> = self
             .aircraft
             .iter()
             .filter(|a| a.parent_id.is_none() && a.occupies_runway())
             .map(|a| a.id)
             .collect();
+        // An arrival already on short final protects the runway from new departures.
+        let arrival_on_final = self
+            .aircraft
+            .iter()
+            .any(|a| a.parent_id.is_none() && a.state == State::Landing && a.on_final);
+
+        // Ground spacing: any ground aircraft brakes while another is close by.
+        let ground_pos: Vec<([f32; 2], u64)> = self
+            .aircraft
+            .iter()
+            .filter(|a| a.parent_id.is_none() && a.altitude <= 0.0)
+            .map(|a| ([a.position[0], a.position[1]], a.id))
+            .collect();
         for a in &mut self.aircraft {
-            a.runway_hold = runway_users.iter().any(|&id| id != a.id);
+            a.ground_blocked = ground_pos.iter().any(|(p, id)| {
+                *id != a.id && (p[0] - a.position[0]).hypot(p[1] - a.position[1]) < GROUND_SEP
+            });
+        }
+
+        // One runway operation at a time: drop a stale grant, keep the departure
+        // queue in arrival order, and grant the runway to the next eligible plane.
+        // A grant persists while the holder is still holding short (Ready) or is
+        // a runway user itself (rolling, on final, backtracking).
+        if let Some(id) = self.runway_active {
+            let still_granted = self
+                .aircraft
+                .iter()
+                .find(|a| a.id == id)
+                .map(|a| {
+                    a.state == State::Ready && a.cleared_for_takeoff
+                        || runway_users.contains(&id)
+                })
+                .unwrap_or(false);
+            if !still_granted {
+                self.runway_active = None;
+            }
+        }
+        self.departure_queue
+            .retain(|id| self.aircraft.iter().any(|a| a.id == *id));
+        for a in &self.aircraft {
+            let eligible = a.parent_id.is_none() && a.state == State::Ready && a.cleared_for_takeoff;
+            if eligible && !self.departure_queue.contains(&a.id) {
+                self.departure_queue.push_back(a.id);
+            }
+        }
+        if self.runway_active.is_none() && !arrival_on_final {
+            while let Some(id) = self.departure_queue.front().copied() {
+                let still_eligible = self
+                    .aircraft
+                    .iter()
+                    .find(|a| a.id == id)
+                    .map(|a| a.state == State::Ready && a.cleared_for_takeoff)
+                    .unwrap_or(false);
+                if still_eligible {
+                    if runway_users.is_empty() {
+                        self.runway_active = Some(id);
+                        self.departure_queue.pop_front();
+                    }
+                    break;
+                }
+                self.departure_queue.pop_front();
+            }
+        } else if arrival_on_final && self.runway_active.is_some() {
+            // An arrival crossed short final after the grant: hold short again.
+            self.runway_active = None;
+        }
+        for a in &mut self.aircraft {
+            a.runway_hold = match a.state {
+                State::Ready => self.runway_active != Some(a.id)
+                    || arrival_on_final
+                    || runway_users.iter().any(|&u| u != a.id),
+                _ => false,
+            };
+            a.runway_occupied = a.state == State::Landing && runway_users.iter().any(|&u| u != a.id);
         }
 
         // Advance tankers and all non-wingman, non-refueling-receiver aircraft first.
@@ -1827,6 +1966,14 @@ impl World {
             });
         }
 
+        // Vertical rates for CPA prediction (smoothed over the tick).
+        if dt > 0.0 {
+            for a in &mut self.aircraft {
+                a.vr = ((a.altitude - a.prev_alt) / dt).clamp(-30.0, 30.0);
+                a.prev_alt = a.altitude;
+            }
+        }
+
         // TCAS airborne separation: smoothly sidestep & climb/descend away from
         // conflicting traffic, then enforce hard 3D clearance so no two airborne
         // planes can ever overlap.
@@ -1848,18 +1995,34 @@ impl World {
         };
 
         // Gently relax previous TCAS offsets back toward zero when clear.
+        // The latched evasion side releases once the offset has decayed away.
         let decay = (-0.45 * dt).exp();
         for a in &mut self.aircraft {
             if is_airborne(a.state) {
                 a.sep_offset[0] *= decay;
                 a.sep_offset[1] *= decay;
                 a.sep_offset[2] *= decay;
+                if a.sep_offset[0].abs() + a.sep_offset[1].abs() < 4.0 {
+                    a.avoid_side = 0.0;
+                }
             } else {
                 a.sep_offset = [0.0, 0.0, 0.0];
+                a.avoid_side = 0.0;
             }
         }
 
         let n = self.aircraft.len();
+        // Velocity snapshot for CPA prediction: heading * speed + measured vertical rate.
+        let vel: Vec<[f32; 3]> = (0..n)
+            .map(|k| {
+                let a = &self.aircraft[k];
+                [
+                    a.heading.cos() * a.speed,
+                    a.heading.sin() * a.speed,
+                    a.vr,
+                ]
+            })
+            .collect();
         let mut push: Vec<[f32; 3]> = vec![[0.0, 0.0, 0.0]; n];
         let mut hard_alt: Vec<f32> = vec![0.0; n];
 
@@ -1891,44 +2054,102 @@ impl World {
                 let dalt = self.aircraft[j].position[2] - self.aircraft[i].position[2];
                 let vdist = dalt.abs();
 
-                if hdist < TCAS_HORIZ_BUFFER && vdist < TCAS_VERT_BUFFER {
-                    // Lateral unit vector (deterministic fallback if exactly co-located).
-                    let (nx, nz) = if hdist > 0.1 {
-                        (dx / hdist, dz / hdist)
-                    } else {
-                        let ang = (self.aircraft[i].id as f32) * 2.1;
-                        (ang.cos(), ang.sin())
-                    };
-                    // Higher (or higher-ID tie-break) climbs, lower descends.
-                    let sign_v = if dalt > 0.01 {
+                // Canonical frame (lower-id -> higher-id) so every decision is
+                // independent of vec order: c is the lower id, d the higher.
+                let (c, d) = if self.aircraft[i].id <= self.aircraft[j].id {
+                    (i, j)
+                } else {
+                    (j, i)
+                };
+                let mut cdx = self.aircraft[d].position[0] - self.aircraft[c].position[0];
+                let mut cdz = self.aircraft[d].position[1] - self.aircraft[c].position[1];
+                if cdx > AREA_SIZE * 0.5 {
+                    cdx -= AREA_SIZE;
+                } else if cdx < -AREA_SIZE * 0.5 {
+                    cdx += AREA_SIZE;
+                }
+                if cdz > AREA_SIZE * 0.5 {
+                    cdz -= AREA_SIZE;
+                } else if cdz < -AREA_SIZE * 0.5 {
+                    cdz += AREA_SIZE;
+                }
+                let cdalt = self.aircraft[d].position[2] - self.aircraft[c].position[2];
+
+                // Predicted closest point of approach on the current velocity vectors.
+                let rvx = vel[d][0] - vel[c][0];
+                let rvz = vel[d][1] - vel[c][1];
+                let rvy = vel[d][2] - vel[c][2];
+                let v2 = rvx * rvx + rvz * rvz + rvy * rvy;
+                let t_cpa = if v2 > 0.01 {
+                    (-(cdx * rvx + cdz * rvz + cdalt * rvy) / v2).clamp(0.0, CPA_LOOKAHEAD)
+                } else {
+                    0.0
+                };
+                let px = cdx + rvx * t_cpa;
+                let pz = cdz + rvz * t_cpa;
+                let pv = cdalt + rvy * t_cpa;
+                let h_pred = px.hypot(pz);
+                let conflicting = (hdist < TCAS_HORIZ_BUFFER && vdist < TCAS_VERT_BUFFER)
+                    || (h_pred < CPA_HORIZ_BUFFER && pv.abs() < CPA_VERT_BUFFER);
+                if !conflicting {
+                    continue;
+                }
+
+                // Canonical axis unit vector (deterministic fallback if co-located).
+                let (nx, nz) = if hdist > 0.1 {
+                    (cdx / hdist, cdz / hdist)
+                } else {
+                    let ang = (self.aircraft[c].id as f32) * 2.1;
+                    (ang.cos(), ang.sin())
+                };
+                // The higher one climbs (lower descends); on a level tie the
+                // higher-id aircraft climbs. Always expressed in the canonical frame.
+                let higher_climbs = cdalt >= -0.01;
+                let sgn = if higher_climbs { 1.0 } else { -1.0 };
+
+                let urgency = (1.0 - hdist / TCAS_HORIZ_BUFFER)
+                    .max(1.0 - h_pred / CPA_HORIZ_BUFFER)
+                    .max(1.0 - vdist / TCAS_VERT_BUFFER)
+                    .clamp(0.15, 1.0);
+                let vert_step = 14.0 * urgency * dt;
+
+                // Vertical resolution: both aircraft separate, at a bounded rate.
+                push[c][2] -= sgn * vert_step;
+                push[d][2] += sgn * vert_step;
+
+                // Lateral resolution: only ONE aircraft evades (the lower id —
+                // deterministic, and asymmetric so the pair cannot oscillate
+                // left-right against each other); the other holds its course.
+                // The evading side is latched until the offset decays.
+                let evader = c;
+                let current = self.aircraft[evader].avoid_side;
+                let side = if current != 0.0 {
+                    current
+                } else {
+                    // Deadband: near-collinear geometry has no meaningful side,
+                    // so keep a fixed one instead of reading noise.
+                    let cross = cdx * rvz - cdz * rvx;
+                    if cross > 1.0 {
                         1.0
-                    } else if dalt < -0.01 {
+                    } else if cross < -1.0 {
                         -1.0
-                    } else if self.aircraft[j].id >= self.aircraft[i].id {
-                        1.0
                     } else {
-                        -1.0
-                    };
-
-                    let urgency = (1.0 - hdist / TCAS_HORIZ_BUFFER)
-                        .max(1.0 - vdist / TCAS_VERT_BUFFER)
-                        .clamp(0.15, 1.0);
-                    let lat_step = 18.0 * urgency * dt;
-                    let vert_step = 14.0 * urgency * dt;
-
-                    push[i][0] -= nx * lat_step;
-                    push[i][1] -= nz * lat_step;
-                    push[i][2] -= sign_v * vert_step;
-                    push[j][0] += nx * lat_step;
-                    push[j][1] += nz * lat_step;
-                    push[j][2] += sign_v * vert_step;
-
-                    // Hard vertical safety floor whenever two planes cross tightly.
-                    if hdist < TCAS_HARD_HORIZ && vdist < TCAS_HARD_VERT {
-                        let need = (TCAS_HARD_VERT - vdist) * 0.5 + 0.5;
-                        hard_alt[i] -= sign_v * need;
-                        hard_alt[j] += sign_v * need;
+                        1.0
                     }
+                };
+                self.aircraft[evader].avoid_side = side;
+                let lat_step = 18.0 * urgency * dt * side;
+                // Perp to the canonical axis; a fixed physical side of the line.
+                push[evader][0] += -nz * lat_step;
+                push[evader][1] += nx * lat_step;
+
+                // Hard vertical safety floor whenever two planes cross tightly,
+                // applied at a bounded rate so it never snaps an aircraft.
+                if hdist < TCAS_HARD_HORIZ && vdist < TCAS_HARD_VERT {
+                    let need = (TCAS_HARD_VERT - vdist) * 0.5 + 0.5;
+                    let step = need.min(VERT_HARD_RATE * dt);
+                    hard_alt[c] -= sgn * step;
+                    hard_alt[d] += sgn * step;
                 }
             }
         }
@@ -2043,6 +2264,84 @@ mod tests {
         assert!(saw_join, "climb-out never handed over to the continuous sector join");
     }
 
+    /// Run a head-on conflict and return (min 3D distance, evader side flips,
+    /// final per-vec-slot (position, sep_offset)). FA always starts east, FB west;
+    /// `fa_first` only changes the vec order (ids are creation-order stable).
+    fn run_headon(fa_first: bool, dt: f32, ticks: u32) -> (f32, u32, Vec<([f32; 3], [f32; 3])>) {
+        let mk = |cs: &str, east: bool| {
+            let mut a = Aircraft::new(cs, Kind::Fighter);
+            a.state = State::Cruising;
+            a.position = [if east { 60.0 } else { -60.0 }, 0.0, 148.0];
+            a.altitude = 148.0;
+            a.heading = if east { std::f32::consts::PI } else { 0.0 };
+            a.speed = 30.0;
+            a.joining = false;
+            a
+        };
+        let a = mk("FA", true);
+        let b = mk("FB", false);
+        let mut world = World::new();
+        world.aircraft = if fa_first { vec![a, b] } else { vec![b, a] };
+
+        let mut min_dist = f32::MAX;
+        let mut prev_side = 0.0;
+        let mut flips = 0u32;
+        let first = world.aircraft[0].position;
+        let mut last = [first[0], 0.0, first[2]];
+        for _ in 0..ticks {
+            world.tick(dt);
+            let pair: Vec<&Aircraft> = world.aircraft.iter().collect();
+            let (pa, pb) = (pair[0], pair[1]);
+            let dx = wrap_centered(pb.position[0] - pa.position[0]);
+            let dz = wrap_centered(pb.position[1] - pa.position[1]);
+            let d = dx.hypot(dz).hypot((pb.position[2] - pa.position[2]).abs());
+            min_dist = min_dist.min(d);
+            // Bounded motion: speed + TCAS push (wrapped for map-edge crossings).
+            let moved = wrap_centered(pa.position[0] - last[0]).abs()
+                .max(wrap_centered(pa.position[2] - last[2]).abs());
+            assert!(moved < 5.0, "unbounded per-tick motion: {moved}");
+            last = [pa.position[0], 0.0, pa.position[2]];
+            // Track the evader's latched side (lowest id) — sign of the lateral offset.
+            let ev = if pa.id < pb.id { pa } else { pb };
+            let side = ev.sep_offset[1].signum();
+            if ev.sep_offset[1].abs() > 3.0 && prev_side != 0.0 && side != prev_side {
+                flips += 1;
+            }
+            if side != 0.0 {
+                prev_side = side;
+            }
+        }
+        let pos: Vec<([f32; 3], [f32; 3])> = vec![
+            (world.aircraft[0].position, world.aircraft[0].sep_offset),
+            (world.aircraft[1].position, world.aircraft[1].sep_offset),
+        ];
+        (min_dist, flips, pos)
+    }
+
+    #[test]
+    fn headon_conflict_yields_deterministically_without_oscillation() {
+        let (min_dist, flips, _) = run_headon(true, 0.05, 400);
+        assert!(min_dist > 8.0, "aircraft came within {min_dist} of each other");
+        assert_eq!(flips, 0, "evader flip-flopped left/right {flips} times");
+    }
+
+    #[test]
+    fn headon_result_is_stable_across_order_and_tick_size() {
+        let (_, _, fwd) = run_headon(true, 0.05, 400);
+        let (_, _, rev) = run_headon(false, 0.05, 400);
+        // Same ids and initial states, reversed vec order: same outcome.
+        let (fa_f, fb_f) = (fwd[0].0, fwd[1].0);
+        let (fb_r, fa_r) = (rev[0].0, rev[1].0); // reversed vec holds [FB, FA]
+        for k in 0..3 {
+            assert!((fa_f[k] - fa_r[k]).abs() < 1e-3, "order changed FA pos: {fa_f:?} vs {fa_r:?}");
+            assert!((fb_f[k] - fb_r[k]).abs() < 1e-3, "order changed FB pos: {fb_f:?} vs {fb_r:?}");
+        }
+        // Finer ticks must keep the same safety invariants.
+        let (min_fine, flips_fine, _) = run_headon(true, 0.025, 800);
+        assert!(min_fine > 8.0, "fine-tick run came within {min_fine}");
+        assert_eq!(flips_fine, 0);
+    }
+
     #[test]
     fn hold_then_approval_climbs_to_cruise() {
         let mut a = Aircraft::new("SKY1", Kind::Agent);
@@ -2151,16 +2450,35 @@ mod tests {
         world.add(a);
         world.add(b);
 
+        let dt = 0.05;
+        // Worst-case per-tick relative growth: both planes get the full soft
+        // vertical step (14 u/s) plus the rate-limited hard floor
+        // (VERT_HARD_RATE), while only the evader moves laterally (18 u/s).
+        // Derived from the rate constants so the caps can't drift out of sync.
+        let max_dh = 18.0 * dt + 0.5;
+        let max_dv = 2.0 * (14.0 + VERT_HARD_RATE) * dt + 0.25;
+        let (mut prev_h, mut prev_v) = (0.0f32, 0.0f32);
         for step in 0..200 {
-            world.tick(0.05);
+            world.tick(dt);
             let p1 = world.aircraft[0].position;
             let p2 = world.aircraft[1].position;
             let hdist = (p1[0] - p2[0]).hypot(p1[1] - p2[1]);
             let vdist = (p1[2] - p2[2]).abs();
+            // Separation is built at a bounded rate (no snap), then the hard
+            // envelope holds for the rest of the flight.
             assert!(
-                hdist >= TCAS_HARD_HORIZ || vdist >= TCAS_HARD_VERT - 0.1,
-                "collision at step {step}: hdist={hdist:.2}, vdist={vdist:.2}"
+                hdist - prev_h <= max_dh && vdist - prev_v <= max_dv,
+                "separation jumped at step {step}: dh={:.2} dv={:.2}",
+                hdist - prev_h,
+                vdist - prev_v
             );
+            if step >= 4 {
+                assert!(
+                    hdist >= TCAS_HARD_HORIZ || vdist >= TCAS_HARD_VERT - 0.1,
+                    "collision at step {step}: hdist={hdist:.2}, vdist={vdist:.2}"
+                );
+            }
+            (prev_h, prev_v) = (hdist, vdist);
         }
     }
 
