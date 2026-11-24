@@ -60,12 +60,29 @@ mod tests {
 /// Invoke the bundled transport without placing credentials in command arguments.
 pub fn bridge(request: &Value) -> Option<Value> {
     use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("python3")
+    use std::process::Stdio;
+    let mut child = crate::platform::python()?
         .args(["-c", include_str!("../../../scripts/t3_bridge.py")])
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().ok()?;
     child.stdin.take()?.write_all(serde_json::to_string(request).ok()?.as_bytes()).ok()?;
     let output = child.wait_with_output().ok()?;
-    if !output.status.success() { return None; }
+    if !output.status.success() {
+        report_failure(String::from_utf8_lossy(&output.stderr).trim());
+        return None;
+    }
+    report_failure("");
     serde_json::from_slice(&output.stdout).ok()
+}
+
+/// Log bridge failures once per distinct reason rather than every poll.
+fn report_failure(reason: &str) {
+    static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    let Ok(mut last) = LAST.lock() else { return };
+    if *last == reason { return; }
+    if reason.is_empty() {
+        tracing::info!("T3 MCP bridge recovered");
+    } else {
+        tracing::warn!("{reason}");
+    }
+    *last = reason.to_owned();
 }

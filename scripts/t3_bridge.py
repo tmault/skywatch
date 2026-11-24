@@ -3,7 +3,30 @@ import json
 import os
 from pathlib import Path
 import sys
+import urllib.error
+import urllib.parse
 import urllib.request
+
+# T3 listens on this machine. Corporate proxies (HTTP_PROXY or Windows
+# Internet Settings) often don't exempt 127.0.0.1, so loopback goes direct.
+LOOPBACK = {'127.0.0.1', 'localhost', '::1'}
+# Wildcard bind addresses work as a destination on Linux but not on Windows.
+WILDCARD = {'0.0.0.0': '127.0.0.1', '::': '[::1]'}
+
+
+def local_url(url):
+    """Point a T3 origin that names a wildcard bind address at loopback."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.hostname in WILDCARD:
+        port = ':' + str(parts.port) if parts.port else ''
+        parts = parts._replace(netloc=WILDCARD[parts.hostname] + port)
+    return urllib.parse.urlunsplit(parts)
+
+
+def opener(url):
+    if urllib.parse.urlsplit(url).hostname in LOOPBACK:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener()
 
 
 def decode(raw):
@@ -23,12 +46,14 @@ class Client:
         self.endpoint = os.environ.get('SKYWATCH_T3_MCP_URL')
         if not self.endpoint:
             home = Path(os.environ.get('T3CODE_HOME', str(Path.home() / '.t3')))
-            runtime = json.loads((home / 'userdata/server-runtime.json').read_text())
+            runtime = json.loads((home / 'userdata' / 'server-runtime.json').read_text(encoding='utf-8'))
             self.endpoint = runtime['origin'].rstrip('/') + '/mcp'
-        token_file = os.environ.get('SKYWATCH_T3_TOKEN_FILE', str(Path.home() / '.config/skywatch/t3-mcp-token'))
+        self.endpoint = local_url(self.endpoint)
+        self.opener = opener(self.endpoint)
+        token_file = os.environ.get('SKYWATCH_T3_TOKEN_FILE', str(Path.home() / '.config' / 'skywatch' / 't3-mcp-token'))
         if not token_file:
             raise ValueError('SKYWATCH_T3_TOKEN_FILE must name a paired MCP client credential')
-        self.token = Path(token_file).read_text().strip()
+        self.token = Path(token_file).read_text(encoding='utf-8').strip()
         self.session = None
         self.rpc('initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
                  'clientInfo': {'name': 'skywatch', 'version': '1'}})
@@ -43,7 +68,7 @@ class Client:
         if self.session:
             headers['Mcp-Session-Id'] = self.session
         request = urllib.request.Request(self.endpoint, json.dumps(body).encode(), headers)
-        with urllib.request.urlopen(request, timeout=8) as response:
+        with self.opener.open(request, timeout=8) as response:
             self.session = response.headers.get('Mcp-Session-Id', self.session)
             raw = response.read()
         if notification:
@@ -123,7 +148,7 @@ def list_peer_threads(client, environment_id):
 
 
 def main():
-    request = json.load(sys.stdin)
+    request = json.load(sys.stdin.buffer)
     client = Client()
     if request.get('action') == 'send':
         return client.call('t3_thread_send', request['arguments'])
@@ -145,5 +170,12 @@ if __name__ == '__main__':
     try:
         print(json.dumps(main()))
     except Exception as error:
-        print('Skywatch T3 bridge unavailable: ' + type(error).__name__, file=sys.stderr)
+        reason = type(error).__name__
+        if isinstance(error, urllib.error.HTTPError):
+            reason += ' (HTTP ' + str(error.code) + '; re-run scripts/pair_t3.py if the token expired)'
+        elif isinstance(error, FileNotFoundError):
+            reason += ' (' + str(error.filename) + '; run scripts/pair_t3.py or set SKYWATCH_T3_TOKEN_FILE)'
+        elif isinstance(error, OSError):
+            reason += ' (' + str(getattr(error, 'reason', None) or error.strerror or 'connection failed') + ')'
+        print('Skywatch T3 bridge unavailable: ' + reason, file=sys.stderr)
         sys.exit(1)

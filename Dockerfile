@@ -26,10 +26,10 @@ RUN touch src/main.rs && cargo build --release --locked
 # ---- runtime stage ---------------------------------------------------------
 FROM debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e AS runtime
 
-# python3 (full stdlib: json, urllib): runs the embedded T3 MCP bridge and the healthcheck. sqlite3: the T3 adapter shells out
-# to `sqlite3 -readonly` to read T3's projection database.
+# python3 (full stdlib: json, urllib): runs the embedded T3 MCP bridge and the healthcheck. T3's projection database is
+# read with the SQLite library bundled into skywatch-server, so no sqlite3 binary is needed.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 sqlite3 ca-certificates \
+    && apt-get install -y --no-install-recommends python3 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 ARG SKYWATCH_UID=1000

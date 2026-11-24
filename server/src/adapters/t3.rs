@@ -348,11 +348,7 @@ fn home_gate_slot(i: usize) -> [f32; 2] {
 }
 
 fn local_device_name() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "local".to_string())
+    crate::platform::device_name()
 }
 
 /// Hybrid zone classifier:
@@ -488,8 +484,9 @@ fn flight_state(status: &str, pending_requests: i64) -> (State, Option<String>) 
 }
 
 fn run_t3(args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("t3")
+    let out = std::process::Command::new(crate::platform::t3_cli()?)
         .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -501,25 +498,40 @@ fn run_t3(args: &[&str]) -> Option<String> {
 }
 
 fn state_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("T3CODE_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".t3")))?;
-    Some(base.join("userdata"))
+    Some(crate::platform::t3_home()?.join("userdata"))
 }
 
+/// Run a read-only query against T3's projection database and return the rows
+/// as a JSON array of objects (the shape `sqlite3 -json` produced). Uses the
+/// bundled SQLite so no `sqlite3` binary is needed on the host.
 fn run_sqlite_json(sql: &str) -> Option<String> {
+    use rusqlite::{types::ValueRef, Connection, OpenFlags};
     let db_path = state_dir()?.join("statev2.sqlite");
-    let out = std::process::Command::new("sqlite3")
-        .args(["-readonly", "-json", &db_path.to_string_lossy(), sql])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+    let conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.busy_timeout(Duration::from_secs(2)).ok()?;
+    let mut stmt = conn.prepare(sql).ok()?;
+    let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
+    let mut rows = stmt.query([]).ok()?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().ok()? {
+        let mut object = serde_json::Map::new();
+        for (i, name) in names.iter().enumerate() {
+            let value = match row.get_ref(i).ok()? {
+                ValueRef::Null => serde_json::Value::Null,
+                ValueRef::Integer(n) => n.into(),
+                ValueRef::Real(f) => f.into(),
+                ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned().into(),
+                ValueRef::Blob(_) => serde_json::Value::Null,
+            };
+            object.insert(name.clone(), value);
+        }
+        out.push(serde_json::Value::Object(object));
     }
-    Some(String::from_utf8_lossy(&out.stdout).to_string())
+    serde_json::to_string(&out).ok()
 }
 
 /// Fast airport list from local SQLite (instant startup, before reachability probe).
