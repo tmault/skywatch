@@ -369,7 +369,9 @@ export function makeAgentMesh(model) {
     titles: { a: 1.25, z: Z(5.25), size: 0.36 },
     nose: { a: 1.3, z: Z(0.95), size: 0.13 },
   });
-  g.add(new THREE.Mesh(body.geo, kit.body));
+  const bodyMesh = new THREE.Mesh(body.geo, kit.body);
+  bodyMesh.name = 'fuselage';
+  g.add(bodyMesh);
 
   // Spinner, two-blade 1.9 m prop, round cooling inlets beside the spinner,
   // exhaust stack under the cowl.
@@ -449,6 +451,7 @@ export function makeAgentMesh(model) {
 
   return finish(group, 0.92, kit, {
     refuelPort: new THREE.Vector3(0, 1.56 * 1.5, Z(2.3) * 1.5),
+    landingLightPos: new THREE.Vector3(0, -0.22 * 1.5, (Z(0.25) + 0.14) * 1.5),
   });
 }
 
@@ -507,7 +510,9 @@ export function makeJetMesh(model) {
     operator: { a: 0.72, z: 7.7, size: 0.34 },
     nose: { a: 1.3, z: 9.9, size: 0.34 },
   });
-  group.add(new THREE.Mesh(body.geo, kit.body));
+  const bodyMesh = new THREE.Mesh(body.geo, kit.body);
+  bodyMesh.name = 'fuselage';
+  group.add(bodyMesh);
   // APU exhaust in the tail cone.
   const apu = new THREE.Mesh(new THREE.CircleGeometry(0.11, 12), kit.dark);
   apu.rotation.y = Math.PI;
@@ -615,6 +620,7 @@ export function makeJetMesh(model) {
 
   return finish(group, 0.74, kit, {
     refuelPort: new THREE.Vector3(0, 1.82, 8.4),
+    landingLightPos: new THREE.Vector3(0, -0.62, 12.45),
   });
 }
 
@@ -654,7 +660,9 @@ export function makeFighterMesh(model) {
     bellyA: 2.0, stripeA: 1.45, stripeW: 0.09, stripeZ1: 7.0, swooshZ: -2.2,
     titles: { a: 1.0, z: -1.6, size: 0.5 },
   });
-  group.add(new THREE.Mesh(body.geo, kit.body));
+  const bodyMesh = new THREE.Mesh(body.geo, kit.body);
+  bodyMesh.name = 'fuselage';
+  group.add(bodyMesh);
   const burnerMat = new THREE.MeshBasicMaterial({
     color: 0xff9d2e, transparent: true, opacity: 0.85, depthWrite: false,
   });
@@ -751,6 +759,7 @@ export function makeFighterMesh(model) {
 
   return finish(group, 0.72, kit, {
     refuelPort: new THREE.Vector3(0, 0.92, 5.2),
+    landingLightPos: new THREE.Vector3(0, -0.35, 9.0),
   });
 }
 
@@ -768,7 +777,9 @@ export function makeDroneMesh(model) {
     bellyA: 2.1, stripeA: 1.6, stripeW: 0.1, stripeZ1: 7.6, swooshZ: -3.8,
     titles: { a: 1.15, z: 3.4, size: 0.62 },
   });
-  group.add(new THREE.Mesh(body.geo, kit.body));
+  const bodyMesh = new THREE.Mesh(body.geo, kit.body);
+  bodyMesh.name = 'fuselage';
+  group.add(bodyMesh);
 
   // Sensor turret under the nose, SATCOM and data-link antennas on the spine.
   const mount = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.34, 0.5, 12), kit.plain);
@@ -818,6 +829,7 @@ export function makeDroneMesh(model) {
 
   return finish(group, 0.76, kit, {
     refuelPort: new THREE.Vector3(0, 1.25, 5.0),
+    landingLightPos: new THREE.Vector3(0, 0.08, 8.25),
   });
 }
 
@@ -840,7 +852,9 @@ export function makeTankerMesh(model) {
     titles: { a: 0.74, z: 3.6, size: 1.55 },
     operator: { a: 0.86, z: 10.6, size: 0.44 },
   });
-  group.add(new THREE.Mesh(body.geo, kit.body));
+  const bodyMesh = new THREE.Mesh(body.geo, kit.body);
+  bodyMesh.name = 'fuselage';
+  group.add(bodyMesh);
 
   // Dorsal SATCOM & fuel-control fairing hump along the upper spine.
   const satcom = new THREE.Mesh(fuselage([
@@ -978,5 +992,6 @@ export function makeTankerMesh(model) {
       port: new THREE.Vector3(podX, podY, podZ - 2.35),
       starboard: new THREE.Vector3(-podX, podY, podZ - 2.35),
     },
+    landingLightPos: new THREE.Vector3(0, -0.82, 16.3),
   });
 }

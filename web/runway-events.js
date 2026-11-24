@@ -60,17 +60,106 @@ const fadeTex = (() => {
 
 const easeOut = (t) => 1 - (1 - t) ** 3;
 
+const NOOP_RAYCAST = () => {};
+
+const BEAM_VERTEX_SHADER = `
+  varying vec2 vUvBeam;
+  varying vec3 vWorldPos;
+  varying vec3 vWorldNormal;
+  void main() {
+    vUvBeam = uv;
+    vec4 wp = modelMatrix * vec4(position, 1.0);
+    vWorldPos = wp.xyz;
+    vWorldNormal = normalize(mat3(modelMatrix) * normal);
+    gl_Position = projectionMatrix * viewMatrix * wp;
+  }
+`;
+
+const BEAM_FRAGMENT_SHADER = `
+  uniform vec3 uColor;
+  uniform float uOpacity;
+  uniform float uLengthPower;
+  uniform float uEdgePower;
+  uniform float uGroundY;
+  varying vec2 vUvBeam;
+  varying vec3 vWorldPos;
+  varying vec3 vWorldNormal;
+  void main() {
+    // v = 1 at the nose lamp, v = 0 at the far end: bright near the source
+    // and smoothly vanishing along the beam, with a short taper at the lamp
+    // apex so the cone never shows a hard start seam.
+    float v = clamp(vUvBeam.y, 0.0, 1.0);
+    float tipFade = smoothstep(1.0, 0.95, v);
+    float lengthFade = pow(v, uLengthPower) * tipFade;
+    // Dissolve grazing silhouette edges cleanly to zero so the cone never
+    // reads as a solid shell from overview, side, or follow views.
+    vec3 viewDir = normalize(cameraPosition - vWorldPos);
+    float ndv = abs(dot(normalize(vWorldNormal), viewDir));
+    float edgeFade = pow(ndv, uEdgePower);
+    // Feather out smoothly just above the runway tarmac so the lower rim
+    // never leaves a hard depth-buffer clip line on the asphalt.
+    float groundFade = smoothstep(uGroundY, uGroundY + 1.0, vWorldPos.y);
+    float a = uOpacity * lengthFade * edgeFade * groundFade;
+    if (a < 0.002) discard;
+    gl_FragColor = vec4(uColor, a);
+  }
+`;
+
+function makeBeamMaterial(colorHex, { lengthPower, edgePower, groundY }) {
+  return new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+    blending: THREE.AdditiveBlending,
+    uniforms: {
+      uColor: { value: new THREE.Color(colorHex) },
+      uOpacity: { value: 0.0 },
+      uLengthPower: { value: lengthPower },
+      uEdgePower: { value: edgePower },
+      uGroundY: { value: groundY },
+    },
+    vertexShader: BEAM_VERTEX_SHADER,
+    fragmentShader: BEAM_FRAGMENT_SHADER,
+  });
+}
+
+function makeBeamMesh(rTop, rBottom, len, mat, origin, pitchDown) {
+  const geo = new THREE.CylinderGeometry(rTop, rBottom, len, 32, 1, true);
+  geo.translate(0, -len / 2, 0); // apex at origin, opening along -Y
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.copy(origin);
+  // -Y (wide end) maps to +Z (forward); positive pitchDown tilts the far
+  // end gently below the nose line.
+  mesh.rotation.x = -Math.PI / 2 + pitchDown;
+  mesh.castShadow = false;
+  mesh.receiveShadow = false;
+  mesh.renderOrder = 4;
+  mesh.raycast = NOOP_RAYCAST;
+  return { mesh, geo };
+}
+
 /**
- * Landing lights on an aircraft mesh: a nose glow (sized in world units so it
- * still reads from the overview camera) and a forward/down light beam.
- * Returns { group, setLevel(0..1, now) }.
+ * Landing lights on an aircraft mesh: a tight nose lamp core, a soft warm
+ * halo (readable from overview without overwhelming close views), and a
+ * dual-layer soft volumetric forward beam originating at the aircraft's nose
+ * light location.
+ * Returns { group, setLevel(0..1, dt), dispose() }.
  */
-export function addLandingLights(built) {
+export function addLandingLights(built, { groundY = 3.22 } = {}) {
   const s = built.scale;
-  const box = new THREE.Box3().setFromObject(built.group);
-  // Bounds are in world units of the unscaled group at creation time.
-  const noseZ = box.max.z / s;
-  const midY = ((box.min.y + box.max.y) * 0.5) / s;
+  let origin;
+  if (built.landingLightPos) {
+    origin = built.landingLightPos.clone();
+  } else {
+    const box = new THREE.Box3().setFromObject(built.group);
+    const noseZ = box.max.z / s;
+    // Fallback for unnamed/custom airframes: vertical centre of the fuselage
+    // alone so the tail fin does not pull the light above the nose.
+    const fus = built.group.getObjectByName('fuselage');
+    const refBox = fus ? new THREE.Box3().setFromObject(fus) : box;
+    const lightY = ((refBox.min.y + refBox.max.y) * 0.5) / s;
+    origin = new THREE.Vector3(0, lightY, noseZ * 0.92);
+  }
 
   const group = new THREE.Group();
   group.name = 'landing-lights';
@@ -78,51 +167,84 @@ export function addLandingLights(built) {
 
   const glowMat = new THREE.SpriteMaterial({
     map: glowTex,
-    color: 0xfffbe8,
+    color: 0xfff6dc,
     transparent: true,
+    opacity: 0,
     depthWrite: false,
     blending: THREE.AdditiveBlending,
     toneMapped: false,
   });
   const glow = new THREE.Sprite(glowMat);
-  glow.position.set(0, midY, noseZ * 0.92);
-  glow.scale.setScalar(16 / s);
+  glow.position.copy(origin);
+  glow.scale.setScalar(11 / s);
   glow.renderOrder = 5;
+  glow.raycast = NOOP_RAYCAST;
   group.add(glow);
 
-  // Beam: an open cone pointing forward and slightly down from the nose.
-  const len = 46 / s;
-  const beamGeo = new THREE.CylinderGeometry(0.3 / s, 7 / s, len, 18, 1, true);
-  beamGeo.translate(0, -len / 2, 0); // apex at origin, opening along -Y
-  const beamMat = new THREE.MeshBasicMaterial({
-    map: fadeTex,
-    color: 0xfff4d0,
+  const coreGlowMat = new THREE.SpriteMaterial({
+    map: glowTex,
+    color: 0xffffff,
     transparent: true,
-    opacity: 0.35,
+    opacity: 0,
     depthWrite: false,
-    side: THREE.DoubleSide,
     blending: THREE.AdditiveBlending,
     toneMapped: false,
   });
-  const beam = new THREE.Mesh(beamGeo, beamMat);
-  beam.position.set(0, midY, noseZ * 0.92);
-  beam.rotation.x = -Math.PI / 2 - 0.16; // -Y -> +Z (forward), tipped down
-  beam.castShadow = false;
-  beam.receiveShadow = false;
-  group.add(beam);
+  const coreGlow = new THREE.Sprite(coreGlowMat);
+  coreGlow.position.copy(origin);
+  coreGlow.scale.setScalar(3.6 / s);
+  coreGlow.renderOrder = 6;
+  coreGlow.raycast = NOOP_RAYCAST;
+  group.add(coreGlow);
+
+  // Dual-layer volumetric cone: a focused warm core nested inside a wider,
+  // softer atmospheric scatter cone. Both pitch slightly downward (~2.6 deg)
+  // and inherit the aircraft's yaw, pitch, and bank cleanly.
+  const pitchDown = 0.045;
+  const innerBeamMat = makeBeamMaterial(0xfff8e2, {
+    lengthPower: 1.65,
+    edgePower: 1.8,
+    groundY,
+  });
+  const innerBeam = makeBeamMesh(0.24 / s, 2.7 / s, 30 / s, innerBeamMat, origin, pitchDown);
+  group.add(innerBeam.mesh);
+
+  const outerBeamMat = makeBeamMaterial(0xffefc2, {
+    lengthPower: 1.9,
+    edgePower: 2.0,
+    groundY,
+  });
+  const outerBeam = makeBeamMesh(0.36 / s, 6.4 / s, 45 / s, outerBeamMat, origin, pitchDown);
+  group.add(outerBeam.mesh);
 
   built.group.add(group);
 
   let level = 0;
+  let disposed = false;
   return {
     group,
-    setLevel(target, dt, now) {
-      level += (target - level) * (1 - Math.exp(-4 * dt));
-      group.visible = level > 0.02;
+    setLevel(target, dt) {
+      if (disposed) return;
+      const step = Math.min(Math.max(dt || 0, 0), 0.1);
+      level += (target - level) * (1 - Math.exp(-4.5 * step));
+      group.visible = level > 0.005;
       if (!group.visible) return;
-      const flicker = 0.92 + 0.08 * Math.sin(now * 23);
-      glowMat.opacity = level * flicker;
-      beamMat.opacity = 0.35 * level;
+      // Steady, smooth illumination following the eased lifecycle level.
+      glowMat.opacity = 0.85 * level;
+      coreGlowMat.opacity = 0.98 * level;
+      innerBeamMat.uniforms.uOpacity.value = 0.34 * level;
+      outerBeamMat.uniforms.uOpacity.value = 0.2 * level;
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      if (group.parent) group.parent.remove(group);
+      innerBeam.geo.dispose();
+      outerBeam.geo.dispose();
+      innerBeamMat.dispose();
+      outerBeamMat.dispose();
+      glowMat.dispose();
+      coreGlowMat.dispose();
     },
   };
 }

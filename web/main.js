@@ -1289,7 +1289,9 @@ function ensureMesh(a) {
   const s = built.scale;
   built.group.scale.setScalar(s);
   built.group.rotation.order = 'YXZ';
-  if (a.kind !== 'fighter' && a.kind !== 'tanker') built.landingLights = addLandingLights(built);
+  if (a.kind !== 'fighter' && a.kind !== 'tanker') {
+    built.landingLights = addLandingLights(built, { groundY: TARMAC_TOP_Y + 0.02 });
+  }
 
   const label = new THREE.Sprite(new THREE.SpriteMaterial({
     transparent: true, depthTest: false,
@@ -1355,9 +1357,13 @@ function setColor(entry, a) {
 function disposeMesh(id) {
   const entry = meshes.get(id);
   if (!entry) return;
+  if (entry.landingLights) {
+    entry.landingLights.dispose();
+  }
   scene.remove(entry.group);
   entry.group.traverse((o) => {
-    if (o.geometry) o.geometry.dispose();
+    // THREE.Sprite shares a singleton BufferGeometry across all sprites.
+    if (o.geometry && !o.isSprite) o.geometry.dispose();
     if (o.material && !entry.disposeMaterials.includes(o.material)) {
       if (o.material.map && !o.material.map.userData.shared) o.material.map.dispose();
       o.material.dispose();
@@ -1939,13 +1945,25 @@ function animate() {
       entry.label.material.opacity = 1;
     }
 
-    // Landing lights on while rolling, climbing out, or on approach.
+    // Landing & taxi lights: soft taxi beam while moving on taxiway or lined
+    // up at the runway, full bright beam during takeoff, climb-out, approach,
+    // and landing rollout.
     if (entry.landingLights) {
       const st = entry.state;
-      const lit = st === 'takeoff' || st === 'landing'
+      let lightTarget = 0;
+      if (st === 'takeoff' || st === 'landing'
         || (st === 'departing' && alt < 160)
-        || (st === 'landed' && entry.speed > 0.5);
-      entry.landingLights.setLevel(lit ? 1 : 0, dt, now);
+        || (st === 'landed' && entry.speed > 0.5)) {
+        lightTarget = 1;
+      } else if (st === 'taxi') {
+        lightTarget = 0.45;
+      } else if (st === 'ready'
+        && Math.abs(entry.group.position.x - 56) < 22
+        && entry.group.position.z > -80
+        && entry.group.position.z < 65) {
+        lightTarget = 0.55;
+      }
+      entry.landingLights.setLevel(lightTarget, dt);
     }
     // Dust and spray thrown up behind a fast ground roll or rollout.
     const groundRoll = ((entry.state === 'takeoff' || entry.state === 'departing') && alt <= 0)
