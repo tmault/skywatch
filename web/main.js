@@ -829,6 +829,8 @@ function updateAircraftLabel(entry, a) {
   entry.label.material.needsUpdate = true;
 }
 
+const NOOP_RAYCAST = () => {};
+
 function makeHoldRing(scale) {
   const ring = new THREE.Mesh(
     new THREE.RingGeometry(14 / scale, 17 / scale, 32),
@@ -837,6 +839,7 @@ function makeHoldRing(scale) {
     }),
   );
   ring.rotation.x = -Math.PI / 2;
+  ring.raycast = NOOP_RAYCAST;
   return ring;
 }
 
@@ -1403,11 +1406,45 @@ function disposeMesh(id) {
 const tickerEl = document.getElementById('ticker-lines');
 const pinnedHold = new Map();
 
+function activateTickerLine(line) {
+  const id = line._aircraftId;
+  if (id === null || id === undefined) return;
+  if (!selectAircraft(id)) {
+    line.classList.add('tick-gone');
+    line.title = 'No longer in the air';
+  }
+}
+
 function addTickerLine(text, holding = false, aircraftId = null, kind = '') {
   const line = document.createElement('div');
-  line.className = 'tick-line' + (holding ? ' hold' : '') + (kind ? ` ${kind}` : '');
-  line.textContent = text;
+  line.className = 'tick-line'
+    + (holding ? ' hold' : '')
+    + (kind ? ` ${kind}` : '')
+    + (aircraftId !== null ? ' tick-clickable' : '');
+  const sep = aircraftId !== null ? text.indexOf(': ') : -1;
+  if (sep > 0) {
+    const link = document.createElement('span');
+    link.className = 'tick-callsign';
+    link.textContent = text.slice(0, sep);
+    line.appendChild(link);
+    line.appendChild(document.createTextNode(text.slice(sep)));
+  } else {
+    line.textContent = text;
+  }
   line._aircraftId = aircraftId;
+  if (aircraftId !== null) {
+    line.tabIndex = 0;
+    line.setAttribute('role', 'button');
+    line.title = 'Follow aircraft';
+    line.addEventListener('click', () => activateTickerLine(line));
+    line.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        ev.stopPropagation();
+        activateTickerLine(line);
+      }
+    });
+  }
   tickerEl.appendChild(line);
   if (holding && aircraftId !== null) {
     pinnedHold.set(aircraftId, line);
@@ -1755,12 +1792,18 @@ function showEventBanner(a, kind, verb) {
   eventBannerTimer = setTimeout(() => eventBanner.classList.remove('show'), 5200);
 }
 
+function selectAircraft(id) {
+  if (id === null || id === undefined) return false;
+  const a = currentSnapshot.get(id);
+  if (!a || !meshes.has(id)) return false;
+  openRadio(a);
+  startFollow(id);
+  return true;
+}
+
 if (eventBanner) {
   eventBanner.addEventListener('click', () => {
-    const a = currentSnapshot.get(Number(eventBanner.dataset.aircraftId));
-    if (!a) return;
-    openRadio(a);
-    startFollow(a.id);
+    selectAircraft(Number(eventBanner.dataset.aircraftId));
   });
 }
 
@@ -1807,7 +1850,7 @@ function handleStateChange(a, from, to) {
     return;
   }
   if (a.kind === 'fighter' && from === undefined) {
-    addTickerLine(`${tag}: fighter wingman on station.`);
+    addTickerLine(`${tag}: fighter wingman on station.`, false, a.id);
     return;
   }
   if (to === 'holding') {
@@ -1820,11 +1863,11 @@ function handleStateChange(a, from, to) {
     else if (to === 'departing') addTickerLine(`${tag}: thread done — departing into the horizon.`, false, a.id, 'takeoff');
     else if (to === 'landing') addTickerLine(`${tag}: on approach, Runway 36.`, false, a.id, 'landing');
     else if (to === 'landed') addTickerLine(`${tag}: touchdown.`, false, a.id, 'landing');
-    else if (to === 'taxi') addTickerLine(`${tag}: taxiing.`);
-    else if (to === 'parked') addTickerLine(`${tag}: parked at the gate.`);
+    else if (to === 'taxi') addTickerLine(`${tag}: taxiing.`, false, a.id);
+    else if (to === 'parked') addTickerLine(`${tag}: parked at the gate.`, false, a.id);
     else if (to === 'ready') addTickerLine(`${tag}: lined up, ready for takeoff.`, true, a.id);
-    else if (to === 'cruising' && from === 'refueling') addTickerLine(`${tag}: provider wait ended — resuming patrol.`);
-    else if (to === 'cruising' && from !== undefined) addTickerLine(`${tag}: cruising.`);
+    else if (to === 'cruising' && from === 'refueling') addTickerLine(`${tag}: provider wait ended — resuming patrol.`, false, a.id);
+    else if (to === 'cruising' && from !== undefined) addTickerLine(`${tag}: cruising.`, false, a.id);
   }
   if (selectedAircraftId() === a.id && from !== undefined) {
     const note = {
@@ -1847,23 +1890,139 @@ function handleStateChange(a, from, to) {
 
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
-let downPos = null;
+const CLICK_DRAG_SQ = 36; // 6px movement threshold distinguishing click from orbit drag
+const MIN_SCREEN_PICK_PX = 20;
+const _pickWorld = new THREE.Vector3();
+const _pickNdc = new THREE.Vector3();
 
-canvas.addEventListener('pointerdown', (ev) => { downPos = [ev.clientX, ev.clientY]; });
-canvas.addEventListener('pointerup', (ev) => {
-  if (!downPos) return;
-  const [dx, dy] = [ev.clientX - downPos[0], ev.clientY - downPos[1]];
-  downPos = null;
-  if (dx * dx + dy * dy > 25) return;
+let downPos = null;
+let downPointerId = null;
+let pointerDragged = false;
+
+function isVisibleInHierarchy(obj, root) {
+  let cur = obj;
+  while (cur) {
+    if (!cur.visible) return false;
+    if (cur === root) return true;
+    cur = cur.parent;
+  }
+  return true;
+}
+
+function pickAircraftAt(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  const localX = clientX - rect.left;
+  const localY = clientY - rect.top;
 
   pointer.set(
-    (ev.clientX / window.innerWidth) * 2 - 1,
-    -(ev.clientY / window.innerHeight) * 2 + 1,
+    (localX / rect.width) * 2 - 1,
+    -(localY / rect.height) * 2 + 1,
   );
+  camera.updateMatrixWorld();
   raycaster.setFromCamera(pointer, camera);
-  const groups = [...meshes.values()].map((e) => e.group);
-  const hits = raycaster.intersectObjects(groups, true);
-  if (hits.length === 0) {
+
+  // Tier 1: exact raycast on visible airframe meshes + visible labels.
+  // Tier 2: per-aircraft invisible airframe hit proxy (fuselage/wings/tail envelope).
+  // Both tiers choose the NEAREST aircraft along the ray.
+  let bestDirectId = null;
+  let bestDirectDist = Infinity;
+  let bestProxyId = null;
+  let bestProxyDist = Infinity;
+
+  for (const [id, entry] of meshes.entries()) {
+    if (!entry.group.visible) continue;
+    entry.group.updateMatrixWorld();
+
+    const hits = raycaster.intersectObject(entry.group, true);
+    for (const h of hits) {
+      const obj = h.object;
+      if (obj === entry.ring) continue;
+      if (obj === entry.hitProxy || obj.userData?.isHitProxy) {
+        if (h.distance < bestProxyDist) {
+          bestProxyDist = h.distance;
+          bestProxyId = id;
+        }
+        continue;
+      }
+      if (obj === entry.label && entry.label.material.opacity <= 0.05) continue;
+      if (!isVisibleInHierarchy(obj, entry.group)) continue;
+      if (h.distance < bestDirectDist) {
+        bestDirectDist = h.distance;
+        bestDirectId = id;
+      }
+      break;
+    }
+  }
+
+  if (bestDirectId !== null) return bestDirectId;
+  if (bestProxyId !== null) return bestProxyId;
+
+  // Tier 3: minimum screen-space pick radius for small/distant aircraft in overview.
+  let bestScreenId = null;
+  let bestScreenDepth = Infinity;
+  const maxSq = MIN_SCREEN_PICK_PX * MIN_SCREEN_PICK_PX;
+
+  for (const [id, entry] of meshes.entries()) {
+    if (!entry.group.visible) continue;
+    if (entry.airframeCenter) {
+      _pickWorld.copy(entry.airframeCenter).applyMatrix4(entry.group.matrixWorld);
+    } else {
+      _pickWorld.copy(entry.group.position);
+    }
+    _pickNdc.copy(_pickWorld).project(camera);
+    if (_pickNdc.z < -1 || _pickNdc.z > 1) continue;
+    const sx = (_pickNdc.x * 0.5 + 0.5) * rect.width;
+    const sy = (-_pickNdc.y * 0.5 + 0.5) * rect.height;
+    const ddx = sx - localX;
+    const ddy = sy - localY;
+    if (ddx * ddx + ddy * ddy <= maxSq) {
+      const camDist = camera.position.distanceTo(_pickWorld);
+      if (camDist < bestScreenDepth) {
+        bestScreenDepth = camDist;
+        bestScreenId = id;
+      }
+    }
+  }
+
+  return bestScreenId;
+}
+
+canvas.addEventListener('pointerdown', (ev) => {
+  if (ev.button !== 0) return;
+  if (downPointerId !== null && ev.pointerId !== downPointerId) {
+    pointerDragged = true;
+    return;
+  }
+  downPos = [ev.clientX, ev.clientY];
+  downPointerId = ev.pointerId;
+  pointerDragged = false;
+});
+canvas.addEventListener('pointermove', (ev) => {
+  if (!downPos || ev.pointerId !== downPointerId || pointerDragged) return;
+  const dx = ev.clientX - downPos[0];
+  const dy = ev.clientY - downPos[1];
+  if (dx * dx + dy * dy > CLICK_DRAG_SQ) pointerDragged = true;
+});
+canvas.addEventListener('pointercancel', (ev) => {
+  if (ev.pointerId === downPointerId) {
+    downPos = null;
+    downPointerId = null;
+    pointerDragged = false;
+  }
+});
+canvas.addEventListener('pointerup', (ev) => {
+  if (!downPos || ev.pointerId !== downPointerId) return;
+  const dx = ev.clientX - downPos[0];
+  const dy = ev.clientY - downPos[1];
+  const wasDrag = pointerDragged || (dx * dx + dy * dy > CLICK_DRAG_SQ);
+  downPos = null;
+  downPointerId = null;
+  pointerDragged = false;
+  if (wasDrag) return;
+
+  const id = pickAircraftAt(ev.clientX, ev.clientY);
+  if (id === null) {
     // Clicking empty sky/water disengages follow cam.
     if (followId !== null) {
       stopFollow(false);
@@ -1871,18 +2030,7 @@ canvas.addEventListener('pointerup', (ev) => {
     }
     return;
   }
-  let obj = hits[0].object;
-  while (obj.parent && !groups.includes(obj)) obj = obj.parent;
-  if (!groups.includes(obj)) return;
-
-  const id = [...meshes.entries()].find(([, e]) => e.group === obj)?.[0];
-  if (id === undefined) return;
-
-  const a = currentSnapshot.get(id);
-  if (a) {
-    openRadio(a);
-    startFollow(id);
-  }
+  selectAircraft(id);
 });
 
 /* ----------------------------------------------------------- main loop */

@@ -221,9 +221,41 @@ button:hover { background: rgba(255, 255, 255, 0.15); }
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.tick-line.tick-clickable {
+  pointer-events: auto;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+.tick-line.tick-clickable:hover,
+.tick-line.tick-clickable:focus-visible {
+  background: rgba(42, 46, 52, 0.94);
+  outline: 1px solid rgba(255, 255, 255, 0.35);
+}
+.tick-line .tick-callsign {
+  font-weight: 700;
+  color: #8be0ff;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: rgba(139, 224, 255, 0.55);
+}
+.tick-line.tick-clickable:hover .tick-callsign,
+.tick-line.tick-clickable:focus-visible .tick-callsign {
+  text-decoration-color: currentColor;
+}
 .tick-line.hold {
   border-left-color: var(--amber);
   color: var(--amber);
+}
+.tick-line.hold .tick-callsign {
+  color: inherit;
+  text-decoration-color: rgba(255, 176, 32, 0.65);
+}
+.tick-line.tick-gone {
+  opacity: 0.55;
+  cursor: default;
+}
+.tick-line.tick-gone .tick-callsign {
+  text-decoration: line-through;
 }
 .tick-line.hold::after { content: " ●"; font-size: 8px; vertical-align: middle; }
 
