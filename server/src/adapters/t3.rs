@@ -90,6 +90,25 @@ struct ThreadListEntry {
     usage_limit_reset_at: Option<String>,
     #[serde(default)]
     usage_limit_code: Option<String>,
+    /// Set when another environment's thread delegated this one. T3's sidebar
+    /// nests such threads under that parent (and its settled state) instead of
+    /// listing them on their own; SQLite gives the parent id, the CLI an object.
+    #[serde(default, alias = "delegatedFrom")]
+    delegated_from: Option<serde_json::Value>,
+}
+
+impl ThreadListEntry {
+    fn is_delegated(&self) -> bool {
+        self.delegated_from.as_ref().is_some_and(|v| !v.is_null())
+    }
+}
+
+/// A delegated thread only gets its own aircraft while it is doing work.
+fn shown_on_its_own(e: &ThreadListEntry, parents_with_active_subagents: &HashSet<String>) -> bool {
+    !e.is_delegated()
+        || is_working_status(&e.status)
+        || detect_token_wait(e).is_some()
+        || parents_with_active_subagents.contains(&e.thread_id)
 }
 
 /// Active token/usage-limit wait detected for a T3 thread.
@@ -582,7 +601,8 @@ fn poll_threads() -> Option<(Vec<ThreadListEntry>, HashSet<String>)> {
                END AS usage_limit_reset_at,
                CASE WHEN json_extract(i.payload_json, '$.failure.class') = 'usage_limit'
                     THEN COALESCE(json_extract(i.payload_json, '$.failure.code'), '')
-               END AS usage_limit_code
+               END AS usage_limit_code,
+               json_extract(t.payload_json, '$.delegatedFrom.threadId') AS delegated_from
                FROM orchestration_v2_projection_threads t
                LEFT JOIN projection_projects p ON p.project_id = t.project_id
                LEFT JOIN orchestration_v2_projection_runs r ON r.run_id = (
@@ -722,6 +742,15 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>, cache:
         .filter(|r| is_working_status(&r.status))
         .map(|r| r.thread_id.clone())
         .collect();
+    // Delegated threads belong to the thread that delegated them (T3 nests them
+    // under it in the sidebar), so they only appear while actually working —
+    // never queued on the taxiway or parked at a gate on their own.
+    let entries: Vec<ThreadListEntry> = entries
+        .into_iter()
+        .filter(|e| shown_on_its_own(e, &parents_with_active_subagents))
+        .collect();
+    let nested = total_entries - entries.len();
+    let total_entries = total_entries - nested;
     let mut flying = Vec::new();
     let mut working_count = HashMap::<String, usize>::new();
     let mut refuel_count = HashMap::<String, usize>::new();
@@ -1637,6 +1666,21 @@ mod tests {
     }
 
     #[test]
+    fn idle_delegated_threads_do_not_queue_on_their_own() {
+        let none = HashSet::new();
+        let mut child = make_entry("mcp:launch:x", "Delegated", "completed");
+        child.delegated_from = Some(serde_json::json!("parent-thread"));
+        assert!(!shown_on_its_own(&child, &none), "idle delegated thread must not queue");
+        child.status = "running".into();
+        assert!(shown_on_its_own(&child, &none), "working delegated thread still flies");
+        let own = make_entry("t-own", "Own", "completed");
+        assert!(shown_on_its_own(&own, &none), "ordinary idle threads still queue");
+        let mut cli = make_entry("t-cli", "CLI", "idle");
+        cli.delegated_from = Some(serde_json::json!({"environmentId": "e", "threadId": "p"}));
+        assert!(!shown_on_its_own(&cli, &none));
+    }
+
+    #[test]
     fn gate_slots_stay_put_when_another_plane_leaves() {
         let mut gates = GateCallsigns::default();
         let e = |id: &str| make_entry(id, id, "idle");
@@ -1724,6 +1768,7 @@ mod tests {
             limit_recovery_reset_at: None,
             limit_recovery_auto_resume: None,
             usage_limit_reset_at: None,
+            delegated_from: None,
             usage_limit_code: None,
         }
     }
