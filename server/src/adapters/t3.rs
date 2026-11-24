@@ -8,6 +8,8 @@
 //! radio-panel messages back into the owning thread via `t3 thread send`.
 
 use super::remote;
+
+mod scheduled;
 use crate::time::parse_rfc3339;
 #[cfg(test)]
 use crate::world::wrap_centered;
@@ -643,16 +645,19 @@ fn state_dir() -> Option<PathBuf> {
 /// as a JSON array of objects (the shape `sqlite3 -json` produced). Uses the
 /// bundled SQLite so no `sqlite3` binary is needed on the host.
 fn run_sqlite_json(sql: &str) -> Option<String> {
+    run_sqlite_json_at(&state_dir()?.join("statev2.sqlite"), sql)
+}
+
+fn run_sqlite_json_at(db_path: &std::path::Path, sql: &str) -> Option<String> {
     use rusqlite::{types::ValueRef, Connection, OpenFlags};
-    let db_path = state_dir()?.join("statev2.sqlite");
     let conn = Connection::open_with_flags(
-        &db_path,
+        db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()?;
     conn.busy_timeout(Duration::from_secs(2)).ok()?;
     let mut stmt = conn.prepare(sql).ok()?;
-    let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
+    let names: Vec<String> = stmt.column_names().map(str::to_owned).collect();
     let mut rows = stmt.query([]).ok()?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().ok()? {
@@ -921,6 +926,13 @@ struct PollData {
     subagents: Vec<SubagentRow>,
 }
 
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn subagent_linger_secs() -> i64 {
     std::env::var("SKYWATCH_SUBAGENT_LINGER_SECS")
         .ok()
@@ -1093,7 +1105,12 @@ fn partition_pools(
 }
 
 /// Fetch airports, threads, pending-request counts, and sub-agents off-lock.
-fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>, cache: &mut remote::Cache) -> Option<PollData> {
+fn fetch_poll_data(
+    home_name: &str,
+    reachability: &HashMap<String, bool>,
+    cache: &mut remote::Cache,
+    last_local_jobs: &mut Vec<scheduled::JobEntry>,
+) -> Option<(PollData, Vec<scheduled::JobEntry>)> {
     let local_environment_id = state_dir()
         .and_then(|dir| std::fs::read_to_string(dir.join("environment-id")).ok())
         .map(|id| id.trim().to_owned())
@@ -1112,12 +1129,23 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>, cache:
     let linger = subagent_linger_secs();
     let mut all_subagents = poll_subagents(&local_ids, now);
 
-    let updates = remote::bridge(&serde_json::json!({"action":"poll"}))
+    // Linked devices' scheduled tasks change slowly and cost one MCP call per
+    // project, so they ride along on every fifth poll; the cache keeps them between.
+    static POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let with_tasks = POLLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(5);
+    let updates = remote::bridge(&serde_json::json!({"action":"poll", "scheduledTasks": with_tasks}))
         .and_then(|v| serde_json::from_value::<Vec<remote::Peer>>(v).ok()).unwrap_or_default();
+    // Scheduled jobs: a failed local read keeps the last known jobs.
+    if let Some(local_jobs) = scheduled::poll_local_tasks() {
+        *last_local_jobs = local_jobs;
+    }
+    let mut jobs = last_local_jobs.clone();
+    jobs.extend(scheduled::poll_os_jobs());
     for peer in cache.merge(updates) {
         if let Some(ap) = airports.iter_mut().find(|a| a.id == peer.environment_id) {
             ap.online = peer.online;
         }
+        jobs.extend(scheduled::peer_tasks(&peer));
         let (peer_entries, peer_done, peer_subs) = extract_peer_threads(&peer, now, linger);
         entries.extend(peer_entries);
         done_or_archived.extend(peer_done);
@@ -1127,16 +1155,19 @@ fn fetch_poll_data(home_name: &str, reachability: &HashMap<String, bool>, cache:
     let (flying, taxiway, stale, subagents, omitted) =
         partition_pools(entries, all_subagents, &airports, now);
 
-    Some(PollData {
-        omitted,
-        local_environment_id,
-        airports,
-        flying,
-        taxiway,
-        stale,
-        done_or_archived,
-        subagents,
-    })
+    Some((
+        PollData {
+            omitted,
+            local_environment_id,
+            airports,
+            flying,
+            taxiway,
+            stale,
+            done_or_archived,
+            subagents,
+        },
+        jobs,
+    ))
 }
 
 /// Move an already-placed ground aircraft to its newly assigned slot by
@@ -1859,6 +1890,7 @@ pub async fn run(world: SharedWorld, mut rx: mpsc::Receiver<ClientFrame>) {
     let mut gates = GateCallsigns::default();
     let mut wingmen = Wingmen::default();
     let mut runway = RunwayOps::default();
+    let mut reapers = scheduled::ReaperCallsigns::default();
 
     // Set home airport immediately before first poll returns.
     {
@@ -1885,20 +1917,24 @@ pub async fn run(world: SharedWorld, mut rx: mpsc::Receiver<ClientFrame>) {
     }
 
     // Channel for background poll results so polling never blocks client frames or sim ticks.
-    let (poll_tx, mut poll_rx) = mpsc::channel::<PollData>(2);
+    let (poll_tx, mut poll_rx) = mpsc::channel::<(PollData, Vec<scheduled::JobEntry>)>(2);
     {
         let home_clone = home_name.clone();
         let reach = std::sync::Arc::clone(&reachability);
         tokio::spawn(async move {
             let mut cache = remote::Cache::default();
+            let mut jobs = Vec::new();
             loop {
                 let hn = home_clone.clone();
                 let snap_reach = reach.read().map(|g| g.clone()).unwrap_or_default();
                 let res = tokio::task::spawn_blocking(move || {
-                    let data = fetch_poll_data(&hn, &snap_reach, &mut cache);
-                    (data, cache)
+                    let data = fetch_poll_data(&hn, &snap_reach, &mut cache, &mut jobs);
+                    (data, cache, jobs)
                 }).await;
-                let res = match res { Ok((data, next_cache)) => { cache = next_cache; Ok(data) }, Err(e) => { cache = remote::Cache::default(); Err(e) } };
+                let res = match res {
+                    Ok((data, next_cache, next_jobs)) => { cache = next_cache; jobs = next_jobs; Ok(data) }
+                    Err(e) => { cache = remote::Cache::default(); jobs = Vec::new(); Err(e) }
+                };
                 if let Ok(Some(data)) = res {
                     if poll_tx.send(data).await.is_err() {
                         break;
@@ -1913,7 +1949,8 @@ pub async fn run(world: SharedWorld, mut rx: mpsc::Receiver<ClientFrame>) {
 
     loop {
         tokio::select! {
-            Some(data) = poll_rx.recv() => {
+            Some((data, jobs)) = poll_rx.recv() => {
+                let local_environment = data.local_environment_id.clone();
                 let mut w = world.lock().await;
                 let events = apply_poll(
                     &mut w,
@@ -1925,6 +1962,7 @@ pub async fn run(world: SharedWorld, mut rx: mpsc::Receiver<ClientFrame>) {
                     &mut wingmen,
                     &mut runway,
                 );
+                scheduled::apply_jobs(&mut w, &home_name, local_environment.as_deref(), jobs, &mut reapers, unix_now());
                 for (cs, what) in &events {
                     tracing::info!(callsign = cs, what, "t3 aircraft update");
                 }
@@ -1946,6 +1984,12 @@ pub async fn run(world: SharedWorld, mut rx: mpsc::Receiver<ClientFrame>) {
                     tracing::warn!(aircraft_id, "unknown aircraft; dropping message");
                     continue;
                 };
+                // Scheduled jobs are a read-only view: radio traffic never
+                // runs, edits, enables or disables a task.
+                if reapers.owns(&callsign) {
+                    tracing::info!(callsign, "scheduled job radio is read-only; message not relayed");
+                    continue;
+                }
                 // Active fleet -> taxiway queue -> gate-parked threads -> fighter wingmen.
                 let thread_id = callsigns
                     .by_thread
@@ -2606,6 +2650,7 @@ mod tests {
             environment_id: "anon-env".into(),
             label: "Anon Laptop".into(),
             online: true,
+            scheduled_tasks: None,
             threads: Some(vec![serde_json::json!({
                 "threadId": "anon-remote",
                 "title": "Anon remote",
@@ -3028,6 +3073,7 @@ mod tests {
             environment_id: "mac".into(),
             label: "Tom's M5 Air".into(),
             online: true,
+            scheduled_tasks: None,
             threads: Some(vec![
                 serde_json::json!({
                     "threadId": "parent-1",
@@ -3242,4 +3288,356 @@ mod tests {
         );
     }
 
+
+    // ---------------------------------------------- scheduled jobs (Reapers)
+
+    use scheduled::{apply_jobs, parse_local_tasks, peer_tasks, JobEntry, ReaperCallsigns};
+
+    const JOB_NOW: i64 = 1_800_000_000;
+
+    fn iso(offset: i64) -> String {
+        crate::time::format_rfc3339(JOB_NOW + offset)
+    }
+
+    fn job_entry(key: &str, title: &str, enabled: bool, status: &str, next_in: Option<i64>) -> JobEntry {
+        JobEntry {
+            key: key.into(),
+            title: title.into(),
+            project: None,
+            thread_id: Some(format!("thread-{title}")),
+            model: None,
+            job: crate::world::ScheduledJob {
+                schedule: "every 5 min".into(),
+                enabled,
+                running: status == "running",
+                next_run_at: next_in.map(iso),
+                last_run_at: None,
+                last_run_status: status.into(),
+                run_count: Some(3),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn job_world() -> World {
+        let mut world = World::new();
+        world.airports = vec![
+            Airport::home("local", "PC"),
+            Airport::satellite("mac", "Mac", SATELLITE_SLOTS[0], true),
+            Airport::satellite("pc2", "PC2", SATELLITE_SLOTS[1], true),
+        ];
+        world
+    }
+
+    fn reaper_by_title<'a>(w: &'a World, title: &str) -> &'a Aircraft {
+        w.iter().find(|a| a.scheduled_job.is_some() && a.title.as_deref() == Some(title)).unwrap()
+    }
+
+    #[test]
+    fn scheduled_tasks_never_send_prompts_or_secrets_to_the_snapshot() {
+        let dir = std::env::temp_dir().join(format!("skywatch-jobs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("statev2.sqlite");
+        let _ = std::fs::remove_file(&db);
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE projection_projects (project_id TEXT PRIMARY KEY, title TEXT);
+                 CREATE TABLE scheduled_tasks (task_id TEXT PRIMARY KEY, title TEXT NOT NULL, prompt TEXT NOT NULL,
+                   enabled INTEGER NOT NULL, schedule_json TEXT NOT NULL, project_id TEXT NOT NULL, thread_id TEXT,
+                   workspace_strategy_json TEXT NOT NULL, model_selection_json TEXT NOT NULL, runtime_mode TEXT NOT NULL,
+                   interaction_mode TEXT NOT NULL, created_by TEXT NOT NULL, creation_source TEXT NOT NULL,
+                   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, next_run_at TEXT, last_run_at TEXT,
+                   last_run_status TEXT NOT NULL, last_run_error TEXT, run_count INTEGER NOT NULL,
+                   webhook_token TEXT, webhook_secret TEXT, last_run_webhook_delivery_id TEXT,
+                   thread_mode TEXT NOT NULL DEFAULT 'new_thread');
+                 INSERT INTO projection_projects VALUES ('proj-1', 'Anon project');
+                 INSERT INTO scheduled_tasks VALUES ('task-a', 'Anon interval job', 'PROMPT-SENTINEL', 1,
+                   '{\"type\":\"interval\",\"everyMs\":300000}', 'proj-1', 'thread-a', '{\"path\":\"/WORKSPACE-SENTINEL\"}',
+                   '{\"instanceId\":\"x\",\"model\":\"claude-sonnet-5-5\"}', 'full-access', 'default', 'agent', 'mcp',
+                   '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', NULL, '2026-01-01T00:00:00Z', 'failed',
+                   'ERROR-SENTINEL /private/path', 4, 'TOKEN-SENTINEL', 'SECRET-SENTINEL', 'DELIVERY-SENTINEL', 'continue');
+                 INSERT INTO scheduled_tasks VALUES ('task-b', 'Anon webhook job', 'PROMPT-SENTINEL', 0,
+                   '{\"type\":\"webhook\",\"signature\":{\"secret\":\"SIG-SENTINEL\",\"header\":\"x-sig\",\"encoding\":\"hex\",\"prefix\":\"\"},\"filters\":[{\"path\":\"body.FILTER-SENTINEL\",\"op\":\"exists\"}]}',
+                   'proj-1', NULL, '{}', '{}', 'full-access', 'default', 'agent', 'mcp',
+                   '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', NULL, NULL, 'never', NULL, 0,
+                   'TOKEN-SENTINEL', 'SECRET-SENTINEL', NULL, 'new_thread');",
+            )
+            .unwrap();
+        }
+        let raw = run_sqlite_json_at(&db, scheduled::SCHEDULED_TASKS_SQL).unwrap();
+        let jobs = parse_local_tasks(&raw);
+        assert_eq!(jobs.len(), 2);
+        let mut world = job_world();
+        let mut reapers = ReaperCallsigns::default();
+        apply_jobs(&mut world, "PC", Some("pc"), jobs, &mut reapers, JOB_NOW);
+        let wire = serde_json::to_string(&world.snapshot()).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        // The query reads schedule_json (to humanise it) but no other private column.
+        for leak in ["PROMPT-", "TOKEN-", "SECRET-SENTINEL", "WORKSPACE", "ERROR-", "DELIVERY-", "/private"] {
+            assert!(!raw.contains(leak), "query returned {leak}");
+        }
+        for leak in ["sentinel", "prompt", "secret", "signature", "filter", "workspace", "token", "/private"] {
+            assert!(!wire.to_lowercase().contains(leak), "snapshot leaked {leak}");
+        }
+        // The only webhook mention is the humanised trigger.
+        assert!(wire.contains("\"schedule\":\"on webhook\""));
+        assert!(wire.contains("\"schedule\":\"every 5 min\""));
+        let a = reaper_by_title(&world, "Anon interval job");
+        assert_eq!(a.kind, Kind::Drone);
+        assert_eq!(a.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(a.scheduled_job.as_ref().unwrap().run_count, Some(4));
+        assert_eq!(a.chat_links.as_ref().unwrap().web, "https://app.t3.codes/threads/pc/thread-a");
+    }
+
+    #[test]
+    fn schedule_json_variants_are_humanised_without_inventing_fields() {
+        use crate::world::humanize_schedule as h;
+        assert_eq!(h(r#"{"type":"interval","everyMs":300000}"#), "every 5 min");
+        assert_eq!(h(r#"{"type":"interval","everyMs":3600000}"#), "every 1 hour");
+        assert_eq!(h(r#"{"type":"interval","everyMs":5400000}"#), "every 1 h 30 min");
+        assert_eq!(h(r#"{"type":"interval","everyMs":172800000}"#), "every 2 days");
+        assert_eq!(h(r#"{"type":"fixed_time","timeOfDay":"00:05"}"#), "daily at 00:05");
+        assert_eq!(h(r#"{"type":"fixed_time","timeOfDay":"09:30","weekdays":[5,1,2,3,4]}"#), "weekdays at 09:30");
+        assert_eq!(h(r#"{"type":"fixed_time","timeOfDay":"10:00","weekdays":[0,6]}"#), "weekends at 10:00");
+        assert_eq!(h(r#"{"type":"fixed_time","timeOfDay":"07:00","weekdays":[1,3,5]}"#), "Mon, Wed, Fri at 07:00");
+        assert_eq!(h(r#"{"type":"once","runAt":"2026-11-28T09:00:00.000Z"}"#), "once on 2026-11-28 09:00 UTC");
+        assert_eq!(h(r#"{"type":"webhook","signature":{"secret":"s"}}"#), "on webhook");
+        assert_eq!(h(r#"{"type":"cron","expression":"*/5 * * * *"}"#), "custom schedule");
+        assert_eq!(h("not json"), "schedule unavailable");
+    }
+
+    #[test]
+    fn task_list_flies_reapers_with_stable_callsigns_across_polls() {
+        let mut world = job_world();
+        let mut reapers = ReaperCallsigns::default();
+        let a = job_entry("task-a", "Anon A", true, "never", Some(7200));
+        let b = job_entry("task-b", "Anon B", false, "succeeded", None);
+        let c = job_entry("task-c", "Anon C", true, "never", Some(9000));
+        apply_jobs(&mut world, "PC", Some("pc"), vec![a.clone(), b.clone()], &mut reapers, JOB_NOW);
+        let cs = |w: &World, t: &str| reaper_by_title(w, t).callsign.clone();
+        let (ca, cb) = (cs(&world, "Anon A"), cs(&world, "Anon B"));
+        assert_eq!((ca.as_str(), cb.as_str()), ("REAP1", "REAP2"));
+        let id_a = reaper_by_title(&world, "Anon A").id;
+        // Reordered list plus a new job: identities hold, the airframe is the same.
+        apply_jobs(&mut world, "PC", Some("pc"), vec![c.clone(), b.clone(), a.clone()], &mut reapers, JOB_NOW + 3);
+        assert_eq!(cs(&world, "Anon A"), ca);
+        assert_eq!(cs(&world, "Anon B"), cb);
+        assert_eq!(cs(&world, "Anon C"), "REAP3");
+        assert_eq!(reaper_by_title(&world, "Anon A").id, id_a);
+        // Enabled jobs park idle; disabled ones park dimmed.
+        use crate::world::JobPhase;
+        assert_eq!(reaper_by_title(&world, "Anon A").scheduled_job.as_ref().unwrap().phase, JobPhase::Parked);
+        assert_eq!(reaper_by_title(&world, "Anon B").scheduled_job.as_ref().unwrap().phase, JobPhase::Disabled);
+        assert!(world.iter().filter(|x| x.scheduled_job.is_some()).all(|x| x.state == State::Parked));
+        // A job that disappears (e.g. a failed poll on reconnect) keeps its callsign on return.
+        apply_jobs(&mut world, "PC", Some("pc"), vec![a.clone(), c.clone()], &mut reapers, JOB_NOW + 6);
+        assert!(world.iter().all(|x| x.title.as_deref() != Some("Anon B")));
+        apply_jobs(&mut world, "PC", Some("pc"), vec![a, b, c], &mut reapers, JOB_NOW + 9);
+        assert_eq!(cs(&world, "Anon B"), cb);
+    }
+
+    #[test]
+    fn due_job_taxis_out_and_takes_off_in_runway_sequence_then_lands_back_on_the_ramp() {
+        let mut world = job_world();
+        let mut reapers = ReaperCallsigns::default();
+        let mut job = job_entry("task-a", "Anon A", true, "succeeded", Some(100));
+        let poll = |w: &mut World, r: &mut ReaperCallsigns, j: &JobEntry, t: i64| {
+            apply_jobs(w, "PC", Some("pc"), vec![j.clone()], r, JOB_NOW + t);
+        };
+        // A thread departure already queued for the runway goes first.
+        let mut thread = Aircraft::with_model("SKY1", Kind::Agent, ModelClass::Frontier);
+        thread.state = State::Parked;
+        thread.position = [HOME_GATES[4][0], HOME_GATES[4][1], 0.0];
+        thread.altitude = 0.0;
+        thread.release();
+        world.add(thread);
+        poll(&mut world, &mut reapers, &job, 0);
+        let mut t = 0.0f32;
+        let mut states = Vec::new();
+        let step = |w: &mut World, r: &mut ReaperCallsigns, j: &JobEntry, t: &mut f32, states: &mut Vec<State>| {
+            for i in 0..60 {
+                w.tick(0.05);
+                if i == 0 {
+                    let a = reaper_by_title(w, "Anon A");
+                    if states.last() != Some(&a.state) {
+                        states.push(a.state);
+                    }
+                }
+            }
+            *t += 3.0;
+            poll(w, r, j, *t as i64);
+        };
+        for _ in 0..30 {
+            step(&mut world, &mut reapers, &job, &mut t, &mut states);
+        }
+        assert_eq!(reaper_by_title(&world, "Anon A").state, State::Ready, "holding short while due");
+        job.job.running = true;
+        job.job.last_run_status = "running".into();
+        let sky1_airborne_first = loop {
+            step(&mut world, &mut reapers, &job, &mut t, &mut states);
+            let r = reaper_by_title(&world, "Anon A");
+            if r.altitude > 0.0 {
+                break world.iter().find(|a| a.callsign == "SKY1").unwrap().altitude > 0.0;
+            }
+            assert!(t < 600.0, "reaper never took off");
+        };
+        assert!(sky1_airborne_first, "the reaper must take its turn behind the queued departure");
+        for _ in 0..80 {
+            step(&mut world, &mut reapers, &job, &mut t, &mut states);
+        }
+        assert_eq!(reaper_by_title(&world, "Anon A").state, State::Cruising);
+        assert_eq!(reaper_by_title(&world, "Anon A").scheduled_job.as_ref().unwrap().phase, crate::world::JobPhase::OnStation);
+        // Finished, next run far away: land and taxi back.
+        job.job.running = false;
+        job.job.last_run_status = "succeeded".into();
+        job.job.next_run_at = Some(iso(t as i64 + 7200));
+        for _ in 0..300 {
+            step(&mut world, &mut reapers, &job, &mut t, &mut states);
+            if reaper_by_title(&world, "Anon A").state == State::Parked && states.contains(&State::Landed) {
+                break;
+            }
+        }
+        let r = reaper_by_title(&world, "Anon A");
+        states.push(r.state);
+        assert_eq!(r.state, State::Parked);
+        assert!(world.airports[0].runway_layout().on_ramp([r.position[0], r.position[1]]));
+        for s in [State::Taxi, State::Ready, State::Takeoff, State::Cruising, State::Landing, State::Landed, State::Parked] {
+            assert!(states.contains(&s), "lifecycle skipped {s:?}: {states:?}");
+        }
+    }
+
+    #[test]
+    fn failed_last_run_raises_a_failure_alert_and_radio_is_read_only() {
+        let mut world = job_world();
+        let mut reapers = ReaperCallsigns::default();
+        apply_jobs(&mut world, "PC", Some("pc"), vec![job_entry("task-f", "Anon F", true, "failed", Some(3600))], &mut reapers, JOB_NOW);
+        let a = reaper_by_title(&world, "Anon F");
+        assert_eq!(a.hold_reason.as_deref(), Some("last scheduled run failed"));
+        assert_eq!(a.state, State::Parked);
+        assert!(reapers.owns(&a.callsign));
+        assert!(!reapers.owns("SKY1"));
+    }
+
+    #[test]
+    fn identical_task_ids_on_two_devices_stay_distinct_and_keep_ownership() {
+        let mut world = job_world();
+        let mut reapers = ReaperCallsigns::default();
+        let peer = |env: &str| remote::Peer {
+            environment_id: env.into(),
+            label: env.into(),
+            online: true,
+            threads: Some(vec![]),
+            scheduled_tasks: Some(vec![serde_json::json!({
+                "scheduledTaskId": "task-1",
+                "title": format!("Anon job on {env}"),
+                "prompt": "PROMPT-SENTINEL",
+                "enabled": true,
+                "boundThreadId": "thread-1",
+                "schedule": {"type": "interval", "everyMs": 600000},
+                "nextRunAt": iso(3600),
+                "lastRunStatus": "succeeded"
+            })]),
+        };
+        let mut jobs = vec![job_entry("task-1", "Anon job on local", true, "never", Some(3600))];
+        jobs.extend(peer_tasks(&peer("mac")));
+        jobs.extend(peer_tasks(&peer("pc2")));
+        apply_jobs(&mut world, "PC", Some("pc"), jobs.clone(), &mut reapers, JOB_NOW);
+        let local = reaper_by_title(&world, "Anon job on local");
+        let mac = reaper_by_title(&world, "Anon job on mac");
+        let pc2 = reaper_by_title(&world, "Anon job on pc2");
+        let ids: HashSet<u64> = [local.id, mac.id, pc2.id].into_iter().collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(mac.airport_id(), "mac");
+        assert_eq!(pc2.airport_id(), "pc2");
+        assert_eq!(local.airport_id(), "local");
+        assert_eq!(mac.device.as_deref(), Some("Mac"));
+        assert_eq!(mac.chat_links.as_ref().unwrap().web, "https://app.t3.codes/threads/mac/thread-1");
+        let mac_layout = world.airports[1].runway_layout();
+        assert!(mac_layout.on_ramp([mac.position[0], mac.position[1]]), "remote job parks on its own island's ramp");
+        assert_eq!(mac.scheduled_job.as_ref().unwrap().schedule, "every 10 min");
+        let wire = serde_json::to_string(&world.snapshot()).unwrap();
+        assert!(!wire.contains("PROMPT-SENTINEL"));
+        let before: Vec<String> = ["local", "mac", "pc2"].iter().map(|e| reaper_by_title(&world, &format!("Anon job on {e}")).callsign.clone()).collect();
+        apply_jobs(&mut world, "PC", Some("pc"), jobs.into_iter().rev().collect(), &mut reapers, JOB_NOW + 3);
+        let after: Vec<String> = ["local", "mac", "pc2"].iter().map(|e| reaper_by_title(&world, &format!("Anon job on {e}")).callsign.clone()).collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn airborne_job_reappearing_before_departure_keeps_identity_and_motion() {
+        let mut world = job_world();
+        let mut callsigns = ReaperCallsigns::default();
+        let entry = job_entry("anon-task", "Anon job", true, "running", None);
+        apply_jobs(&mut world, "PC", None, vec![entry.clone()], &mut callsigns, JOB_NOW);
+        let cs = reaper_by_title(&world, "Anon job").callsign.clone();
+        let a = world.get_mut(&cs).unwrap();
+        a.state = State::Cruising;
+        a.altitude = 60.0;
+        a.position = [40.0, -250.0, 60.0];
+        let id = a.id;
+        apply_jobs(&mut world, "PC", None, vec![], &mut callsigns, JOB_NOW + 3);
+        assert_eq!(world.get_mut(&cs).unwrap().state, State::Departing);
+        let pos = world.get_mut(&cs).unwrap().position;
+        apply_jobs(&mut world, "PC", None, vec![entry], &mut callsigns, JOB_NOW + 6);
+        let a = world.get_mut(&cs).unwrap();
+        assert_eq!(a.id, id);
+        assert_eq!(a.position, pos);
+        assert_eq!(a.state, State::Cruising);
+        assert!(a.ramp_slot().is_some());
+        assert!(!a.is_departing());
+    }
+
+    #[test]
+    fn scheduled_only_project_gets_its_own_sector() {
+        let mut world = job_world();
+        let mut entry = job_entry("anon-task", "Anon job", true, "running", None);
+        entry.project = Some("Anon project".into());
+        apply_jobs(&mut world, "PC", None, vec![entry], &mut ReaperCallsigns::default(), JOB_NOW);
+        let a = reaper_by_title(&world, "Anon job");
+        let zone = a.topic.as_deref().unwrap();
+        assert!(world.sectors.iter().any(|s| s.name == zone && s.kind == "project"));
+    }
+
+    #[test]
+    fn ramp_capacity_shows_an_omitted_count_and_prefers_running_jobs() {
+        let mut world = job_world();
+        let mut reapers = ReaperCallsigns::default();
+        let mut jobs: Vec<JobEntry> = (0..7)
+            .map(|i| job_entry(&format!("task-{i}"), &format!("Anon {i}"), true, "never", Some(3600 + i * 60)))
+            .collect();
+        jobs[6].job.running = true;
+        jobs[6].job.last_run_status = "running".into();
+        apply_jobs(&mut world, "PC", Some("pc"), jobs, &mut reapers, JOB_NOW);
+        let shown: Vec<_> = world.iter().filter(|a| a.scheduled_job.is_some()).collect();
+        assert_eq!(shown.len(), crate::world::World::new().ramp_capacity("local"));
+        assert_eq!(world.omitted_jobs, 7 - shown.len());
+        assert!(shown.iter().any(|a| a.title.as_deref() == Some("Anon 6")), "running job is never the one omitted");
+        assert_eq!(world.snapshot().omitted_jobs, 3);
+    }
+
+    #[test]
+    fn os_scheduler_jobs_expose_only_names_and_timing() {
+        struct Fake;
+        impl scheduled::JobSource for Fake {
+            fn name(&self) -> &'static str { "systemd" }
+            fn list(&self) -> Vec<scheduled::OsJob> {
+                vec![scheduled::OsJob {
+                    name: "anon-backup.timer".into(),
+                    next_run_at: Some(iso(600)),
+                    last_run_at: None,
+                    last_result: "succeeded".into(),
+                }]
+            }
+        }
+        let sources: Vec<Box<dyn scheduled::JobSource>> = vec![Box::new(Fake)];
+        let jobs = scheduled::os_entries(&sources);
+        assert_eq!(jobs[0].key, "os:systemd:anon-backup.timer");
+        assert!(jobs[0].thread_id.is_none());
+        let mut world = job_world();
+        apply_jobs(&mut world, "PC", None, jobs, &mut ReaperCallsigns::default(), JOB_NOW);
+        let a = reaper_by_title(&world, "anon-backup.timer");
+        assert_eq!(a.scheduled_job.as_ref().unwrap().schedule, "systemd timer");
+        assert!(a.chat_links.is_none());
+    }
 }

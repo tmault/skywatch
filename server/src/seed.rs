@@ -8,22 +8,21 @@
 use std::time::{Duration, SystemTime};
 
 use crate::world::{
-    default_sectors, formation_position, refuel_formation_position, Aircraft, Airport, Kind, ModelClass, Sector, State, World,
+    default_sectors, formation_position, refuel_formation_position, Aircraft, Airport, Kind, ModelClass,
+    ScheduledJob, Sector, State, World,
     GATE_HEADING, HOME_GATES, PROJECT_SECTOR_RADIUS, PROJECT_SECTOR_SLOTS, RUNWAY_MID,
     SATELLITE_SLOTS,
 };
 
-/// Starting `[x, z, alt]` positions for the 5 primary demo aircraft.
-const POSITIONS: [[f32; 3]; 5] = [
+/// Starting `[x, z, alt]` positions for the 3 primary demo aircraft.
+const POSITIONS: [[f32; 3]; 3] = [
     [-225.0, 245.0, 100.0],
     [285.0, 30.0, 100.0],
     [RUNWAY_MID[0], RUNWAY_MID[1], 0.0],
-    [0.0, -275.0, 65.0],
-    [60.0, -255.0, 65.0],
 ];
 
-const HEADINGS: [f32; 5] = [0.8, 2.4, 0.0, 3.9, 5.5];
-const ALTITUDES: [f32; 5] = [100.0, 100.0, 0.0, 65.0, 65.0];
+const HEADINGS: [f32; 3] = [0.8, 2.4, 0.0];
+const ALTITUDES: [f32; 3] = [100.0, 100.0, 0.0];
 
 /// Populate a fresh world with the demo cast and sample device airports.
 pub fn seed(world: &mut World) {
@@ -47,8 +46,6 @@ pub fn seed(world: &mut World) {
         ("SKY1", Kind::Agent, ModelClass::Frontier, "Skywatch", "claude-opus-5-5"),
         ("SKY2", Kind::Agent, ModelClass::Local, "AI & Models", "local-models/qwen3.8-27b"),
         ("SKY3", Kind::Agent, ModelClass::Local, "Build", "ollama/deepseek-v4.1-flash"),
-        ("REAP1", Kind::Drone, ModelClass::Local, "Homelab", "gemini-4-argon"),
-        ("REAP2", Kind::Drone, ModelClass::Local, "Homelab", "gpt-6-luna"),
     ];
 
     let mut sky1_info = None;
@@ -76,8 +73,6 @@ pub fn seed(world: &mut World) {
                 // takeoff at cycle 3 (a real landing would auto-exit to a gate).
                 a.hold_on_runway();
             }
-            "REAP1" => a.title = Some("Tower health monitor".to_string()),
-            "REAP2" => a.title = Some("Nightly backup cron".to_string()),
             _ => {}
         }
         world.add(a);
@@ -158,6 +153,7 @@ pub fn seed(world: &mut World) {
         a.refuel("Demo usage limit reached", reset);
         world.add(a);
     }
+    seed_reapers(world, unix_now());
     world.sync_tankers();
     let (position, heading) = world.iter().find(|a| a.kind == Kind::Tanker)
         .map(|a| (a.position, a.heading)).expect("demo tanker");
@@ -169,6 +165,104 @@ pub fn seed(world: &mut World) {
         a.position = [target[0] - offset * heading.cos(), target[1] - offset * heading.sin(), a.altitude];
         a.heading = heading;
     }
+}
+
+/// Synthetic scheduled jobs: `(callsign, airport, title, model, schedule)`.
+/// The demo clock compresses REAP1/REAP2's runs into a five-minute cycle so
+/// the ramp, taxi-out, takeoff, loiter, landing and return all show quickly.
+const DEMO_JOBS: [(&str, &str, &str, &str, &str); 5] = [
+    ("REAP1", "local", "Tower health monitor", "gemini-4-argon", "every 5 min"),
+    ("REAP2", "local", "Backup snapshot sync", "gpt-6-luna", "every 5 min"),
+    ("REAP3", "local", "Weekly dependency audit", "claude-haiku-5-5", "Mon at 07:00"),
+    ("REAP4", "local", "Certificate expiry check", "gpt-6-luna", "daily at 06:00"),
+    ("REAP5", "m5-air", "Photo library backup", "gemini-4-argon", "daily at 03:30"),
+];
+const DEMO_JOB_PERIOD: i64 = 300;
+/// `(callsign, offset into the cycle when its run starts, run length)`.
+/// REAP1 opens the demo on station; REAP2 waits for SKY3 to clear the runway.
+const DEMO_RUNS: [(&str, i64, i64); 2] = [("REAP1", 0, 140), ("REAP2", 200, 120)];
+
+fn seed_reapers(world: &mut World, start: i64) {
+    for (cs, ap_id, title, model, _) in DEMO_JOBS {
+        let Some(ap) = world.airports.iter().find(|a| a.id == ap_id).cloned() else { continue };
+        let Some(slot) = world.free_ramp_slot(ap_id) else { continue };
+        let mut a = Aircraft::reaper(cs, &ap, slot, ScheduledJob::default());
+        a.title = Some(title.to_string());
+        a.model = Some(model.to_string());
+        a.assign("Homelab");
+        if cs == "REAP1" {
+            // Already mid-run when the demo opens: loitering over Homelab.
+            a.state = State::Cruising;
+            a.position = [0.0, -275.0, 60.0];
+            a.altitude = 60.0;
+            a.heading = 3.9;
+        }
+        world.add(a);
+    }
+    apply_demo_jobs(world, start, start);
+}
+
+/// Synthetic job state at `now` for a demo that started at `start`.
+fn demo_job(cs: &str, schedule: &str, start: i64, now: i64) -> ScheduledJob {
+    let fmt = crate::time::format_rfc3339;
+    let elapsed = (now - start).max(0);
+    let mut job = ScheduledJob {
+        schedule: schedule.to_string(),
+        enabled: true,
+        last_run_status: "succeeded".into(),
+        ..ScheduledJob::default()
+    };
+    if let Some((_, offset, length)) = DEMO_RUNS.iter().find(|r| r.0 == cs) {
+        let since = elapsed - offset;
+        let cycle = since.div_euclid(DEMO_JOB_PERIOD);
+        let into = since.rem_euclid(DEMO_JOB_PERIOD);
+        let run_start = start + offset + cycle * DEMO_JOB_PERIOD;
+        job.running = since >= 0 && into < *length;
+        job.last_run_status = if job.running { "running" } else if since < 0 { "never" } else { "succeeded" }.into();
+        job.last_run_at = (since >= 0).then(|| fmt(run_start));
+        job.next_run_at = Some(fmt(if since < 0 { start + offset } else { run_start + DEMO_JOB_PERIOD }));
+        job.run_count = Some((42 + cycle.max(-1)) as u64);
+        return job;
+    }
+    match cs {
+        "REAP3" => {
+            job.enabled = false;
+            job.last_run_at = Some(fmt(start - 3 * 86_400));
+            job.run_count = Some(12);
+        }
+        "REAP4" => {
+            job.last_run_status = "failed".into();
+            job.last_run_at = Some(fmt(start - 5 * 3600));
+            job.next_run_at = Some(fmt(start + 19 * 3600));
+            job.run_count = Some(88);
+        }
+        _ => {
+            job.last_run_at = Some(fmt(start - 9 * 3600));
+            job.next_run_at = Some(fmt(start + 15 * 3600));
+            job.run_count = Some(230);
+        }
+    }
+    job
+}
+
+/// Refresh every demo job's synthetic status and steer the Reapers.
+fn apply_demo_jobs(world: &mut World, start: i64, now: i64) {
+    for (cs, _, _, _, schedule) in DEMO_JOBS {
+        let job = demo_job(cs, schedule, start, now);
+        if let Some(a) = world.get_mut(cs) {
+            let phase = a.scheduled_job.as_ref().map(|j| j.phase).unwrap_or_default();
+            a.hold_reason = job.last_run_failed().then(|| "last scheduled run failed".to_string());
+            a.scheduled_job = Some(ScheduledJob { phase, ..job });
+        }
+    }
+    world.steer_reapers(now);
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn demo_reset_after(seconds: u64) -> String {
@@ -268,10 +362,12 @@ const SCRIPT_INTERVAL_SECS: u32 = 60;
 
 pub async fn run_script(world: crate::ws::SharedWorld) {
     let mut cycle: u32 = 0;
+    let start = unix_now();
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
         interval.tick().await;
         let mut w = world.lock().await;
+        apply_demo_jobs(&mut w, start, unix_now());
         if cycle.is_multiple_of(SCRIPT_INTERVAL_SECS) {
             run_cycle(&mut w, cycle / SCRIPT_INTERVAL_SECS);
         }
@@ -313,8 +409,13 @@ mod tests {
         assert_eq!(state_of("SKY7"), State::Refueling);
         assert_eq!(state_of("SKY8"), State::Cruising);
         assert_eq!(state_of("SKY9"), State::Parked);
-        assert_eq!(state_of("REAP1"), State::Cruising);
-        assert_eq!(state_of("REAP2"), State::Cruising);
+        assert_eq!(state_of("REAP2"), State::Parked);
+        assert_eq!(state_of("REAP3"), State::Parked);
+        let reap1 = world.iter().find(|a| a.callsign == "REAP1").unwrap();
+        assert!(reap1.scheduled_job.as_ref().unwrap().running, "REAP1 starts its run at once");
+        assert_eq!(state_of("REAP1"), State::Cruising, "on station over Homelab");
+        let reap5 = world.iter().find(|a| a.callsign == "REAP5").unwrap();
+        assert_eq!(reap5.airport_id(), "m5-air");
         let sky8 = world.iter().find(|a| a.callsign == "SKY8").unwrap();
         let sky9 = world.iter().find(|a| a.callsign == "SKY9").unwrap();
         assert_eq!(sky8.model.as_deref(), Some("claude-fable-5-2"));
@@ -322,6 +423,40 @@ mod tests {
         let tankers: Vec<_> = world.iter().filter(|a| a.kind == Kind::Tanker).collect();
         assert_eq!(tankers.len(), 1);
         assert_eq!(tankers[0].callsign, "KC-CLAUDE");
+    }
+
+    #[test]
+    fn demo_reapers_cycle_through_the_whole_ramp_lifecycle() {
+        let mut world = World::new();
+        seed(&mut world);
+        let start = 1_900_000_000;
+        apply_demo_jobs(&mut world, start, start);
+        let mut seen = std::collections::HashSet::new();
+        for step in 0..(2 * DEMO_JOB_PERIOD * 20) {
+            if step % 20 == 0 {
+                let secs = step / 20;
+                if secs % SCRIPT_INTERVAL_SECS as i64 == 0 {
+                    run_cycle(&mut world, (secs / SCRIPT_INTERVAL_SECS as i64) as u32);
+                }
+                apply_demo_jobs(&mut world, start, start + secs);
+            }
+            world.tick(0.05);
+            for cs in ["REAP1", "REAP2"] {
+                let a = world.iter().find(|a| a.callsign == cs).unwrap();
+                seen.insert((cs, a.scheduled_job.as_ref().unwrap().phase));
+            }
+        }
+        use crate::world::JobPhase::*;
+        for cs in ["REAP1", "REAP2"] {
+            for phase in [Parked, Launching, OnStation, Returning] {
+                assert!(seen.contains(&(cs, phase)), "{cs} never {phase:?}");
+            }
+        }
+        assert!(seen.contains(&("REAP1", HoldingShort)) || seen.contains(&("REAP2", HoldingShort)));
+        let reap3 = world.iter().find(|a| a.callsign == "REAP3").unwrap();
+        assert_eq!(reap3.scheduled_job.as_ref().unwrap().phase, Disabled);
+        let reap4 = world.iter().find(|a| a.callsign == "REAP4").unwrap();
+        assert_eq!(reap4.hold_reason.as_deref(), Some("last scheduled run failed"));
     }
 
     #[test]

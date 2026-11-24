@@ -1,4 +1,9 @@
+mod reaper;
 mod tanker;
+
+pub use reaper::{humanize_schedule, ScheduledJob};
+#[cfg(test)]
+pub use reaper::JobPhase;
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -145,7 +150,17 @@ impl RunwayLayout {
     /// the opposite end from the departure entrance, then follow painted
     /// taxiways (never the runway or the departure queue lane) back to `dest`.
     pub fn far_exit_route(&self, dest: [f32; 2]) -> Vec<[f32; 2]> {
-        let route = if self.is_home {
+        let route = if self.is_home && self.on_ramp(dest) {
+            // Reaper ramp: the return loop's spine leads north onto the ramp.
+            vec![
+                [self.runway_x, self.exit_z],
+                [HOME_EXIT_LANE_X, self.exit_z],
+                [HOME_EXIT_LANE_X, HOME_EXIT_RETURN_Z],
+                [reaper::HOME_RAMP_SPINE_X, HOME_EXIT_RETURN_Z],
+                [reaper::HOME_RAMP_SPINE_X, dest[1]],
+                dest,
+            ]
+        } else if self.is_home {
             // North connector loops past Alpha's last holding slot, then the
             // apron lane brings arrivals south to their slot's latitude.
             vec![
@@ -285,6 +300,18 @@ pub struct Aircraft {
     /// Optional RFC3339 timestamp when provider tokens/quota reset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refuel_reset_at: Option<String>,
+    /// Scheduled job this Reaper drone visualises (read-only; never a thread).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_job: Option<ScheduledJob>,
+    /// Sticky parking slot `(position, heading)` on the owning airport's Reaper ramp.
+    #[serde(skip)]
+    ramp_slot: Option<([f32; 2], f32)>,
+    /// Lifecycle stage the Reaper is being steered toward.
+    #[serde(skip)]
+    job_target: reaper::JobTarget,
+    /// Heading to settle on when a taxi ends parked or holding short off the runway.
+    #[serde(skip)]
+    park_heading: Option<f32>,
     /// Tanker flight-level slot index (assigned dynamically when multiple providers are active).
     #[serde(skip)]
     tanker_orbit_idx: usize,
@@ -719,6 +746,10 @@ impl Aircraft {
             refuel_scope: None,
             refuel_slot: None,
             refuel_reset_at: None,
+            scheduled_job: None,
+            ramp_slot: None,
+            job_target: reaper::JobTarget::Park,
+            park_heading: None,
             tanker_orbit_idx: 0,
             orbit_center: None,
             patrol_angle: rng.gen_range(0.0..std::f32::consts::TAU),
@@ -1262,9 +1293,11 @@ impl Aircraft {
         self.taxi_next = Some(next);
         self.ground_timer = 0.0;
         self.taxi_waypoints.clear();
-        let cur = [self.position[0], self.position[1]];
         let layout = self.airport_layout;
         let thresh = layout.threshold;
+        // Off the Reaper ramp first, onto the lane that leads to the runway.
+        let (exit, cur) = layout.ramp_exit([self.position[0], self.position[1]]);
+        self.taxi_waypoints.extend(exit);
         if layout.is_home {
             if cur[0] > 96.0 {
                 // Gate concourse: pull back onto apron centerline, south to connector, west to runway.
@@ -1646,7 +1679,9 @@ impl Aircraft {
                     if self.taxi_waypoints.is_empty() {
                         self.state = self.taxi_next.take().unwrap_or(State::Parked);
                         self.ground_timer = 0.0;
-                        if let (State::Ready, Some((_, h))) = (self.state, self.arrival_slot) {
+                        if let Some(h) = self.settle_heading() {
+                            self.heading = h;
+                        } else if let (State::Ready, Some((_, h))) = (self.state, self.arrival_slot) {
                             self.heading = h;
                         } else if self.state == State::Ready {
                             self.heading = RUNWAY_HEADING;
@@ -1681,7 +1716,9 @@ impl Aircraft {
                         if self.taxi_waypoints.is_empty() {
                             self.state = self.taxi_next.take().unwrap_or(State::Parked);
                             self.ground_timer = 0.0;
-                            if let (State::Ready, Some((_, h))) = (self.state, self.arrival_slot) {
+                            if let Some(h) = self.settle_heading() {
+                                self.heading = h;
+                            } else if let (State::Ready, Some((_, h))) = (self.state, self.arrival_slot) {
                                 self.heading = h;
                             } else if self.state == State::Ready {
                                 self.heading = RUNWAY_HEADING;
@@ -1888,6 +1925,8 @@ pub struct WorldSnapshot {
     pub sectors: Vec<Sector>,
     pub airports: Vec<Airport>,
     pub omitted_threads: usize,
+    /// Scheduled jobs beyond the Reaper ramps' capacity (shown as a count).
+    pub omitted_jobs: usize,
 }
 
 /// A topic or project airspace sector, serialised for the client to render.
@@ -1918,6 +1957,7 @@ pub struct World {
     pub aircraft: Vec<Aircraft>,
     pub airports: Vec<Airport>,
     pub omitted_threads: usize,
+    pub omitted_jobs: usize,
     pub sectors: Vec<Sector>,
     /// Per-airport aircraft currently granted the runway (rolling or on final).
     runway_active: std::collections::HashMap<String, u64>,
@@ -1931,6 +1971,7 @@ impl Default for World {
             aircraft: Vec::new(),
             airports: vec![Airport::home("local", "Tower")],
             omitted_threads: 0,
+            omitted_jobs: 0,
             sectors: default_sectors(),
             runway_active: std::collections::HashMap::new(),
             departure_queue: std::collections::HashMap::new(),
@@ -2168,7 +2209,8 @@ impl World {
                     a.taxi_next = Some(State::Ready);
                     a.ground_timer = 0.0;
                     a.taxi_waypoints.clear();
-                    let cur = [a.position[0], a.position[1]];
+                    let (exit, cur) = a.airport_layout.ramp_exit([a.position[0], a.position[1]]);
+                    a.taxi_waypoints.extend(exit);
                     if cur[0] > 96.0 {
                         a.taxi_waypoints.push([APRON_X, cur[1]]);
                         a.taxi_waypoints.push([APRON_X, dest[1]]);
@@ -2284,7 +2326,9 @@ impl World {
             let slot = self.aircraft.iter().find(|a| a.id == id).and_then(|a| a.arrival_slot);
             if let Some((slot, _)) = slot {
                 if let Some(a) = self.aircraft.iter_mut().find(|a| a.id == id) {
-                    a.taxi_from_runway(slot, State::Ready);
+                    // Reapers shut down on their ramp slot; threads queue Ready.
+                    let next = if a.scheduled_job.is_some() { State::Parked } else { State::Ready };
+                    a.taxi_from_runway(slot, next);
                 }
                 continue;
             }
@@ -2396,6 +2440,7 @@ impl World {
         // conflicting traffic, then enforce hard 3D clearance so no two airborne
         // planes can ever overlap.
         self.enforce_air_separation(dt);
+        self.refresh_reaper_phases();
     }
 
     fn enforce_air_separation(&mut self, dt: f32) {
@@ -2604,6 +2649,7 @@ impl World {
             sectors: self.sectors.clone(),
             airports: self.airports.clone(),
             omitted_threads: self.omitted_threads,
+            omitted_jobs: self.omitted_jobs,
         }
     }
 }
@@ -4075,5 +4121,209 @@ mod tests {
         let p = w.get_mut("M4").unwrap();
         assert_eq!(p.state, State::Parked);
         assert!((p.position[0] - mac.gates[3][0]).hypot(p.position[1] - mac.gates[3][1]) < 1.0);
+    }
+
+    // ---------------------------------------------------- scheduled-job Reapers
+
+    const T0: i64 = 1_800_000_000;
+
+    fn job(enabled: bool, running: bool, next_in: Option<i64>, now: i64) -> ScheduledJob {
+        ScheduledJob {
+            schedule: "every 15 min".into(),
+            enabled,
+            running,
+            next_run_at: next_in.map(|s| crate::time::format_rfc3339(now + s)),
+            last_run_at: None,
+            last_run_status: if running { "running" } else { "never" }.into(),
+            run_count: Some(0),
+            phase: JobPhase::Parked,
+        }
+    }
+
+    fn reaper_world(airport: &Airport, n: usize, job_for: impl Fn(usize) -> ScheduledJob) -> World {
+        let mut world = world_with(airport);
+        for i in 0..n {
+            let slot = world.free_ramp_slot(&airport.id).expect("free ramp slot");
+            let mut a = Aircraft::reaper(&format!("REAP{}", i + 1), airport, slot, job_for(i));
+            a.assign("Homelab");
+            world.add(a);
+        }
+        world
+    }
+
+    fn reaper<'a>(w: &'a World, cs: &str) -> &'a Aircraft {
+        w.iter().find(|a| a.callsign == cs).unwrap()
+    }
+
+    fn set_job(w: &mut World, cs: &str, f: impl FnOnce(&mut ScheduledJob)) {
+        f(w.get_mut(cs).unwrap().scheduled_job.as_mut().unwrap());
+    }
+
+    /// Tick at 20 Hz, steering every 3 s like the poller, until `done` holds.
+    /// Asserts motion stays continuous (no teleports) the whole way.
+    fn run_reapers(w: &mut World, now: &mut f32, t0: i64, secs: f32, done: impl Fn(&World) -> bool) -> bool {
+        const DT: f32 = 0.05;
+        let mut last: std::collections::HashMap<u64, [f32; 3]> =
+            w.iter().map(|a| (a.id, a.position)).collect();
+        for step in 0..(secs / DT) as usize {
+            if step % 60 == 0 {
+                w.steer_reapers(t0 + *now as i64);
+            }
+            w.tick(DT);
+            *now += DT;
+            for a in w.iter() {
+                if let Some(p) = last.get(&a.id) {
+                    let d = wrap_centered(a.position[0] - p[0]).hypot(wrap_centered(a.position[1] - p[1]));
+                    assert!(d < 4.0, "{} jumped {d} in one tick ({:?})", a.callsign, a.state);
+                }
+                last.insert(a.id, a.position);
+            }
+            if done(w) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn reaper_ramp_slots_stay_clear_of_gates_queue_and_runway() {
+        for airport in test_airports() {
+            let layout = airport.runway_layout();
+            let slots = layout.ramp_slots();
+            assert!(!slots.is_empty());
+            for (p, _) in &slots {
+                assert!(layout.on_ramp(*p), "{}: slot off ramp", airport.id);
+                for g in &airport.gates {
+                    assert!((p[0] - g[0]).hypot(p[1] - g[1]) > 18.0, "{}: ramp slot near gate", airport.id);
+                }
+                for (q, _) in TAXIWAY_QUEUE {
+                    assert!((p[0] - q[0]).hypot(p[1] - q[1]) > 30.0);
+                }
+                assert!((p[0] - layout.runway_x).abs() > 10.0, "{}: ramp on runway", airport.id);
+                assert!(p[1] < layout.end_z, "{}: ramp beside the runway", airport.id);
+            }
+            for (i, (a, _)) in slots.iter().enumerate() {
+                for (b, _) in &slots[i + 1..] {
+                    assert!((a[0] - b[0]).hypot(a[1] - b[1]) >= 20.0, "{}: ramp slots too close", airport.id);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reaper_full_lifecycle_from_ramp_to_sector_and_back() {
+        for airport in test_airports() {
+            let layout = airport.runway_layout();
+            let mut w = reaper_world(&airport, 1, |_| job(true, false, Some(3600), T0));
+            let slot = reaper(&w, "REAP1").ramp_slot().unwrap();
+            let mut now = 0.0;
+
+            // Enabled and idle: parked on the ramp, engines off.
+            w.steer_reapers(T0);
+            let a = reaper(&w, "REAP1");
+            assert_eq!(a.state, State::Parked);
+            assert_eq!(a.scheduled_job.as_ref().unwrap().phase, JobPhase::Parked);
+
+            // Due within two minutes: taxi out and hold short of the runway.
+            set_job(&mut w, "REAP1", |j| j.next_run_at = Some(crate::time::format_rfc3339(T0 + 90)));
+            let (hold, _) = layout.reaper_hold();
+            assert!(run_reapers(&mut w, &mut now, T0, 120.0, |w| reaper(w, "REAP1").state == State::Ready),
+                "{}: never reached the holding point", airport.id);
+            let a = reaper(&w, "REAP1");
+            assert!((a.position[0] - hold[0]).hypot(a.position[1] - hold[1]) < 0.5);
+            assert_eq!(a.scheduled_job.as_ref().unwrap().phase, JobPhase::HoldingShort);
+            assert!(!a.in_runway_sequence(), "holding short must not take the runway");
+
+            // Running: take the runway, climb out and loiter over the sector.
+            set_job(&mut w, "REAP1", |j| { j.running = true; j.last_run_status = "running".into(); });
+            assert!(run_reapers(&mut w, &mut now, T0, 120.0, |w| reaper(w, "REAP1").state == State::Takeoff));
+            let a = reaper(&w, "REAP1");
+            assert!((a.position[0] - layout.runway_x).abs() < 2.0, "{}: takeoff off the runway", airport.id);
+            assert!(run_reapers(&mut w, &mut now, T0, 300.0, |w| {
+                let a = reaper(w, "REAP1");
+                a.state == State::Cruising && !a.joining
+            }), "{}: never joined its loiter", airport.id);
+            run_reapers(&mut w, &mut now, T0, 30.0, |_| false);
+            let a = reaper(&w, "REAP1");
+            assert_eq!(a.scheduled_job.as_ref().unwrap().phase, JobPhase::OnStation);
+            let homelab = BASE_SECTORS.iter().find(|s| s.0 == "Homelab").unwrap();
+            let d = wrap_centered(a.position[0] - homelab.1[0]).hypot(wrap_centered(a.position[1] - homelab.1[1]));
+            assert!(d < homelab.2 * 1.3, "{}: loiter outside its sector ({d})", airport.id);
+            assert!((48.0..90.0).contains(&a.altitude), "{}: not at drone altitude", airport.id);
+
+            // Finished: approach, land and taxi back to the same ramp slot.
+            set_job(&mut w, "REAP1", |j| {
+                j.running = false;
+                j.last_run_status = "succeeded".into();
+                j.next_run_at = Some(crate::time::format_rfc3339(T0 + 3 * 3600));
+            });
+            assert!(run_reapers(&mut w, &mut now, T0, 30.0, |w| reaper(w, "REAP1").state == State::Landing));
+            assert_eq!(reaper(&w, "REAP1").scheduled_job.as_ref().unwrap().phase, JobPhase::Returning);
+            assert!(run_reapers(&mut w, &mut now, T0, 400.0, |w| reaper(w, "REAP1").state == State::Landed),
+                "{}: never touched down", airport.id);
+            assert!(run_reapers(&mut w, &mut now, T0, 300.0, |w| reaper(w, "REAP1").state == State::Parked),
+                "{}: never got back to the ramp", airport.id);
+            let a = reaper(&w, "REAP1");
+            assert!((a.position[0] - slot.0[0]).hypot(a.position[1] - slot.0[1]) < 0.5, "{}: wrong slot", airport.id);
+            assert!((a.heading - slot.1).sin().abs() < 0.05);
+            run_reapers(&mut w, &mut now, T0, 3.0, |_| false);
+            assert_eq!(reaper(&w, "REAP1").scheduled_job.as_ref().unwrap().phase, JobPhase::Parked);
+        }
+    }
+
+    #[test]
+    fn disabled_reaper_stays_parked_even_when_due() {
+        let home = Airport::home("local", "Tower");
+        let mut w = reaper_world(&home, 1, |_| job(false, false, Some(30), T0));
+        let mut now = 0.0;
+        run_reapers(&mut w, &mut now, T0, 20.0, |_| false);
+        let a = reaper(&w, "REAP1");
+        assert_eq!(a.state, State::Parked);
+        assert_eq!(a.scheduled_job.as_ref().unwrap().phase, JobPhase::Disabled);
+    }
+
+    #[test]
+    fn one_due_reaper_holds_short_per_airport_and_the_rest_wait_on_the_ramp() {
+        let home = Airport::home("local", "Tower");
+        let mut w = reaper_world(&home, 3, |i| job(true, false, Some(60 + i as i64 * 10), T0));
+        let mut now = 0.0;
+        run_reapers(&mut w, &mut now, T0, 50.0, |_| false);
+        let moving: Vec<_> = w.iter().filter(|a| a.state != State::Parked).map(|a| a.callsign.clone()).collect();
+        assert_eq!(moving, vec!["REAP1".to_string()], "only the soonest job taxis out");
+    }
+
+    #[test]
+    fn simultaneous_reaper_runs_take_turns_on_the_runway() {
+        let home = Airport::home("local", "Tower");
+        let mut w = reaper_world(&home, 3, |_| job(true, true, Some(600), T0));
+        let mut now = 0.0;
+        let mut airborne_order = Vec::new();
+        for _ in 0..(240.0 / 0.05) as usize {
+            run_reapers(&mut w, &mut now, T0, 0.05, |_| false);
+            let rolling: Vec<_> = w
+                .iter()
+                .filter(|a| a.state == State::Takeoff && a.altitude <= 0.0)
+                .collect();
+            assert!(rolling.len() <= 1, "two reapers rolling on the runway at once");
+            for a in w.iter() {
+                if a.altitude > 0.0 && !airborne_order.contains(&a.callsign) {
+                    airborne_order.push(a.callsign.clone());
+                }
+            }
+        }
+        assert_eq!(airborne_order.len(), 3, "every running job got airborne: {airborne_order:?}");
+    }
+
+    #[test]
+    fn reaper_ramp_capacity_is_bounded() {
+        for airport in test_airports() {
+            let mut w = world_with(&airport);
+            let cap = w.ramp_capacity(&airport.id);
+            for i in 0..cap {
+                let slot = w.free_ramp_slot(&airport.id).unwrap();
+                w.add(Aircraft::reaper(&format!("REAP{i}"), &airport, slot, job(true, false, None, T0)));
+            }
+            assert!(w.free_ramp_slot(&airport.id).is_none());
+        }
     }
 }

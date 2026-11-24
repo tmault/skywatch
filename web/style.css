@@ -789,3 +789,6 @@ button.tick-line.active {
     animation: none;
   }
 }
+
+#radio-hold-reason.reaper-details { white-space: pre-line; color: #c3b6f5; }
+#radio-hold-reason.reaper-failed { color: #ff8895; }

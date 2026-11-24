@@ -60,6 +60,13 @@ pub fn delta_json(snapshot: &WorldSnapshot) -> String {
 /// Handle a parsed client frame: log it, apply immediate world effects,
 /// forward it to the adapter channel.
 async fn handle_frame(state: &HubState, frame: ClientFrame) {
+    let aircraft_id = match &frame {
+        ClientFrame::Message { aircraft_id, .. } | ClientFrame::Approve { aircraft_id } => *aircraft_id,
+    };
+    if state.world.lock().await.aircraft.iter()
+        .any(|a| a.id == aircraft_id && a.scheduled_job.is_some()) {
+        return;
+    }
     match &frame {
         ClientFrame::Message { aircraft_id, text } => {
             tracing::info!(aircraft_id, text, "client message");
@@ -71,7 +78,12 @@ async fn handle_frame(state: &HubState, frame: ClientFrame) {
             if let Some(a) = world
                 .aircraft
                 .iter_mut()
-                .find(|a| a.id == *aircraft_id && a.state == AircraftState::Holding)
+                // Scheduled-job Reapers are read-only: approval never touches them.
+                .find(|a| {
+                    a.id == *aircraft_id
+                        && a.state == AircraftState::Holding
+                        && a.scheduled_job.is_none()
+                })
             {
                 tracing::info!(aircraft_id, callsign = %a.callsign, "releasing holding aircraft");
                 a.release();
@@ -145,6 +157,26 @@ async fn handle_socket(socket: WebSocket, state: HubState) {
 mod tests {
     use super::*;
     use crate::world::{Aircraft, Kind};
+
+    #[tokio::test]
+    async fn scheduled_jobs_ignore_messages_and_approvals_before_forwarding() {
+        let mut w = World::new();
+        let mut a = Aircraft::new("REAP1", Kind::Drone);
+        a.hold("last scheduled run failed");
+        a.scheduled_job = Some(crate::world::ScheduledJob::default());
+        let id = a.id;
+        w.add(a);
+        let world = Arc::new(Mutex::new(w));
+        let (deltas, _) = broadcast::channel(8);
+        let (adapter_tx, mut adapter_rx) = mpsc::channel(8);
+        let state = HubState { world: Arc::clone(&world), deltas, adapter_tx };
+        handle_frame(&state, ClientFrame::Approve { aircraft_id: id }).await;
+        handle_frame(&state, ClientFrame::Message { aircraft_id: id, text: "Anon message".into() }).await;
+        assert!(adapter_rx.try_recv().is_err());
+        let w = world.lock().await;
+        assert_eq!(w.aircraft[0].state, AircraftState::Holding);
+        assert_eq!(w.aircraft[0].hold_reason.as_deref(), Some("last scheduled run failed"));
+    }
 
     #[tokio::test]
     async fn approve_releases_holding_aircraft_and_forwards_frame() {
