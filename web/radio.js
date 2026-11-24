@@ -54,6 +54,7 @@ export function openRadio(aircraft) {
   selectedId = aircraft.id;
   render(aircraft);
   panel.hidden = false;
+  document.getElementById('app')?.classList.add('radio-open');
   // Do not steal keyboard focus: arrow keys must keep orbiting the camera.
   // Enter (handled in main.js) or a click focuses the message field.
 }
@@ -71,6 +72,7 @@ export function closeRadio(note) {
   const wasOpen = selectedId !== null;
   selectedId = null;
   panel.hidden = true;
+  document.getElementById('app')?.classList.remove('radio-open');
   if (wasOpen && onClose) onClose();
 }
 
