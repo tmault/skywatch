@@ -196,9 +196,6 @@ pub struct Aircraft {
     /// Current taxi speed (m/s) for bounded acceleration and braking.
     #[serde(skip)]
     ground_speed: f32,
-    /// Set by `World::tick` while ground traffic ahead is within `GROUND_SEP`.
-    #[serde(skip)]
-    ground_blocked: bool,
     /// Set by `World::tick` for arrivals on final while another aircraft uses the runway.
     #[serde(skip)]
     runway_occupied: bool,
@@ -327,7 +324,8 @@ const TAXI_SPEED: f32 = 6.0; // m/s on the ground
 const DEPARTURE_TAXI_SPEED: f32 = 14.0; // brisk taxi out for farewell departures
 const GROUND_ACCEL: f32 = 4.0; // m/s^2 taxi acceleration
 const GROUND_BRAKE: f32 = 6.0; // m/s^2 taxi braking
-const GROUND_SEP: f32 = 14.0; // minimum spacing between ground aircraft
+#[cfg(test)]
+const GROUND_SEP: f32 = 14.0; // spacing the departure hold slots keep between queued aircraft
 const TAXI_DELAY_AFTER_LANDING: f32 = 5.0; // s rolled out on runway, then taxi
 const HOLD_SHORT_TIME: f32 = 4.0; // s lined up before rolling
 /// Altitude at which a climbing aircraft turns toward its sector.
@@ -580,7 +578,6 @@ impl Aircraft {
             ground_timer: 0.0,
             must_clear_runway: false,
             ground_speed: 0.0,
-            ground_blocked: false,
             runway_occupied: false,
             avoid_side: 0.0,
             prev_alt: alt,
@@ -1309,7 +1306,8 @@ impl Aircraft {
                     .map(|w| (w[0] - self.position[0]).hypot(w[1] - self.position[1]))
                     .unwrap_or(0.0);
                 let v_arrive = (2.0 * GROUND_BRAKE * dist_to_wp).sqrt();
-                let want = if self.ground_blocked { 0.0 } else { v_max.min(v_arrive) };
+                // Ground traffic drives through each other: no blocking, so no taxi deadlocks.
+                let want = v_max.min(v_arrive);
                 self.ground_speed += (want - self.ground_speed)
                     .clamp(-GROUND_BRAKE * dt, GROUND_ACCEL * dt);
                 if self.ground_speed < 0.05 {
@@ -1787,38 +1785,6 @@ impl World {
                 a.taxi_waypoints.push([TAXIWAY_X, dest[1]]);
                 a.taxi_waypoints.push(dest);
             }
-        }
-
-        // Only traffic ahead along the current leg blocks a taxi. At near
-        // coincidence the lower id proceeds, independent of iteration order.
-        let ground_pos: Vec<([f32; 2], u64)> = self
-            .aircraft
-            .iter()
-            .filter(|a| a.parent_id.is_none() && a.altitude <= 0.0)
-            .map(|a| ([a.position[0], a.position[1]], a.id))
-            .collect();
-        for a in &mut self.aircraft {
-            let direction = a.taxi_waypoints.iter().find_map(|w| {
-                let dx = w[0] - a.position[0];
-                let dz = w[1] - a.position[1];
-                let distance = dx.hypot(dz);
-                (distance > 0.01).then_some([dx / distance, dz / distance])
-            });
-            a.ground_blocked = a.state == State::Taxi
-                && ground_pos.iter().any(|(p, id)| {
-                    let dx = p[0] - a.position[0];
-                    let dz = p[1] - a.position[1];
-                    let distance = dx.hypot(dz);
-                    *id != a.id
-                        && distance < GROUND_SEP
-                        && if distance < 1.0 {
-                            *id < a.id
-                        } else {
-                            direction
-                                .map(|d| dx * d[0] + dz * d[1] > 0.01)
-                                .unwrap_or(false)
-                        }
-                });
         }
 
         // One runway operation at a time: drop a stale grant, keep the departure
