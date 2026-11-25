@@ -1257,21 +1257,27 @@ impl Aircraft {
         self.refuel_connected = false;
         self.refuel_slot = None;
         self.refuel_reset_at = None;
-        self.cleared_for_takeoff = true;
         self.arrival_slot = None;
         self.exiting_runway = false;
         match self.state {
             // On the ground: taxi to the runway threshold, hold short, then roll.
             State::Parked | State::Landed | State::Taxi | State::Ready => {
-                self.must_clear_runway = false;
+                // Keep `must_clear_runway` set if releasing a genuinely landed
+                // (or already runway-backtracking) aircraft so `occupies_runway()`
+                // keeps protecting the runway until it reaches the threshold.
+                let preserve_runway_protection =
+                    matches!(self.state, State::Landed | State::Taxi) && self.must_clear_runway;
                 let thresh = self.airport_layout.threshold;
                 let d = (self.position[0] - thresh[0]).hypot(self.position[1] - thresh[1]);
+                self.cleared_for_takeoff = true;
                 self.speed = 0.0;
                 if d < 6.0 {
+                    self.must_clear_runway = false;
                     self.state = State::Ready;
                     self.heading = RUNWAY_HEADING;
                     self.ground_timer = 0.0;
                 } else {
+                    self.must_clear_runway = preserve_runway_protection;
                     self.route_to_runway(State::Ready);
                 }
             }
@@ -1282,7 +1288,10 @@ impl Aircraft {
                 self.joining = true;
             }
             // Airborne hold: climb straight out, then join continuously.
-            _ => self.state = State::Takeoff,
+            _ => {
+                self.cleared_for_takeoff = false;
+                self.state = State::Takeoff;
+            }
         }
     }
 
@@ -1423,8 +1432,9 @@ impl Aircraft {
                     && cur[1] <= layout.threshold[1] + 6.0
                     && cur[1] >= layout.end_z - 6.0;
 
-                if dist_to_thresh < 6.0 || on_runway {
-                    // Already lined up or on the runway: roll straight north for takeoff.
+                if on_runway && dist_to_thresh >= 6.0 && self.state == State::Landed {
+                    // Already occupying the runway mid-deck: roll straight off for takeoff.
+                    self.must_clear_runway = false;
                     self.state = State::Departing;
                     self.heading = RUNWAY_HEADING;
                     self.altitude = 0.0;
@@ -1434,9 +1444,42 @@ impl Aircraft {
                     return;
                 }
 
-                // Route cleanly along the airport's apron lane / taxiway to its runway threshold.
-                self.route_to_runway(State::Departing);
+                // Route through the airport's departure queue and runway arbitration
+                // so farewell departures never roll onto an occupied runway.
+                let preserve_runway_protection =
+                    matches!(self.state, State::Landed | State::Taxi) && self.must_clear_runway;
+                self.cleared_for_takeoff = true;
+                if dist_to_thresh < 6.0 {
+                    self.must_clear_runway = false;
+                    self.state = State::Ready;
+                    self.heading = RUNWAY_HEADING;
+                    self.altitude = 0.0;
+                    self.position[2] = 0.0;
+                    self.ground_timer = HOLD_SHORT_TIME;
+                    self.speed = 0.0;
+                } else {
+                    self.must_clear_runway = preserve_runway_protection;
+                    self.route_to_runway(State::Ready);
+                }
             }
+        }
+    }
+
+    /// Cancel an in-progress farewell departure before the aircraft despawns
+    /// (for example when a user unsettles/reopens a thread).
+    pub fn cancel_departure(&mut self) {
+        self.departing_forever = false;
+        self.departure_heading = None;
+        self.cleared_for_takeoff = false;
+        if self.state == State::Departing {
+            self.state = if self.altitude > 0.0 {
+                State::Cruising
+            } else {
+                State::Takeoff
+            };
+            self.joining = self.altitude > 0.0;
+        } else if self.state == State::Taxi && self.taxi_next == Some(State::Departing) {
+            self.taxi_next = Some(State::Ready);
         }
     }
 
@@ -1448,7 +1491,7 @@ impl Aircraft {
 
     /// Advance the simulation by `dt` seconds using the current world sectors.
     pub fn tick_with_sectors(&mut self, dt: f32, sectors: &[Sector]) {
-        if self.kind == Kind::Tanker && self.state == State::Cruising {
+        if self.kind == Kind::Tanker && matches!(self.state, State::Cruising | State::Refueling) {
             // Provider aerial refuelling tanker: smooth, stately elliptical track
             // high above all airspace zones, never wrapping across map edges.
             let key = self.refuel_scope.as_deref().unwrap_or("generic");
@@ -1500,6 +1543,8 @@ impl Aircraft {
                 self.position[2] = self.altitude;
             }
             State::Cruising => {
+                // Never carry a previous holding orbit center across cruise legs.
+                self.orbit_center = None;
                 let base_alt = self.cruise_altitude();
 
                 if let Some(topic) = &self.topic {
@@ -1678,6 +1723,7 @@ impl Aircraft {
                     // Stationary: transition only when the route is exhausted.
                     if self.taxi_waypoints.is_empty() {
                         self.state = self.taxi_next.take().unwrap_or(State::Parked);
+                        self.must_clear_runway = false;
                         self.ground_timer = 0.0;
                         if let Some(h) = self.settle_heading() {
                             self.heading = h;
@@ -1698,6 +1744,7 @@ impl Aircraft {
                 while rem > 0.0 {
                     let Some(&target) = self.taxi_waypoints.first() else {
                         self.state = self.taxi_next.take().unwrap_or(State::Parked);
+                        self.must_clear_runway = false;
                         if self.state == State::Departing {
                             self.heading = RUNWAY_HEADING;
                             self.ground_timer = 0.0;
@@ -1715,6 +1762,7 @@ impl Aircraft {
                         self.taxi_waypoints.remove(0);
                         if self.taxi_waypoints.is_empty() {
                             self.state = self.taxi_next.take().unwrap_or(State::Parked);
+                            self.must_clear_runway = false;
                             self.ground_timer = 0.0;
                             if let Some(h) = self.settle_heading() {
                                 self.heading = h;
@@ -1741,15 +1789,21 @@ impl Aircraft {
             State::Ready => {
                 self.altitude = 0.0;
                 self.position[2] = 0.0;
-                // Only roll onto takeoff when explicitly cleared via `release()`;
-                // planes queued on the taxiway wait here until awakened.
+                // Only roll onto takeoff when explicitly cleared via `release()` or
+                // `depart()`; planes queued on the taxiway wait here until awakened.
                 if self.cleared_for_takeoff && !self.runway_hold {
                     self.ground_timer += dt;
-                    if self.ground_timer >= HOLD_SHORT_TIME {
+                    if self.ground_timer >= HOLD_SHORT_TIME || self.departing_forever {
                         self.cleared_for_takeoff = false;
-                        self.state = State::Takeoff;
                         self.heading = RUNWAY_HEADING;
-                        self.speed = 0.0;
+                        if self.departing_forever {
+                            self.state = State::Departing;
+                            self.ground_timer = 0.0;
+                            self.speed = 6.0;
+                        } else {
+                            self.state = State::Takeoff;
+                            self.speed = 0.0;
+                        }
                     }
                 }
             }
@@ -1770,6 +1824,7 @@ impl Aircraft {
                     self.altitude += self.climb_rate() * dt;
                     self.advance(dt);
                     if self.altitude >= CLIMB_OUT_ALT {
+                        self.cleared_for_takeoff = false;
                         self.state = State::Cruising;
                         self.joining = true;
                     }
@@ -4325,5 +4380,167 @@ mod tests {
             }
             assert!(w.free_ramp_slot(&airport.id).is_none());
         }
+    }
+
+    // ----------------------------------------- TLA+ model-checked regressions
+
+    #[test]
+    fn tankers_fly_elliptical_orbit_at_assigned_flight_levels() {
+        let mut world = World::new();
+        for (cs, model) in [("R1", "claude-opus-5-5"), ("R2", "gpt-6.1-sol")] {
+            let mut a = Aircraft::with_model(cs, Kind::Agent, ModelClass::Frontier);
+            a.model = Some(model.into());
+            a.refuel("quota reached", None);
+            world.add(a);
+        }
+        world.sync_tankers();
+        let initial_headings: Vec<f32> = world
+            .iter()
+            .filter(|a| a.kind == Kind::Tanker)
+            .map(|a| a.heading)
+            .collect();
+        assert_eq!(initial_headings.len(), 2);
+
+        for _ in 0..400 {
+            world.tick(0.05);
+        }
+        let tankers: Vec<&Aircraft> = world.iter().filter(|a| a.kind == Kind::Tanker).collect();
+        assert_eq!(tankers.len(), 2);
+        // Must turn along their elliptical orbits (not fly straight) and stay vertically separated.
+        assert!(
+            tankers
+                .iter()
+                .zip(&initial_headings)
+                .all(|(t, h)| (t.heading - h).sin().abs() > 0.05),
+            "tankers flew straight instead of orbiting elliptically"
+        );
+        let alt_gap = (tankers[0].altitude - tankers[1].altitude).abs();
+        assert!(
+            alt_gap >= TANKER_ALT_STEP - 2.0,
+            "tankers collapsed in altitude: {} vs {}",
+            tankers[0].altitude,
+            tankers[1].altitude
+        );
+        for t in &tankers {
+            assert!(
+                t.altitude >= TANKER_BASE_ALTITUDE - 2.0,
+                "tanker sank to fallback altitude: {}",
+                t.altitude
+            );
+        }
+    }
+
+    #[test]
+    fn landed_aircraft_released_on_runway_still_occupies_runway_while_backtracking() {
+        let mut a = Aircraft::with_model("ARR1", Kind::Agent, ModelClass::Frontier);
+        a.state = State::Landed;
+        a.must_clear_runway = true;
+        a.position = [RUNWAY_THRESHOLD[0], RUNWAY_EXIT_Z, 0.0];
+        a.altitude = 0.0;
+        a.arrival_slot = Some(TAXIWAY_QUEUE[0]);
+
+        a.go_around();
+        assert_eq!(a.state, State::Taxi);
+        assert!(
+            a.occupies_runway(),
+            "aircraft backtracking down runway centerline after Landed -> go_around must occupy runway"
+        );
+    }
+
+    #[test]
+    fn farewell_departures_obey_runway_mutual_exclusion() {
+        let mut world = World::new();
+        for (i, pos) in [HOME_GATES[0], HOME_GATES[1]].into_iter().enumerate() {
+            let mut a = Aircraft::with_model(&format!("DEP{i}"), Kind::Agent, ModelClass::Frontier);
+            a.state = State::Parked;
+            a.position = [pos[0], pos[1], 0.0];
+            a.altitude = 0.0;
+            a.depart();
+            world.add(a);
+        }
+
+        for step in 0..2000 {
+            world.tick(0.05);
+            let rolling = world
+                .iter()
+                .filter(|a| matches!(a.state, State::Departing | State::Takeoff) && a.altitude <= 0.0)
+                .count();
+            assert!(
+                rolling <= 1,
+                "runway incursion at tick {step}: {rolling} aircraft rolling simultaneously"
+            );
+            if world.aircraft.is_empty() {
+                break;
+            }
+        }
+        assert!(world.aircraft.is_empty(), "both farewell departures must eventually despawn");
+    }
+
+    #[test]
+    fn airborne_hold_release_does_not_leak_takeoff_clearance_into_cruise() {
+        let mut a = Aircraft::with_model("SKY1", Kind::Agent, ModelClass::Frontier);
+        a.position = [0.0, 0.0, 150.0];
+        a.altitude = 150.0;
+        a.hold("awaiting approval");
+        a.release();
+        assert!(!a.cleared_for_takeoff, "airborne release must not set ground takeoff clearance");
+        a.tick(0.1);
+        assert_eq!(a.state, State::Cruising);
+        assert!(!a.cleared_for_takeoff);
+    }
+
+    #[test]
+    fn restored_taxiing_reaper_never_transitions_to_departing_and_despawns() {
+        let home = Airport::home("local", "Tower");
+        let mut w = reaper_world(&home, 1, |_| job(true, true, Some(600), T0));
+        let slot = reaper(&w, "REAP1").ramp_slot().unwrap();
+        w.steer_reapers(T0);
+        assert_eq!(reaper(&w, "REAP1").state, State::Taxi);
+        assert!(reaper(&w, "REAP1").in_runway_sequence());
+
+        // Retire while taxiing out, then restore before it leaves the ground
+        // (matching `scheduled::apply_jobs`, which restores `scheduled_job`).
+        w.get_mut("REAP1").unwrap().retire_job();
+        {
+            let a = w.get_mut("REAP1").unwrap();
+            a.restore_reaper(slot);
+            a.scheduled_job = Some(job(true, false, Some(60), T0));
+        }
+        let mut now = 0.0;
+        run_reapers(&mut w, &mut now, T0, 90.0, |_| false);
+        let a = w.iter().find(|a| a.callsign == "REAP1").expect("restored reaper despawned!");
+        assert_ne!(a.state, State::Departing);
+        assert!(!a.is_departing());
+    }
+
+    #[test]
+    fn short_reaper_job_finishing_before_liftoff_aborts_or_keeps_launching_phase() {
+        let home = Airport::home("local", "Tower");
+        let mut w = reaper_world(&home, 1, |_| job(true, true, Some(600), T0));
+        w.steer_reapers(T0);
+        assert_eq!(reaper(&w, "REAP1").state, State::Taxi);
+        assert!(reaper(&w, "REAP1").cleared_for_takeoff);
+
+        // Job finishes while still taxiing out: must abort clearance and return to ramp.
+        set_job(&mut w, "REAP1", |j| {
+            j.running = false;
+            j.last_run_status = "succeeded".into();
+            j.next_run_at = Some(crate::time::format_rfc3339(T0 + 3600));
+        });
+        w.steer_reapers(T0 + 3);
+        let a = reaper(&w, "REAP1");
+        assert!(!a.cleared_for_takeoff, "short job finish must cancel takeoff clearance while taxiing");
+        assert_eq!(a.taxi_next, Some(State::Parked));
+
+        // If already on the takeoff roll (alt == 0), phase stays Launching rather than Returning.
+        let a = w.get_mut("REAP1").unwrap();
+        a.state = State::Takeoff;
+        a.altitude = 0.0;
+        w.steer_reapers(T0 + 6);
+        assert_eq!(
+            reaper(&w, "REAP1").scheduled_job.as_ref().unwrap().phase,
+            JobPhase::Launching,
+            "ground takeoff roll must not report Returning"
+        );
     }
 }

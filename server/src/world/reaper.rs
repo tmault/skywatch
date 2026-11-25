@@ -304,8 +304,17 @@ impl Aircraft {
         self.departing_forever = false;
         self.departure_heading = None;
         if self.state == State::Departing {
+            self.cleared_for_takeoff = false;
             self.state = if self.altitude > 0.0 { State::Cruising } else { State::Takeoff };
             self.joining = self.altitude > 0.0;
+        } else if matches!(self.state, State::Taxi | State::Ready)
+            && (self.taxi_next == Some(State::Departing) || self.cleared_for_takeoff)
+        {
+            // Abort a ground farewell departure and route back to the ramp slot;
+            // `steer_job` may redirect to `Fly` or `HoldShort` right after.
+            let here = [self.position[0], self.position[1]];
+            let route = self.airport_layout.ramp_return_route(here, slot.0);
+            self.taxi_route(route, State::Parked, slot.1);
         }
     }
 
@@ -387,9 +396,12 @@ impl Aircraft {
                     self.begin_approach(Some(slot));
                 }
                 State::Ready | State::Taxi
-                    if !self.cleared_for_takeoff && !self.exiting_runway && self.arrival_slot.is_none() =>
+                    if !self.exiting_runway && self.arrival_slot.is_none() =>
                 {
-                    let homing = self.taxi_next == Some(State::Parked)
+                    // Even if already cleared for takeoff (short job finished before
+                    // liftoff), cancel the launch clearance and return to the ramp.
+                    let homing = !self.cleared_for_takeoff
+                        && self.taxi_next == Some(State::Parked)
                         && self.taxi_destination().is_some_and(|d| (d[0] - slot.0[0]).hypot(d[1] - slot.0[1]) < 1.0);
                     if !homing {
                         self.taxi_route(layout.ramp_return_route(here, slot.0), State::Parked, slot.1);
@@ -412,6 +424,7 @@ impl Aircraft {
         let target = self.job_target;
         let state = self.state;
         let airborne = self.airborne();
+        let rolling_for_takeoff = state == State::Takeoff && !airborne;
         let taxiing_out = state == State::Taxi
             && self.taxi_next == Some(State::Ready)
             && !self.exiting_runway
@@ -420,6 +433,7 @@ impl Aircraft {
         job.phase = match target {
             JobTarget::Fly if airborne => JobPhase::OnStation,
             JobTarget::Fly => JobPhase::Launching,
+            _ if rolling_for_takeoff => JobPhase::Launching,
             JobTarget::HoldShort if state == State::Ready => JobPhase::HoldingShort,
             JobTarget::HoldShort if state == State::Parked => {
                 if job.enabled { JobPhase::Parked } else { JobPhase::Disabled }

@@ -416,10 +416,13 @@ impl GateCallsigns {
 }
 
 /// Threads whose aircraft is flying an approach to land and backtrack to the
-/// taxiway queue: thread id -> airborne callsign (SKYn).
+/// taxiway queue (or gate): thread id -> callsign. Also tracks threads currently
+/// on a farewell departure so reopening/unsettling one reclaims the airframe
+/// instead of spawning a duplicate.
 #[derive(Default)]
 struct RunwayOps {
     arrivals: HashMap<String, String>,
+    departing: HashMap<String, String>,
     /// False until the first poll is applied: threads already running at
     /// startup appear in the air rather than all queueing for takeoff at once.
     primed: bool,
@@ -1356,6 +1359,9 @@ fn apply_poll(
         new_threads.push((entry.thread_id.clone(), entry.title.clone(), mc));
     }
 
+    // Prune departing callsigns that have already vanished past the horizon.
+    runway.departing.retain(|_, cs| world.get_mut(cs).is_some());
+
     // A thread that starts working again mid-arrival goes around and keeps its callsign.
     let resumed: Vec<(String, String)> = runway
         .arrivals
@@ -1368,6 +1374,27 @@ fn apply_poll(
         if let Some(a) = world.get_mut(&cs) {
             a.go_around();
             callsigns.by_thread.insert(id.clone(), cs);
+            new_threads.retain(|(tid, _, _)| *tid != id);
+        }
+    }
+
+    // A settled/archived thread reopened before its departing airframe despawned
+    // reclaims that airframe instead of spawning a duplicate.
+    let revived_flying: Vec<(String, String)> = runway
+        .departing
+        .iter()
+        .filter(|(id, _)| keep.contains_key(*id))
+        .map(|(id, cs)| (id.clone(), cs.clone()))
+        .collect();
+    for (id, old_cs) in revived_flying {
+        runway.departing.remove(&id);
+        let new_cs = callsigns.get(&id);
+        let _ = world.rename(&old_cs, &new_cs);
+        if let Some(a) = world.get_mut(&new_cs) {
+            a.cancel_departure();
+            if a.altitude <= 0.0 && matches!(a.state, State::Taxi | State::Ready | State::Parked) {
+                a.release();
+            }
             new_threads.retain(|(tid, _, _)| *tid != id);
         }
     }
@@ -1421,7 +1448,9 @@ fn apply_poll(
                 }
             }
             if !all_active_ids.contains(&id) && data.done_or_archived.contains(&id) {
-                world.depart_by_callsign(&cs);
+                if world.depart_by_callsign(&cs) {
+                    runway.departing.insert(id, cs.clone());
+                }
                 radio_events.push((cs, "thread done — departing into the horizon".to_string()));
             } else if runway.primed && taxi_ids.contains(&id) {
                 // Park where this thread sits on the taxiway: its home queue
@@ -1483,6 +1512,8 @@ fn apply_poll(
                             .unwrap_or("usage limit reached — waiting for tokens"),
                         info.reset_at.clone(),
                     );
+                } else if info.state == State::Holding {
+                    a.hold(info.reason.as_deref().unwrap_or("holding"));
                 } else {
                     if a.state == State::Refueling && info.state == State::Cruising {
                         a.release();
@@ -1586,7 +1617,9 @@ fn apply_poll(
                 }
             }
             if !all_active_ids.contains(&id) && data.done_or_archived.contains(&id) {
-                world.depart_by_callsign(&cs);
+                if world.depart_by_callsign(&cs) {
+                    runway.departing.insert(id, cs.clone());
+                }
                 radio_events.push((
                     cs,
                     "thread done — taxiing to Runway 36 for final departure".to_string(),
@@ -1600,6 +1633,21 @@ fn apply_poll(
 
     for (i, entry) in data.taxiway.iter().enumerate() {
         let cs = taxiway_cs.get(&entry.thread_id);
+        let owning_ap = airport_for_key(&world.airports, &entry.thread_id).cloned();
+        let (slot_pos, slot_hdg) = taxiway_slot(&data.taxiway, i, &world.airports, gates);
+        if let Some(dcs) = runway.departing.remove(&entry.thread_id) {
+            if let Some(a) = world.get_mut(&dcs) {
+                a.cancel_departure();
+                if a.altitude > 0.0 {
+                    if a.begin_approach(Some((slot_pos, slot_hdg))) {
+                        runway.arrivals.insert(entry.thread_id.clone(), dcs);
+                        continue;
+                    }
+                } else {
+                    let _ = world.rename(&dcs, &cs);
+                }
+            }
+        }
         if let Some(acs) = runway.arrivals.get(&entry.thread_id).cloned() {
             let arrived = world
                 .get_mut(&acs)
@@ -1618,8 +1666,6 @@ fn apply_poll(
             }
             runway.arrivals.remove(&entry.thread_id);
         }
-        let owning_ap = airport_for_key(&world.airports, &entry.thread_id).cloned();
-        let (slot_pos, slot_hdg) = taxiway_slot(&data.taxiway, i, &world.airports, gates);
         let (_, reason) = entry_flight_state(entry);
         let (zone, _) = classify_zone(entry.project.as_deref(), &entry.title);
         if let Some(a) = world.get_mut(&cs) {
@@ -1662,17 +1708,22 @@ fn apply_poll(
         }
     }
 
-    // Arrivals whose thread left the taxiway pool (archived, gone stale) mid-landing.
+    // --- Extended Terminal Gates: threads parked at gates (>24h or home overflow) ---
+    let stale_ids: HashSet<String> = data.stale.iter().map(|e| e.thread_id.clone()).collect();
+
+    // Arrivals whose thread left both taxiway and stale pools (archived or omitted) mid-landing.
     let orphaned: Vec<(String, String)> = runway
         .arrivals
         .iter()
-        .filter(|(id, _)| !taxi_ids.contains(*id))
+        .filter(|(id, _)| !taxi_ids.contains(*id) && !stale_ids.contains(*id))
         .map(|(id, cs)| (id.clone(), cs.clone()))
         .collect();
     for (id, cs) in orphaned {
         if data.done_or_archived.contains(&id) {
             runway.arrivals.remove(&id);
-            world.depart_by_callsign(&cs);
+            if world.depart_by_callsign(&cs) {
+                runway.departing.insert(id, cs);
+            }
         } else if world
             .get_mut(&cs)
             .map(|a| a.state == State::Ready)
@@ -1683,8 +1734,6 @@ fn apply_poll(
         }
     }
 
-    // --- Extended Terminal Gates: threads parked at gates (>24h or home overflow) ---
-    let stale_ids: HashSet<String> = data.stale.iter().map(|e| e.thread_id.clone()).collect();
     let gate_drop: Vec<String> = gates
         .by_thread
         .keys()
@@ -1699,7 +1748,9 @@ fn apply_poll(
                 }
             }
             if !all_active_ids.contains(&id) && data.done_or_archived.contains(&id) {
-                world.depart_by_callsign(&cs);
+                if world.depart_by_callsign(&cs) {
+                    runway.departing.insert(id, cs.clone());
+                }
                 radio_events.push((
                     cs,
                     "thread archived — pushing back for final departure".to_string(),
@@ -1716,6 +1767,39 @@ fn apply_poll(
         let gate_index = gates.slots.get(&entry.thread_id).copied().unwrap_or(0);
         let owning_ap = airport_for_key(&world.airports, &entry.thread_id).cloned();
         let (slot, _) = slot_position(&entry.thread_id, gate_index, &world.airports, false);
+        if let Some(dcs) = runway.departing.remove(&entry.thread_id) {
+            if let Some(a) = world.get_mut(&dcs) {
+                a.cancel_departure();
+                if a.altitude > 0.0 {
+                    if a.begin_approach(Some((slot, GATE_HEADING))) {
+                        runway.arrivals.insert(entry.thread_id.clone(), dcs);
+                        continue;
+                    }
+                } else {
+                    let _ = world.rename(&dcs, &cs);
+                }
+            }
+        }
+        if let Some(acs) = runway.arrivals.get(&entry.thread_id).cloned() {
+            let arrived = world.get_mut(&acs).map(|a| {
+                if matches!(a.state, State::Landing | State::Landed) {
+                    a.set_arrival_slot(Some((slot, GATE_HEADING)));
+                }
+                matches!(a.state, State::Ready | State::Parked) && a.arrival_slot().is_some()
+            });
+            match arrived {
+                // Still landing or taxiing in: wait and rename to GT once on the ground.
+                Some(false) => continue,
+                Some(true) => {
+                    world.rename(&acs, &cs);
+                    if let Some(a) = world.get_mut(&cs) {
+                        a.set_arrival_slot(None);
+                    }
+                }
+                None => {}
+            }
+            runway.arrivals.remove(&entry.thread_id);
+        }
         if let Some(a) = world.get_mut(&cs) {
             if let Some(ap) = &owning_ap {
                 a.set_airport(ap);
@@ -3639,5 +3723,189 @@ mod tests {
         let a = reaper_by_title(&world, "anon-backup.timer");
         assert_eq!(a.scheduled_job.as_ref().unwrap().schedule, "systemd timer");
         assert!(a.chat_links.is_none());
+    }
+
+    #[test]
+    fn reentering_hold_after_cruising_away_does_not_teleport_to_old_orbit() {
+        let mut world = World::new();
+        let (mut sky, mut taxi, mut gates, mut wing, mut runway) = (
+            Callsigns::default(),
+            TaxiwayCallsigns::default(),
+            GateCallsigns::default(),
+            Wingmen::default(),
+            RunwayOps::default(),
+        );
+        let poll = |status: &str| PollData {
+            omitted: 0,
+            local_environment_id: None,
+            airports: vec![Airport::home("local", "omarchy")],
+            flying: vec![(make_entry("t-hold", "Hold Test", status), 0)],
+            taxiway: vec![],
+            stale: vec![],
+            done_or_archived: HashSet::new(),
+            subagents: vec![],
+        };
+
+        // Hold #1 at [-200, -200].
+        apply_poll(&mut world, "omarchy", poll("waiting"), &mut sky, &mut taxi, &mut gates, &mut wing, &mut runway);
+        {
+            let a = world.get_mut("SKY1").unwrap();
+            a.position = [-200.0, -200.0, 150.0];
+            a.altitude = 150.0;
+        }
+        world.tick(0.05); // derives orbit_center around [-200, -200]
+
+        // Resume cruising and fly far away to [200, 200].
+        apply_poll(&mut world, "omarchy", poll("running"), &mut sky, &mut taxi, &mut gates, &mut wing, &mut runway);
+        {
+            let a = world.get_mut("SKY1").unwrap();
+            a.position = [200.0, 200.0, 150.0];
+            a.altitude = 150.0;
+        }
+        world.tick(0.05);
+        let before = world.get_mut("SKY1").unwrap().position;
+
+        // Re-enter Holding via apply_poll: must orbit near [200, 200], never snap back to [-200, -200].
+        apply_poll(&mut world, "omarchy", poll("waiting"), &mut sky, &mut taxi, &mut gates, &mut wing, &mut runway);
+        world.tick(0.05);
+        let after = world.get_mut("SKY1").unwrap().position;
+        let jump = wrap_centered(after[0] - before[0]).hypot(wrap_centered(after[1] - before[1]));
+        assert!(jump < 5.0, "re-entering hold teleported aircraft by {jump} units ({before:?} -> {after:?})");
+    }
+
+    #[test]
+    fn landing_thread_moving_to_stale_pool_does_not_spawn_duplicate_aircraft() {
+        let mut world = World::new();
+        let (mut sky, mut taxi, mut gates, mut wing, mut runway) = (
+            Callsigns::default(),
+            TaxiwayCallsigns::default(),
+            GateCallsigns::default(),
+            Wingmen::default(),
+            RunwayOps::default(),
+        );
+        // Poll 1: flying.
+        apply_poll(
+            &mut world,
+            "omarchy",
+            PollData {
+                omitted: 0,
+                local_environment_id: None,
+                airports: vec![Airport::home("local", "omarchy")],
+                flying: vec![(make_entry("t-dup", "Arrival", "running"), 0)],
+                taxiway: vec![],
+                stale: vec![],
+                done_or_archived: HashSet::new(),
+                subagents: vec![],
+            },
+            &mut sky, &mut taxi, &mut gates, &mut wing, &mut runway,
+        );
+        // Poll 2: stops -> enters taxiway and begins Landing as SKY1.
+        apply_poll(
+            &mut world,
+            "omarchy",
+            PollData {
+                omitted: 0,
+                local_environment_id: None,
+                airports: vec![Airport::home("local", "omarchy")],
+                flying: vec![],
+                taxiway: vec![make_entry("t-dup", "Arrival", "completed")],
+                stale: vec![],
+                done_or_archived: HashSet::new(),
+                subagents: vec![],
+            },
+            &mut sky, &mut taxi, &mut gates, &mut wing, &mut runway,
+        );
+        assert_eq!(world.aircraft.len(), 1);
+        assert_eq!(world.get_mut("SKY1").unwrap().state, State::Landing);
+
+        // Poll 3: pushed into stale pool while still Landing -> must NOT spawn GT1 alongside SKY1!
+        apply_poll(
+            &mut world,
+            "omarchy",
+            PollData {
+                omitted: 0,
+                local_environment_id: None,
+                airports: vec![Airport::home("local", "omarchy")],
+                flying: vec![],
+                taxiway: vec![],
+                stale: vec![make_entry("t-dup", "Arrival", "completed")],
+                done_or_archived: HashSet::new(),
+                subagents: vec![],
+            },
+            &mut sky, &mut taxi, &mut gates, &mut wing, &mut runway,
+        );
+        assert_eq!(
+            world.aircraft.len(),
+            1,
+            "duplicate aircraft spawned while SKY1 was still landing: {:?}",
+            world.aircraft.iter().map(|a| (&a.callsign, a.state)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unsettling_departing_thread_reclaims_airframe_without_duplication() {
+        let mut world = World::new();
+        let (mut sky, mut taxi, mut gates, mut wing, mut runway) = (
+            Callsigns::default(),
+            TaxiwayCallsigns::default(),
+            GateCallsigns::default(),
+            Wingmen::default(),
+            RunwayOps::default(),
+        );
+        // Poll 1: flying.
+        apply_poll(
+            &mut world,
+            "omarchy",
+            PollData {
+                omitted: 0,
+                local_environment_id: None,
+                airports: vec![Airport::home("local", "omarchy")],
+                flying: vec![(make_entry("t-revive", "Revive Me", "running"), 0)],
+                taxiway: vec![],
+                stale: vec![],
+                done_or_archived: HashSet::new(),
+                subagents: vec![],
+            },
+            &mut sky, &mut taxi, &mut gates, &mut wing, &mut runway,
+        );
+        let original_id = world.get_mut("SKY1").unwrap().id;
+        // Poll 2: settled -> SKY1 departs.
+        apply_poll(
+            &mut world,
+            "omarchy",
+            PollData {
+                omitted: 0,
+                local_environment_id: None,
+                airports: vec![Airport::home("local", "omarchy")],
+                flying: vec![],
+                taxiway: vec![],
+                stale: vec![],
+                done_or_archived: HashSet::from(["t-revive".to_string()]),
+                subagents: vec![],
+            },
+            &mut sky, &mut taxi, &mut gates, &mut wing, &mut runway,
+        );
+        assert_eq!(world.get_mut("SKY1").unwrap().state, State::Departing);
+
+        // Poll 3: unsettled before despawn -> reclaims same airframe (no duplicate!).
+        apply_poll(
+            &mut world,
+            "omarchy",
+            PollData {
+                omitted: 0,
+                local_environment_id: None,
+                airports: vec![Airport::home("local", "omarchy")],
+                flying: vec![],
+                taxiway: vec![make_entry("t-revive", "Revive Me", "idle")],
+                stale: vec![],
+                done_or_archived: HashSet::new(),
+                subagents: vec![],
+            },
+            &mut sky, &mut taxi, &mut gates, &mut wing, &mut runway,
+        );
+        assert_eq!(world.aircraft.len(), 1, "unsettled thread must not duplicate departing aircraft");
+        assert_eq!(world.aircraft[0].id, original_id);
+        assert_eq!(world.aircraft[0].state, State::Landing);
+        assert!(!world.aircraft[0].is_departing());
     }
 }
