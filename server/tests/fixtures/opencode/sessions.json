@@ -1,0 +1,86 @@
+{
+  "data": [
+    {
+      "id": "ses_root",
+      "projectID": "prj_1",
+      "title": "Root task",
+      "model": {
+        "id": "gpt-6",
+        "providerID": "openai"
+      },
+      "cost": 0,
+      "tokens": {
+        "input": 0,
+        "output": 0,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      },
+      "time": {
+        "created": 1795564800000,
+        "updated": 1795564800000
+      },
+      "location": {
+        "directory": "/workspace"
+      }
+    },
+    {
+      "id": "ses_child",
+      "parentID": "ses_root",
+      "projectID": "prj_1",
+      "title": "Child task",
+      "cost": 0,
+      "tokens": {
+        "input": 0,
+        "output": 0,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      },
+      "time": {
+        "created": 1795564800000,
+        "updated": 1795564800000
+      },
+      "location": {
+        "directory": "/workspace"
+      }
+    },
+    {
+      "id": "ses_fork",
+      "fork": {
+        "sessionID": "ses_root",
+        "boundary": {
+          "type": "through",
+          "messageID": "msg_fixture"
+        }
+      },
+      "projectID": "prj_1",
+      "title": "Independent fork",
+      "cost": 0,
+      "tokens": {
+        "input": 0,
+        "output": 0,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      },
+      "time": {
+        "created": 1795564800000,
+        "updated": 1795564800000
+      },
+      "location": {
+        "directory": "/workspace"
+      }
+    }
+  ],
+  "cursor": {
+    "previous": null,
+    "next": null
+  }
+}
