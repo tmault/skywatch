@@ -387,9 +387,12 @@ pub struct Aircraft {
     /// Landing: false while inbound to the final approach fix, true on final.
     #[serde(skip)]
     on_final: bool,
-    /// Arrival circuit: east entry, base leg, then aligned glide capture.
+    /// Arrival circuit: 0 east entry, 1 base leg, 2 aligned glide capture.
     #[serde(skip)]
     approach_leg: u8,
+    /// Vertical rate (u/s) flown on approach, eased so descents never snap.
+    #[serde(skip)]
+    approach_vr: f32,
     /// Taxiing off the far-end runway exit back to the apron/queue.
     #[serde(skip)]
     exiting_runway: bool,
@@ -514,6 +517,26 @@ const GLIDE_SLOPE: f32 = 0.05240778;
 const FLARE_DISTANCE: f32 = 50.0;
 const GLIDE_DESCENT_RATE: f32 = 2.0;
 const GLIDE_CLIMB_RATE: f32 = 2.0;
+
+/// Terminal descent before final (u/s), tapered in proportion to the height
+/// left above the target and eased in at a bounded vertical acceleration.
+const APPROACH_DESCENT_RATE: f32 = 8.0;
+const APPROACH_LEVEL_GAIN: f32 = 0.8;
+const APPROACH_VERT_ACCEL: f32 = 8.0;
+/// Circuit turn rate (rad/s).
+const APPROACH_TURN_RATE: f32 = 0.65;
+/// Final may be captured from the fix down to this far inside it.
+const FINAL_CAPTURE_WINDOW: f32 = 50.0;
+/// Capture tolerances: height off the glide, centerline offset and heading error.
+const FINAL_CAPTURE_ALT: f32 = 1.0;
+const FINAL_CAPTURE_OFFSET: f32 = 12.0;
+const FINAL_CAPTURE_HEADING: f32 = 0.3;
+/// Flight-path slope limits (tangents of about 2.2 and 3.8 degrees) that hold a
+/// captured final to a shallow glide; the minimum ends at `FINAL_SLOPE_FLOOR`
+/// altitude so the flare can level off.
+const FINAL_MIN_SLOPE: f32 = 0.0384;
+const FINAL_MAX_SLOPE: f32 = 0.0664;
+const FINAL_SLOPE_FLOOR: f32 = 3.0;
 
 fn glide_height(distance: f32) -> f32 {
     let d = distance.max(0.0);
@@ -780,6 +803,7 @@ impl Aircraft {
             joining: false,
             on_final: false,
             approach_leg: 0,
+            approach_vr: 0.0,
             exiting_runway: false,
             landing_pitch: None,
             arrival_slot: None,
@@ -879,7 +903,8 @@ impl Aircraft {
         }
         if self.state != State::Landing {
             self.on_final = false;
-            self.approach_leg = 0;
+            self.approach_leg = self.entry_leg();
+            self.approach_vr = 0.0;
             self.landing_pitch = None;
         }
         self.state = State::Landing;
@@ -893,6 +918,57 @@ impl Aircraft {
         self.cleared_for_takeoff = false;
         self.arrival_slot = slot;
         true
+    }
+
+    /// The most direct circuit leg to join from here: straight in (2), via the
+    /// base leg (1), or the full circuit from the east entry (0). A shortcut is
+    /// only taken when there is room to descend to approach altitude on it.
+    fn entry_leg(&self) -> u8 {
+        let layout = self.airport_layout;
+        let lx = self.position[0] - layout.runway_x;
+        let lz = self.position[1] - layout.touchdown_z;
+        // Only the full circuit may cross the patrol-map edge.
+        if self.across_map_edge().contains(&true) {
+            return 0;
+        }
+        let final_len = layout.final_len();
+        let capture_end = final_len - FINAL_CAPTURE_WINDOW;
+        let excess = self.altitude - layout.approach_alt;
+        // Seconds to get level, including the taper at the bottom.
+        let taper_from = APPROACH_DESCENT_RATE / APPROACH_LEVEL_GAIN;
+        let descent_time = (excess - taper_from).max(0.0) / APPROACH_DESCENT_RATE
+            + (excess.clamp(FINAL_CAPTURE_ALT, taper_from) / FINAL_CAPTURE_ALT).ln()
+                / APPROACH_LEVEL_GAIN
+            + (-excess).max(0.0) / GLIDE_CLIMB_RATE
+            + 0.5;
+        let top_speed = self.speed.max(self.approach_speed());
+        let descent_run = descent_time * top_speed;
+        let run = lz - capture_end;
+        if run >= descent_run
+            && lx.abs() <= run * 0.25
+            && (self.heading - RUNWAY_HEADING).cos() > 0.5
+        {
+            return 2;
+        }
+        let base_z = final_len + 70.0;
+        // The base leg may start heading away, so it also needs room to turn
+        // round without reaching the patrol-map edge.
+        let reach = AREA_SIZE / 2.0 - 2.0 * top_speed / APPROACH_TURN_RATE;
+        if lz >= final_len
+            && lx.abs().max(lz) <= reach
+            && lx.hypot(lz - base_z) + base_z - capture_end >= descent_run
+        {
+            return 1;
+        }
+        0
+    }
+
+    /// Per axis, whether the shortest way to this aircraft's airport crosses
+    /// the patrol-map edge.
+    fn across_map_edge(&self) -> [bool; 2] {
+        let layout = self.airport_layout;
+        let origin = [layout.runway_x, layout.touchdown_z];
+        [0, 1].map(|axis| (self.position[axis] - origin[axis]).abs() > AREA_SIZE / 2.0)
     }
 
     /// Abort an arrival and climb back out to the sector (thread started again).
@@ -981,34 +1057,57 @@ impl Aircraft {
         let old_alt = self.altitude;
         if !self.on_final {
             // Fly a circuit rather than diving directly at the runway from an
-            // arbitrary heading/height. Repeat it if still above glide capture.
-            let target = match self.approach_leg {
+            // arbitrary heading, losing height briskly on the way round.
+            let mut target = match self.approach_leg {
                 0 => [140.0, final_len + 70.0],
                 1 => [0.0, final_len + 70.0],
                 _ => [0.0, lz - 70.0],
             };
+            // Still across the patrol-map edge from the airport: head over
+            // that edge first, so the one wrap happens before the circuit.
+            let across = self.across_map_edge();
+            for (axis, offset) in [lx, lz].into_iter().enumerate() {
+                if across[axis] {
+                    target[axis] = offset - offset.signum() * 100.0;
+                }
+            }
             let dx = target[0] - lx;
             let dz = target[1] - lz;
             let dist = dx.hypot(dz);
-            self.turn_toward(dz.atan2(dx), 0.65 * dt);
-            let target_alt = if self.approach_leg == 2 {
-                glide_height(lz + self.heading.sin() * self.speed * dt)
-            } else {
-                layout.approach_alt
-            };
-            let vertical_limit = self.speed * GLIDE_SLOPE;
-            self.altitude += (target_alt - self.altitude)
-                .clamp(-vertical_limit * dt, vertical_limit * dt);
-            if self.approach_leg < 2 && dist < 35.0 {
+            self.turn_toward(dz.atan2(dx), APPROACH_TURN_RATE * dt);
+            // On the last leg, stay level until the glide is intercepted at the
+            // fix, then follow it down.
+            let glide_ahead = glide_height(lz + self.heading.sin() * self.speed * dt);
+            let (target_alt, path_rate) =
+                if self.approach_leg == 2 && glide_ahead < layout.approach_alt {
+                    let closing = (-self.heading.sin()).max(0.0) * self.speed;
+                    (glide_ahead, -GLIDE_SLOPE * closing)
+                } else {
+                    (layout.approach_alt, 0.0)
+                };
+            let rate = (path_rate + (target_alt - self.altitude) * APPROACH_LEVEL_GAIN)
+                .clamp(-APPROACH_DESCENT_RATE, GLIDE_CLIMB_RATE);
+            self.approach_vr += (rate - self.approach_vr)
+                .clamp(-APPROACH_VERT_ACCEL * dt, APPROACH_VERT_ACCEL * dt);
+            self.altitude += self.approach_vr * dt;
+            // A waypoint inside the turning circle can never be reached, so the
+            // acceptance radius grows with the turn radius.
+            let reached = (self.speed / APPROACH_TURN_RATE + 5.0).max(35.0);
+            if self.approach_leg < 2 && dist < reached && !across.contains(&true) {
                 self.approach_leg += 1;
             }
             if self.approach_leg == 2 {
-                let aligned = (self.heading - RUNWAY_HEADING).sin().abs() < 0.12
-                    && self.heading.sin() < -0.98
-                    && lx.abs() < 5.0;
-                if aligned && (self.altitude - target_alt).abs() < 0.001 && lz <= final_len {
+                let aligned = (self.heading - RUNWAY_HEADING).cos() > FINAL_CAPTURE_HEADING.cos()
+                    && lx.abs() < FINAL_CAPTURE_OFFSET;
+                let capture_end = final_len - FINAL_CAPTURE_WINDOW;
+                if aligned
+                    && (self.altitude - target_alt).abs() <= FINAL_CAPTURE_ALT
+                    && lz <= final_len
+                    && lz >= capture_end
+                {
                     self.on_final = true;
-                } else if lz < final_len - 45.0 {
+                } else if lz < capture_end {
+                    // Missed the capture window: go round again.
                     self.approach_leg = 0;
                 }
             }
@@ -1048,8 +1147,24 @@ impl Aircraft {
                 // correction is bounded and works both ways — a too-low
                 // approach climbs back to the path instead of clipping short.
                 let desired = glide_height(lz + self.heading.sin() * self.speed * dt);
-                self.altitude += (desired - self.altitude)
-                    .clamp(-GLIDE_DESCENT_RATE * dt, GLIDE_CLIMB_RATE * dt);
+                let error = desired - self.altitude;
+                let (lowest, highest) = if error.abs() <= 2.0 * FINAL_CAPTURE_ALT {
+                    // Close the small capture error without leaving the
+                    // shallow glide: never steep, never climbing, and always
+                    // descending until the flare.
+                    let min_slope = if self.altitude > FINAL_SLOPE_FLOOR {
+                        FINAL_MIN_SLOPE
+                    } else {
+                        0.0
+                    };
+                    (
+                        -(self.speed * FINAL_MAX_SLOPE).min(GLIDE_DESCENT_RATE),
+                        -(self.speed * min_slope).min(GLIDE_DESCENT_RATE),
+                    )
+                } else {
+                    (-GLIDE_DESCENT_RATE, GLIDE_CLIMB_RATE)
+                };
+                self.altitude += error.clamp(lowest * dt, highest * dt);
                 if lz <= 1.0 {
                     // The pursuit oscillation damps out slowly, so the last
                     // gate is deliberately forgiving — a 6u / 0.25 rad
@@ -1074,10 +1189,11 @@ impl Aircraft {
                     self.on_final = false;
                 }
             }
+            if !self.on_final {
+                self.approach_leg = 0;
+            }
         }
-        if !self.on_final && self.approach_leg == 2 && lz < goaround_dist {
-            self.approach_leg = 0;
-        }
+        self.approach_vr = (self.altitude - old_alt) / dt.max(0.001);
         let flight_angle = ((self.altitude - old_alt) / (self.speed * dt).max(0.001)).atan();
         let flare = if self.on_final {
             (1.0 - lz / FLARE_DISTANCE).clamp(0.0, 1.0)
@@ -3642,7 +3758,9 @@ mod tests {
                             assert!(!was_final && !a.on_final, "{ctx}: wrapped on final");
                             assert!(a.approach_leg == 0, "{ctx}: wrapped on the circuit");
                         }
-                        assert!((a.altitude - old[2]).abs() < 0.11, "{ctx}: altitude discontinuity");
+                        // Gentle on final; brisk but bounded before it.
+                        let max_step = if was_final && a.on_final { 0.11 } else { 0.55 };
+                        assert!((a.altitude - old[2]).abs() < max_step, "{ctx}: altitude discontinuity");
                         let angle = ((a.altitude - old[2]) / horizontal.max(0.001)).atan().to_degrees();
                         if was_final && a.on_final && a.altitude > 3.0 {
                             assert!(angle > -4.0 && angle < -2.0, "{ctx}: glide {angle}");
@@ -3666,6 +3784,75 @@ mod tests {
                     assert!(landed && final_samples > 30, "{ctx}: failed arrival");
                 }
             }
+        }
+    }
+
+    /// A jet arriving from cruise height anywhere on the map loses its height
+    /// on the way in: it lands promptly with at most one extra circuit.
+    #[test]
+    fn high_arrivals_land_with_at_most_one_extra_circuit() {
+        let airports = [
+            Airport::home("local", "Tower"),
+            Airport::satellite("ne", "NE", SATELLITE_SLOTS[1], true),
+            Airport::satellite("south", "S", SATELLITE_SLOTS[2], true),
+        ];
+        for airport in &airports {
+            for xi in -4..=4 {
+                for zi in -4..=4 {
+                    for hi in 0..8 {
+                        let mut a = Aircraft::with_model("HIGH", Kind::Agent, ModelClass::Frontier);
+                        a.set_airport(airport);
+                        a.state = State::Cruising;
+                        a.position = [xi as f32 * 100.0, zi as f32 * 100.0, 180.0];
+                        a.altitude = 180.0;
+                        a.heading = hi as f32 * std::f32::consts::FRAC_PI_4;
+                        let ctx = format!("{} from {:?} heading {}", airport.id, a.position, a.heading);
+                        assert!(a.begin_approach(None));
+                        let mut extra_circuits = 0;
+                        let mut landed = false;
+                        for _ in 0..(100.0 / 0.05) as usize {
+                            let (leg, old_alt) = (a.approach_leg, a.altitude);
+                            a.tick(0.05);
+                            assert!((a.altitude - old_alt).abs() < 0.55, "{ctx}: altitude snap");
+                            // Leaving the last leg means flying another circuit.
+                            if leg == 2 && a.approach_leg != 2 {
+                                extra_circuits += 1;
+                            }
+                            if a.state == State::Landed {
+                                landed = true;
+                                break;
+                            }
+                        }
+                        assert!(landed, "{ctx}: not down within 100 s");
+                        assert!(extra_circuits <= 1, "{ctx}: {extra_circuits} extra circuits");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Arrivals already south of the field join as far round the circuit as
+    /// their height allows; high or badly placed ones fly it from the east.
+    #[test]
+    fn approach_entry_takes_the_most_direct_leg_with_room_to_descend() {
+        let north = RUNWAY_HEADING;
+        for (position, heading, leg) in [
+            ([56.0, 330.0, 20.0], north, 2),
+            ([56.0, 405.0, 40.0], north, 2),
+            ([-100.0, 330.0, 20.0], 0.0, 1),
+            ([56.0, 330.0, 20.0], -north, 1),
+            ([56.0, 290.0, 180.0], north, 0),
+            ([0.0, -200.0, 20.0], north, 0),
+            // Shortest way crosses the map edge: only the full circuit may wrap.
+            ([56.0, -395.0, 20.0], north, 0),
+        ] {
+            let mut a = Aircraft::with_model("ENT", Kind::Agent, ModelClass::Frontier);
+            a.position = position;
+            a.altitude = position[2];
+            a.heading = heading;
+            a.speed = a.approach_speed();
+            assert!(a.begin_approach(None));
+            assert_eq!(a.approach_leg, leg, "from {position:?} heading {heading}");
         }
     }
 
@@ -3788,8 +3975,11 @@ mod tests {
             let a = &world.aircraft[1];
             let dalt = (a.altitude - prev_alt) / 0.05;
             prev_alt = a.altitude;
+            // The seeded start is far above the glide, so once it goes around
+            // it may descend at the brisker pre-final rate, but never snaps.
+            let max_descent = if a.on_final { GLIDE_DESCENT_RATE } else { APPROACH_DESCENT_RATE };
             assert!(
-                dalt >= -GLIDE_DESCENT_RATE - 0.5 && dalt <= GLIDE_CLIMB_RATE + 0.5,
+                dalt >= -max_descent - 0.5 && dalt <= GLIDE_CLIMB_RATE + 0.5,
                 "vertical snap at {step}: {dalt} u/s"
             );
             if was_on_final && !a.on_final && a.altitude > 15.0 {
