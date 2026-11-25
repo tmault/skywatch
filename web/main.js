@@ -18,6 +18,7 @@ import {
   makeAgentMesh, makeJetMesh, makeJumboMesh, makeFighterMesh, makeDroneMesh, makeTankerMesh,
 } from './aircraft.js';
 import { isFlagshipAgent } from './flagship.js';
+import { gearTarget, advanceGear, easeGear } from './landing-gear.js';
 import { liveryFor } from './livery.js';
 import { createLocalFlair } from './local-flair.js';
 import { createAlertManager, classifyAircraftUrgency, isPassiveHold } from './alerts.js';
@@ -1644,6 +1645,11 @@ function ensureMesh(a) {
   }
   built.prop = built.group.getObjectByName('prop');
   built.gear = built.group.getObjectByName('gear');
+  if (built.gear) {
+    // Spawn already in position so gear never cycles on initial load.
+    built.gearProgress = gearTarget(a.state, a.position[2]);
+    built.gear.userData.setProgress(built.gearProgress);
+  }
 
   enableShadows(built.group, { receive: false });
   scene.add(built.group);
@@ -2567,12 +2573,11 @@ function animate() {
 
     // Retract landing gear while en route or climbing away after takeoff.
     if (entry.gear) {
-      entry.gear.visible =
-        entry.state !== 'cruising'
-        && entry.state !== 'holding'
-        && entry.state !== 'refueling'
-        && !((entry.state === 'departing' || entry.state === 'takeoff') && alt > 18)
-        && !(entry.state === 'landing' && alt > 70);
+      const target = gearTarget(entry.state, alt);
+      if (entry.gearProgress !== target) {
+        entry.gearProgress = advanceGear(entry.gearProgress, target, dt);
+        entry.gear.userData.setProgress(easeGear(entry.gearProgress));
+      }
     }
 
     if (entry.kind === 'fighter') {
