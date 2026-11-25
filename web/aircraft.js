@@ -509,6 +509,88 @@ function wheel(kit, x, y, z, r, w) {
   return g;
 }
 
+// Retractable gear rig. Parts are authored in gear coordinates in their
+// deployed pose, then hung from hinge groups without moving, so progress 1 is
+// exactly the authored geometry. Each hinge swings to its `stow` rotation as
+// progress falls to 0.
+function gearRig() {
+  const gear = new THREE.Group();
+  gear.name = 'gear';
+  const joints = [];
+  const braces = [];
+  const doors = [];
+  const UP = new THREE.Vector3(0, 1, 0);
+
+  // `parent` is `gear` or a top-level hinge (for a bogie on the end of a leg).
+  function hang(pivot, parts, parent = gear) {
+    const hinge = new THREE.Group();
+    const at = new THREE.Vector3(...pivot);
+    for (const part of parts) {
+      part.position.sub(at);
+      hinge.add(part);
+    }
+    hinge.position.copy(at).sub(parent.position);
+    parent.add(hinge);
+    return hinge;
+  }
+
+  gear.userData.setProgress = (t) => {
+    const down = THREE.MathUtils.clamp(t, 0, 1);
+    for (const { hinge, stow } of joints) hinge.quaternion.identity().slerp(stow, 1 - down);
+    // Doors stay open while the legs travel and close over the end of the cycle.
+    const closing = 1 - THREE.MathUtils.smoothstep(down, 0, 0.35);
+    for (const { hinge, stow } of doors) hinge.quaternion.identity().slerp(stow, closing);
+    for (const { mesh, anchor, foot, hinge, length } of braces) {
+      const end = foot.clone().sub(hinge.position).applyQuaternion(hinge.quaternion).add(hinge.position);
+      const span = end.clone().sub(anchor);
+      mesh.position.copy(anchor).add(end).multiplyScalar(0.5);
+      mesh.scale.y = span.length() / length;
+      mesh.quaternion.setFromUnitVectors(UP, span.normalize());
+    }
+    gear.visible = down > 0.005;
+  };
+
+  return {
+    gear,
+    leg(pivot, parts, stow, parent) {
+      const hinge = hang(pivot, parts, parent);
+      joints.push({ hinge, stow });
+      return hinge;
+    },
+    door(pivot, mesh, stow) {
+      doors.push({ hinge: hang(pivot, [mesh]), stow });
+    },
+    // Folding side/drag brace from a fixed airframe anchor to a point on a leg.
+    brace(mat, anchor, foot, radius, hinge, segs) {
+      const mesh = rod(mat, anchor, foot, radius, segs);
+      gear.add(mesh);
+      braces.push({
+        mesh, hinge,
+        anchor: new THREE.Vector3(...anchor),
+        foot: new THREE.Vector3(...foot),
+        length: mesh.geometry.parameters.height,
+      });
+    },
+  };
+}
+
+const FOLD_AXES = { x: new THREE.Vector3(1, 0, 0), z: new THREE.Vector3(0, 0, 1) };
+
+// Stow rotation about one axis (positive about X swings a hanging leg aft,
+// negative about Z swings a port leg inboard).
+function foldAbout(axis, angle) {
+  return new THREE.Quaternion().setFromAxisAngle(FOLD_AXES[axis], angle);
+}
+
+// Stow rotation for a skewed trunnion: shortest swing that takes the deployed
+// pivot-to-wheel direction onto `toward`.
+function foldToward(pivot, wheelAt, toward) {
+  return new THREE.Quaternion().setFromUnitVectors(
+    new THREE.Vector3(...wheelAt).sub(new THREE.Vector3(...pivot)).normalize(),
+    new THREE.Vector3(...toward).normalize(),
+  );
+}
+
 // Tapered, twisted propeller blade along +Y from radius r0 to r1. Pitch is
 // the blade angle from the disc plane, washing out toward the tip.
 function propBlade(mat, { r0, r1, rootChord, tipChord, pitchRoot = 0.8, pitchTip = 0.32 }) {
@@ -1090,21 +1172,26 @@ export function makeJetMesh(model) {
     root: { le: -4.4, chord: 2.6 }, tip: { le: -6.5, chord: 0.8 },
   }));
 
-  // Retractable gear (hidden in flight by main.js): twin-wheel main legs
-  // with side braces, twin-wheel nose leg.
-  const gear = new THREE.Group();
-  gear.name = 'gear';
+  // Retractable gear (cycled by main.js): twin-wheel main legs with side
+  // braces folding inboard and aft into the belly, twin-wheel nose leg folding
+  // aft.
+  const rig = gearRig();
   for (const side of [1, -1]) {
-    gear.add(rod(kit.metal, [side * 2.2, wingY - 0.2, -1.2], [side * 2.2, -3.3, -1.2], 0.14));
-    gear.add(rod(kit.metal, [side * 1.2, -1.4, -1.2], [side * 2.2, -2.5, -1.2], 0.06));
-    gear.add(rod(kit.metal, [side * 1.9, -3.4, -1.2], [side * 2.5, -3.4, -1.2], 0.09));
-    for (const dx of [1.92, 2.48]) gear.add(wheel(kit, side * dx, -3.4, -1.2, 0.58, 0.34));
+    const pivot = [side * 2.2, wingY - 0.2, -1.2];
+    const leg = rig.leg(pivot, [
+      rod(kit.metal, pivot, [side * 2.2, -3.3, -1.2], 0.14),
+      rod(kit.metal, [side * 1.9, -3.4, -1.2], [side * 2.5, -3.4, -1.2], 0.09),
+      ...[1.92, 2.48].map((dx) => wheel(kit, side * dx, -3.4, -1.2, 0.58, 0.34)),
+    ], foldToward(pivot, [side * 2.2, -3.4, -1.2], [-side * 0.67, 0.05, -0.74]));
+    rig.brace(kit.metal, [side * 1.2, -1.4, -1.2], [side * 2.2, -2.5, -1.2], 0.06, leg);
   }
-  gear.add(rod(kit.metal, [0, -1.4, 9.2], [0, -3.4, 9.2], 0.12));
-  gear.add(rod(kit.metal, [0, -1.6, 8.3], [0, -2.6, 9.2], 0.05));
-  gear.add(wheel(kit, 0.22, -3.5, 9.2, 0.38, 0.25));
-  gear.add(wheel(kit, -0.22, -3.5, 9.2, 0.38, 0.25));
-  group.add(gear);
+  const noseLeg = rig.leg([0, -1.4, 9.2], [
+    rod(kit.metal, [0, -1.4, 9.2], [0, -3.4, 9.2], 0.12),
+    wheel(kit, 0.22, -3.5, 9.2, 0.38, 0.25),
+    wheel(kit, -0.22, -3.5, 9.2, 0.38, 0.25),
+  ], foldAbout('x', 1.66));
+  rig.brace(kit.metal, [0, -1.6, 8.3], [0, -2.6, 9.2], 0.05, noseLeg);
+  group.add(rig.gear);
 
   navLights(group, kit, [wingSpan - 0.2, tipY + 0.1, -3.9], [0, tailY + 0.2, -12.7]);
   group.add(dot(kit.beacon, 0, 1.86, 0.5, 0.24));
@@ -1501,47 +1588,56 @@ export function makeJumboMesh(model) {
 
   // Iconic 18-wheel retractable 747-400 landing gear (25.60 m wheelbase,
   // 11.00 m outer track, 1.24 m H49x19-22 main tyres, ground plane y = -5.45 m
-  // giving 2.05 m belly clearance) with open wheel-well doors.
-  const gear = new THREE.Group();
-  gear.name = 'gear';
+  // giving 2.05 m belly clearance) with wheel-well doors that close behind it.
+  const rig = gearRig();
   const mainWheelR = 0.62;
   const mainWheelY = -5.45 + mainWheelR; // -4.83 m -> bottom contact y = -5.45 m
-  const addMainBogie = (x, z, strutTopY, braceX, doorSide) => {
-    gear.add(rod(kit.metal, [x, strutTopY, z], [x, mainWheelY, z], 0.20, 8));
-    gear.add(rod(kit.metal, [braceX, strutTopY - 0.25, z], [x, -3.75, z], 0.09, 6));
-    gear.add(rod(kit.metal, [x, mainWheelY, z - 0.86], [x, mainWheelY, z + 0.86], 0.12, 6));
+  // `levelBogie` counter-rotates the truck so it stays flat as the leg swings.
+  const addMainBogie = (x, z, strutTopY, braceX, doorSide, stow, levelBogie) => {
+    const leg = rig.leg([x, strutTopY, z], [
+      rod(kit.metal, [x, strutTopY, z], [x, mainWheelY, z], 0.20, 8),
+    ], stow);
+    const truck = [rod(kit.metal, [x, mainWheelY, z - 0.86], [x, mainWheelY, z + 0.86], 0.12, 6)];
     for (const dz of [-0.78, 0.78]) {
-      gear.add(rod(kit.metal, [x - 0.46, mainWheelY, z + dz], [x + 0.46, mainWheelY, z + dz], 0.09, 6));
+      truck.push(rod(kit.metal, [x - 0.46, mainWheelY, z + dz], [x + 0.46, mainWheelY, z + dz], 0.09, 6));
       for (const dx of [-0.46, 0.46]) {
-        gear.add(wheel(kit, x + dx, mainWheelY, z + dz, mainWheelR, 0.44));
+        truck.push(wheel(kit, x + dx, mainWheelY, z + dz, mainWheelR, 0.44));
       }
     }
-    // Thin strut door flush beside the retracted bay.
+    rig.leg([x, mainWheelY, z], truck,
+      levelBogie ? stow.clone().invert() : new THREE.Quaternion(), leg);
+    rig.brace(kit.metal, [braceX, strutTopY - 0.25, z], [x, -3.75, z], 0.09, leg, 6);
+    // Thin strut door hinged along its top edge, folding over the bay.
     const door = new THREE.Mesh(new THREE.BoxGeometry(0.08, 1.45, 2.0), kit.plain);
     door.position.set(x + doorSide * 0.42, strutTopY - 0.72, z);
-    gear.add(door);
+    rig.door([x + doorSide * 0.42, strutTopY, z], door, foldAbout('z', -doorSide * Math.PI / 2));
   };
   for (const side of [1, -1]) {
-    // Wing-gear bogies at exact 11.00 m track (x = ±5.50 m).
-    addMainBogie(side * 5.50, M(33.9), wingYAt(5.50) - 0.15, side * 3.4, side);
-    // Body-gear bogies tucked inboard and staggered 3.2 m aft (x = ±1.95 m).
-    addMainBogie(side * 1.95, M(37.1), -2.85, side * 0.65, -side);
+    // Wing-gear bogies at exact 11.00 m track (x = ±5.50 m), folding inboard.
+    addMainBogie(side * 5.50, M(33.9), wingYAt(5.50) - 0.15, side * 3.4, side,
+      foldAbout('z', -side * Math.PI / 2), false);
+    // Body-gear bogies tucked inboard and staggered 3.2 m aft (x = ±1.95 m),
+    // folding forward.
+    addMainBogie(side * 1.95, M(37.1), -2.85, side * 0.65, -side,
+      foldAbout('x', -Math.PI / 2), true);
   }
   // Twin-wheel nose gear (25.60 m ahead of main gear midpoint -> m = 9.9 m).
   const noseGearZ = M(9.9);
   const noseWheelR = 0.50;
   const noseWheelY = -5.45 + noseWheelR; // -4.95 m -> bottom contact y = -5.45 m
-  gear.add(rod(kit.metal, [0, -3.15, noseGearZ], [0, noseWheelY, noseGearZ], 0.17, 8));
-  gear.add(rod(kit.metal, [0, -3.20, noseGearZ - 1.5], [0, -4.15, noseGearZ], 0.08, 6));
-  gear.add(rod(kit.metal, [-0.42, noseWheelY, noseGearZ], [0.42, noseWheelY, noseGearZ], 0.09, 6));
-  gear.add(wheel(kit, 0.42, noseWheelY, noseGearZ, noseWheelR, 0.36));
-  gear.add(wheel(kit, -0.42, noseWheelY, noseGearZ, noseWheelR, 0.36));
+  const noseLeg = rig.leg([0, -3.15, noseGearZ], [
+    rod(kit.metal, [0, -3.15, noseGearZ], [0, noseWheelY, noseGearZ], 0.17, 8),
+    rod(kit.metal, [-0.42, noseWheelY, noseGearZ], [0.42, noseWheelY, noseGearZ], 0.09, 6),
+    wheel(kit, 0.42, noseWheelY, noseGearZ, noseWheelR, 0.36),
+    wheel(kit, -0.42, noseWheelY, noseGearZ, noseWheelR, 0.36),
+  ], foldAbout('x', -1.83));
+  rig.brace(kit.metal, [0, -3.20, noseGearZ - 1.5], [0, -4.15, noseGearZ], 0.08, noseLeg, 6);
   for (const side of [1, -1]) {
     const nDoor = new THREE.Mesh(new THREE.BoxGeometry(0.08, 1.05, 2.2), kit.plain);
     nDoor.position.set(side * 0.62, -3.65, noseGearZ - 0.3);
-    gear.add(nDoor);
+    rig.door([side * 0.62, -3.125, noseGearZ - 0.3], nDoor, foldAbout('z', -side * Math.PI / 2));
   }
-  group.add(gear);
+  group.add(rig.gear);
 
   // Wingtip nav lights, tailcone white light, upper-deck crown & belly beacons.
   group.add(dot(kit.red, wingSpan - 0.2, tipY + 0.16, tip.le - 0.5, 0.34));
@@ -1682,15 +1778,20 @@ export function makeFighterMesh(model) {
     group.add(flame);
   }
 
-  const gear = new THREE.Group();
-  gear.name = 'gear';
+  // Main legs fold forward and inboard under the intakes, nose leg aft.
+  const rig = gearRig();
   for (const side of [1, -1]) {
-    gear.add(rod(kit.metal, [side * 1.3, -0.4, -1.0], [side * 1.5, -1.9, -1.0], 0.09));
-    gear.add(wheel(kit, side * 1.5, -2.0, -1.0, 0.38, 0.26));
+    const pivot = [side * 1.3, -0.4, -1.0];
+    rig.leg(pivot, [
+      rod(kit.metal, pivot, [side * 1.5, -1.9, -1.0], 0.09),
+      wheel(kit, side * 1.5, -2.0, -1.0, 0.38, 0.26),
+    ], foldToward(pivot, [side * 1.5, -2.0, -1.0], [-side * 0.47, 0, 0.88]));
   }
-  gear.add(rod(kit.metal, [0, -0.5, 4.6], [0, -1.9, 4.8], 0.08));
-  gear.add(wheel(kit, 0, -2.05, 4.8, 0.28, 0.2));
-  group.add(gear);
+  rig.leg([0, -0.5, 4.6], [
+    rod(kit.metal, [0, -0.5, 4.6], [0, -1.9, 4.8], 0.08),
+    wheel(kit, 0, -2.05, 4.8, 0.28, 0.2),
+  ], foldAbout('x', 1.75));
+  group.add(rig.gear);
 
   navLights(group, kit, [6.5, 0.05, -3.3], [0, 0.0, -6.5]);
   group.add(dot(kit.beacon, 0, 0.93, -1.2, 0.18));
@@ -1756,15 +1857,20 @@ export function makeDroneMesh(model) {
   prop.position.z = -7.25;
   group.add(prop);
 
-  const gear = new THREE.Group();
-  gear.name = 'gear';
+  // Splayed main legs swing in and aft along the belly, nose leg aft.
+  const rig = gearRig();
   for (const side of [1, -1]) {
-    gear.add(rod(kit.metal, [side * 0.5, -0.6, 0.6], [side * 2.0, -2.1, 0.6], 0.08));
-    gear.add(wheel(kit, side * 2.05, -2.2, 0.6, 0.36, 0.22));
+    const pivot = [side * 0.5, -0.6, 0.6];
+    rig.leg(pivot, [
+      rod(kit.metal, pivot, [side * 2.0, -2.1, 0.6], 0.08),
+      wheel(kit, side * 2.05, -2.2, 0.6, 0.36, 0.22),
+    ], foldToward(pivot, [side * 2.05, -2.2, 0.6], [-side * 0.1, 0.05, -1]));
   }
-  gear.add(rod(kit.metal, [0, -0.9, 4.4], [0, -2.15, 4.4], 0.07));
-  gear.add(wheel(kit, 0, -2.25, 4.4, 0.28, 0.18));
-  group.add(gear);
+  rig.leg([0, -0.9, 4.4], [
+    rod(kit.metal, [0, -0.9, 4.4], [0, -2.15, 4.4], 0.07),
+    wheel(kit, 0, -2.25, 4.4, 0.28, 0.18),
+  ], foldAbout('x', 1.83));
+  group.add(rig.gear);
 
   navLights(group, kit, [12.4, 0.75, 0.6], [0, 0.0, -6.9]);
   group.add(dot(kit.beacon, 0, 1.4, 2.0, 0.2));
@@ -1948,15 +2054,21 @@ export function makeTankerMesh(model) {
   group.add(dot(amberMat, 0, -2.3, 9.6, 0.22));
 
   // Deployable tricycle gear keeps the boom clear during landing rotation.
-  const gear = new THREE.Group();
-  gear.name = 'gear';
+  // Long main legs fold aft and inboard (straight inboard they would cross),
+  // nose leg aft.
+  const rig = gearRig();
   for (const side of [1, -1]) {
-    gear.add(rod(kit.metal, [side * 2.4, -1.6, -2.0], [side * 2.4, -5.2, -2.0], 0.16));
-    gear.add(wheel(kit, side * 2.4, -5.2, -2.0, 0.65, 0.38));
+    const pivot = [side * 2.4, -1.6, -2.0];
+    rig.leg(pivot, [
+      rod(kit.metal, pivot, [side * 2.4, -5.2, -2.0], 0.16),
+      wheel(kit, side * 2.4, -5.2, -2.0, 0.65, 0.38),
+    ], foldToward(pivot, [side * 2.4, -5.2, -2.0], [-side * 0.42, 0.08, -0.9]));
   }
-  gear.add(rod(kit.metal, [0, -1.6, 10.0], [0, -5.35, 10.0], 0.14));
-  gear.add(wheel(kit, 0, -5.35, 10.0, 0.5, 0.3));
-  group.add(gear);
+  rig.leg([0, -1.6, 10.0], [
+    rod(kit.metal, [0, -1.6, 10.0], [0, -5.35, 10.0], 0.14),
+    wheel(kit, 0, -5.35, 10.0, 0.5, 0.3),
+  ], foldAbout('x', 1.6));
+  group.add(rig.gear);
 
   return finish(group, 0.85, kit, {
     refuelAnchors: {
