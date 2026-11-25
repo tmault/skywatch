@@ -9,8 +9,8 @@ import {
   appendHistory, stateColor,
 } from './radio.js';
 import {
-  buildAlpineIsland, buildAlpineBackdrop, makeSwissFlag, updateAlpine, SWISS_RED,
-  makeLakeMaterial, enableShadows,
+  makeSwissFlag, updateAlpine, SWISS_RED,
+  enableShadows,
 } from './alpine.js';
 import { addRunwayLights } from './runway-lights.js';
 import { addLandingLights, createRunwayEvents } from './runway-events.js';
@@ -23,8 +23,10 @@ import { createLocalFlair } from './local-flair.js';
 import { createAlertManager, classifyAircraftUrgency, isPassiveHold } from './alerts.js';
 import { isReaper, reaperLabelStatus } from './reaper.js';
 import { productionRoute, routeRibbon } from './ground-route.js';
+import { createThemeState } from './theme-state.js';
+import { createEnvironment } from './environment.js';
+import { setupThemePicker } from './theme-picker.js';
 
-const WORLD_SIZE = 820;
 const INTERP_RATE = 10; // exponential smoothing constant (per second)
 const TARMAC_TOP_Y = 3.2; // elevated runway/apron deck height (well above sand y=2.0)
 
@@ -75,7 +77,8 @@ controls.minDistance = 18;
 controls.maxDistance = 900;
 
 // Alpine daylight: cool sky fill, meadow-green bounce, warm low sun.
-scene.add(new THREE.HemisphereLight(0xcfe6ff, 0x3f5a34, 0.78));
+const hemisphere = new THREE.HemisphereLight(0xcfe6ff, 0x3f5a34, 0.78);
+scene.add(hemisphere);
 scene.add(new THREE.AmbientLight(0x8094a8, 0.2));
 // Mid-afternoon sun (~37° up) so peaks, trees and terminals throw long,
 // readable shadows; aircraft shadows on the lake show their altitude.
@@ -101,26 +104,21 @@ const rim = new THREE.DirectionalLight(0x9cc8f0, 0.4);
 rim.position.set(-260, 180, -240);
 scene.add(rim);
 
-// Alpine lake, a faint Swiss-style layout grid, and the mountains around it.
-{
-  const lake = new THREE.Mesh(
-    new THREE.CircleGeometry(1300, 96),
-    makeLakeMaterial(),
-  );
-  lake.receiveShadow = true;
-  lake.rotation.x = -Math.PI / 2;
-  lake.position.y = 0;
-  scene.add(lake);
-
-  const grid = new THREE.GridHelper(WORLD_SIZE, 35, 0xffffff, 0xffffff);
-  grid.material.transparent = true;
-  grid.material.opacity = 0.1;
-  grid.material.depthWrite = false;
-  grid.position.y = 0.35;
-  scene.add(grid);
-
-  buildAlpineBackdrop(scene, 620, 1500);
-}
+// Public boot configuration contains only the validated theme name. Older
+// servers without this endpoint continue with Alpine and a local override.
+let bootConfig = {};
+try {
+  const response = await fetch('/config.json');
+  if (response.ok) bootConfig = await response.json();
+} catch { /* legacy/offline server */ }
+let themeStorage;
+try { themeStorage = window.localStorage; } catch { /* disabled storage */ }
+const themeState = createThemeState(bootConfig.theme, themeStorage);
+const environment = createEnvironment({ scene, sun, hemisphere, state: themeState });
+const disposeThemePicker = setupThemePicker(themeState);
+window.addEventListener('pagehide', event => {
+  if (!event.persisted) { disposeThemePicker(); environment.dispose(); }
+});
 
 /* ----------------------------------------------------- runway events */
 
@@ -151,6 +149,11 @@ function makeMarking(w, l, x, z, y, mat) {
 }
 
 const airportGroups = new Map();
+window.addEventListener('skywatch-theme-change', () => {
+  for (const entry of airportGroups.values()) {
+    if (entry.glassMat && !entry.online) applySatelliteOnlineState(entry, false);
+  }
+});
 const radars = [];
 
 // Small Reaper ramp: a hangar apron for scheduled-job drones, with painted
@@ -249,8 +252,9 @@ function buildHomeAirport(ap) {
   // pads under Runway 36, parallel Taxiway Alpha, holding bay, and gate pier.
   const towerSpot = { x: -46, z: -4 };
   const flagSpot = { x: -34, z: 7 };
-  const terrain = buildAlpineIsland(island, {
+  const terrain = environment.island(island, {
     seed: 1.3,
+    sceneryClear: [{ x: 56, z: 0, hw: 18, hl: 300 }],
     center: [14, -4],
     radius: 138,
     hilliness: 4.5,
@@ -507,8 +511,9 @@ function buildSatelliteAirport(ap, idx) {
   // rocky peak (snow-dusted) to one side, firs and a chalet or two.
   const knollZ = (idx % 2 === 0 ? 1 : -1) * 36;
   const flagSpot = { x: -26, z: -knollZ * 0.3 };
-  const terrain = buildAlpineIsland(island, {
+  const terrain = environment.island(island, {
     seed,
+    sceneryClear: [{ x: 4, z: 0, hw: 14, hl: 230 }],
     center: [2, 0],
     radius: 72,
     hilliness: 3,
@@ -1789,6 +1794,7 @@ function releaseHeldKeys() {
 }
 
 window.addEventListener('keydown', (ev) => {
+  if (document.getElementById('theme-picker').open) return;
   if (ev.key === 'Escape' && followId !== null) {
     stopFollow(true);
     closeRadio();

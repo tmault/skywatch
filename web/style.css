@@ -792,3 +792,18 @@ button.tick-line.active {
 
 #radio-hold-reason.reaper-details { white-space: pre-line; color: #c3b6f5; }
 #radio-hold-reason.reaper-failed { color: #ff8895; }
+
+#theme-trigger { font: inherit; letter-spacing: inherit; color: inherit; background: transparent; border: 0; padding: 4px 0; cursor: pointer; }
+#theme-trigger:focus-visible, #theme-picker button:focus-visible, #theme-picker input:focus-visible { outline: 2px solid #91dbff; outline-offset: 4px; }
+#theme-picker { color: var(--text); background: #171e27; border: 1px solid #778799; border-radius: 16px; padding: 24px; width: min(390px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); }
+#theme-picker::backdrop { background: #07121b88; }
+#theme-picker h2 { margin: 0 0 8px; font-size: 24px; }
+#theme-picker p { color: #c4d0dd; line-height: 1.5; }
+#theme-picker fieldset { border: 0; padding: 0; margin: 20px 0; }
+#theme-picker legend { font-weight: 600; margin-bottom: 10px; }
+#theme-picker label { display: block; padding: 12px 8px; border-radius: 8px; cursor: pointer; }
+#theme-picker label:has(:checked) { background: #304459; }
+#theme-picker input { accent-color: #8bd7ff; margin-right: 8px; }
+#theme-picker label span { display: block; padding-left: 25px; color: #c4d0dd; font-size: 13px; margin-top: 5px; }
+.theme-done { background: #c8eaff; color: #152535; border: 0; border-radius: 8px; padding: 10px 20px; font: inherit; cursor: pointer; }
+#theme-trigger { pointer-events: auto; }

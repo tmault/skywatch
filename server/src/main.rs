@@ -2,6 +2,7 @@ mod adapters;
 mod platform;
 mod seed;
 mod time;
+mod theme;
 mod world;
 mod ws;
 
@@ -27,6 +28,9 @@ const ADAPTER_CHANNEL_BUFFER: usize = 64;
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+
+    let boot_config = theme::BootConfig::parse(std::env::var("SKYWATCH_THEME").ok().as_deref())
+        .unwrap_or_else(|error| panic!("{error}"));
 
     let world: SharedWorld = Arc::new(Mutex::new(World::new()));
     let (deltas, _delta_rx) = broadcast::channel::<String>(BROADCAST_CAPACITY);
@@ -114,6 +118,7 @@ async fn main() {
     let index_bytes = std::fs::read(web_dir.join("index.html")).expect("web/index.html");
 
     let app = Router::new()
+        .route("/config.json", get(move || { let config = boot_config.clone(); async move { axum::Json(config) } }))
         .route("/health", get(|| async { "ok" }))
         .route("/ws", get(ws::ws_handler))
         .with_state(HubState {
