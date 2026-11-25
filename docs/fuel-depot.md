@@ -1,5 +1,11 @@
 # Subscription fuel depot
 
+> **Disabled.** The app no longer creates the depot (no island, tanks, HUD button
+> or panel, and `/?fuel-demo=1` does nothing), and the server no longer starts
+> the usage poll, so `SKYWATCH_USAGE_FILE` is ignored. The code, tests and
+> `/fuel-demo.html` fixture remain dormant. The notes below describe the feature
+> as it behaves when wired in.
+
 The depot displays **authoritative subscription allowances**, independently of the
 thread/aircraft driver. It does not estimate allowances from tokens, costs, context
 occupancy, or rate-limit errors. The live default is explicitly unavailable.
