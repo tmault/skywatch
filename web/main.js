@@ -1858,7 +1858,8 @@ function sendJson(obj) {
 
 setupRadio({
   send: (id, text) => sendJson({ type: 'message', aircraft_id: id, text }),
-  approve: (id) => sendJson({ type: 'approve', aircraft_id: id }),
+  approve: (id, request_id) => sendJson({ type: 'approve', aircraft_id: id, request_id }),
+  reject: (id, request_id) => sendJson({ type: 'reject', aircraft_id: id, request_id }),
   close: () => stopFollow(true),
 });
 
@@ -1880,6 +1881,10 @@ function connect() {
   ws.addEventListener('message', (ev) => {
     let frame;
     try { frame = JSON.parse(ev.data); } catch { return; }
+    if (frame.type === 'command_result') {
+      appendHistory(frame.aircraft_id, frame.ok ? 'backend' : 'error', frame.message);
+      return;
+    }
     if (frame.type !== 'snapshot' && frame.type !== 'delta') return;
     applySnapshot(frame.snapshot);
   });

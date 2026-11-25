@@ -42,14 +42,24 @@ async fn main() {
     // T3 adapter: mirror recent T3 threads as aircraft. SKYWATCH_T3=0
     // disables; when enabled it takes the adapter channel and the demo
     // seed is skipped so the world shows real traffic only.
-    let t3_mode = match std::env::var("SKYWATCH_T3").as_deref() {
-        Ok("0") | Ok("false") => false,
-        _ => true,
-    };
-
-    if t3_mode {
-        let world = Arc::clone(&world);
-        tokio::spawn(adapters::t3::run(world, adapter_rx));
+    let driver = adapters::config::select(
+        std::env::var("SKYWATCH_DRIVER").ok().as_deref(),
+        std::env::var("SKYWATCH_T3").ok().as_deref(),
+    )
+    .expect("invalid driver configuration");
+    let live_mode = driver != adapters::config::Driver::Disabled;
+    if driver == adapters::config::Driver::OpenCode {
+        let config =
+            adapters::opencode::Config::from_env().unwrap_or_else(|error| panic!("{error}"));
+        tokio::spawn(adapters::opencode::run(
+            Arc::clone(&world),
+            adapter_rx,
+            config,
+            deltas.clone(),
+        ));
+        tracing::info!("OpenCode adapter enabled");
+    } else if driver == adapters::config::Driver::T3 {
+        tokio::spawn(adapters::t3::run(Arc::clone(&world), adapter_rx));
         tracing::info!("t3 adapter enabled");
     } else if demo_mode {
         {
@@ -108,6 +118,7 @@ async fn main() {
         .route("/ws", get(ws::ws_handler))
         .with_state(HubState {
             world,
+            demo: !live_mode && demo_mode,
             deltas,
             adapter_tx,
         })
@@ -135,7 +146,11 @@ async fn main() {
 
     let port = std::env::var("SKYWATCH_PORT").unwrap_or_else(|_| "8422".to_string());
     let host = std::env::var("SKYWATCH_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let addr = if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
+    let addr = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     tracing::info!("listening on {addr}");
     axum::serve(listener, app).await.unwrap();

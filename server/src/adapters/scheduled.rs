@@ -7,7 +7,8 @@
 //! (cron, systemd timers, launchd, Task Scheduler) plug in later behind
 //! [`JobSource`]; see `docs/scheduled-jobs.md`.
 
-use super::{airport_for_key, bind_conversation, classify_zone, remote, run_sqlite_json};
+use super::fleet::{airport_for_key, bind_conversation, classify_zone};
+use super::{remote, t3::run_sqlite_json};
 use crate::world::{humanize_schedule, Aircraft, Airport, ScheduledJob, World};
 use serde::Deserialize;
 use serde_json::Value;
@@ -15,7 +16,8 @@ use std::collections::{HashMap, HashSet};
 
 /// Only the columns Skywatch shows. Never `prompt`, `webhook_token`,
 /// `webhook_secret`, workspace or runtime settings.
-pub(super) const SCHEDULED_TASKS_SQL: &str = "SELECT s.task_id, s.title, s.enabled, s.schedule_json, s.thread_id, \
+pub(super) const SCHEDULED_TASKS_SQL: &str =
+    "SELECT s.task_id, s.title, s.enabled, s.schedule_json, s.thread_id, \
        s.next_run_at, s.last_run_at, s.last_run_status, s.run_count, \
        json_extract(s.model_selection_json, '$.model') AS model, p.title AS project \
        FROM scheduled_tasks s LEFT JOIN projection_projects p ON p.project_id = s.project_id \
@@ -78,7 +80,14 @@ struct RemoteTask {
     run_count: Option<u64>,
 }
 
-fn job(schedule: String, enabled: bool, next: Option<String>, last: Option<String>, status: String, count: Option<u64>) -> ScheduledJob {
+fn job(
+    schedule: String,
+    enabled: bool,
+    next: Option<String>,
+    last: Option<String>,
+    status: String,
+    count: Option<u64>,
+) -> ScheduledJob {
     ScheduledJob {
         schedule,
         enabled,
@@ -102,7 +111,14 @@ pub(super) fn parse_local_tasks(raw: &str) -> Vec<JobEntry> {
             project: r.project,
             thread_id: r.thread_id,
             model: r.model,
-            job: job(humanize_schedule(&r.schedule_json), r.enabled, r.next_run_at, r.last_run_at, r.last_run_status, r.run_count),
+            job: job(
+                humanize_schedule(&r.schedule_json),
+                r.enabled,
+                r.next_run_at,
+                r.last_run_at,
+                r.last_run_status,
+                r.run_count,
+            ),
         })
         .collect()
 }
@@ -166,7 +182,11 @@ impl JobSource for NotYetAvailable {
     }
     fn list(&self) -> Vec<OsJob> {
         static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| tracing::info!("SKYWATCH_OS_JOBS is set, but OS scheduler adapters are not available yet"));
+        WARNED.call_once(|| {
+            tracing::info!(
+                "SKYWATCH_OS_JOBS is set, but OS scheduler adapters are not available yet"
+            )
+        });
         Vec::new()
     }
 }
@@ -189,7 +209,14 @@ pub(super) fn os_entries(sources: &[Box<dyn JobSource>]) -> Vec<JobEntry> {
                 project: None,
                 thread_id: None,
                 model: None,
-                job: job(format!("{} timer", src.name()), true, j.next_run_at, j.last_run_at, j.last_result, None),
+                job: job(
+                    format!("{} timer", src.name()),
+                    true,
+                    j.next_run_at,
+                    j.last_run_at,
+                    j.last_result,
+                    None,
+                ),
             })
         })
         .collect()
@@ -234,23 +261,36 @@ pub(super) fn apply_jobs(
 ) {
     // Jobs can be the only activity in a project. Give those projects a sector
     // as well, retaining the thread sectors already allocated by apply_poll.
-    let mut projects: Vec<String> = jobs.iter().filter_map(|j| {
-        let (zone, is_project) = classify_zone(j.project.as_deref(), &j.title);
-        is_project.then_some(zone)
-    }).collect();
+    let mut projects: Vec<String> = jobs
+        .iter()
+        .filter_map(|j| {
+            let (zone, is_project) = classify_zone(j.project.as_deref(), &j.title);
+            is_project.then_some(zone)
+        })
+        .collect();
     projects.sort();
     projects.dedup();
     for name in projects {
-        if world.sectors.iter().any(|s| s.name == name) { continue; }
+        if world.sectors.iter().any(|s| s.name == name) {
+            continue;
+        }
         let slot = world.sectors.iter().filter(|s| s.kind == "project").count();
-        if let Some(center) = super::PROJECT_SECTOR_SLOTS.get(slot) {
-            world.sectors.push(super::Sector { name, center: *center,
-                radius: super::PROJECT_SECTOR_RADIUS, kind: "project".into() });
+        if let Some(center) = crate::world::PROJECT_SECTOR_SLOTS.get(slot) {
+            world.sectors.push(crate::world::Sector {
+                name,
+                center: *center,
+                radius: crate::world::PROJECT_SECTOR_RADIUS,
+                kind: "project".into(),
+            });
         }
     }
     // Per airport: running jobs first, then drones already shown (no
     // reshuffling), then the soonest next run. The rest are counted.
-    let shown: HashSet<String> = world.iter().filter(|a| a.scheduled_job.is_some()).map(|a| a.callsign.clone()).collect();
+    let shown: HashSet<String> = world
+        .iter()
+        .filter(|a| a.scheduled_job.is_some())
+        .map(|a| a.callsign.clone())
+        .collect();
     let mut by_airport: HashMap<String, Vec<JobEntry>> = HashMap::new();
     let mut omitted = 0;
     for j in jobs {
@@ -261,11 +301,31 @@ pub(super) fn apply_jobs(
     }
     let mut keep: Vec<(JobEntry, Airport)> = Vec::new();
     for (ap_id, mut list) in by_airport {
-        let ap = world.airports.iter().find(|a| a.id == ap_id).cloned().expect("airport");
-        let next = |j: &JobEntry| j.job.next_run_at.as_deref().and_then(crate::time::parse_rfc3339).unwrap_or(i64::MAX);
+        let ap = world
+            .airports
+            .iter()
+            .find(|a| a.id == ap_id)
+            .cloned()
+            .expect("airport");
+        let next = |j: &JobEntry| {
+            j.job
+                .next_run_at
+                .as_deref()
+                .and_then(crate::time::parse_rfc3339)
+                .unwrap_or(i64::MAX)
+        };
         list.sort_by_key(|j| {
-            let on_screen = reapers.by_key.get(&j.key).is_some_and(|cs| shown.contains(cs));
-            (!j.job.running, !on_screen, !j.job.enabled, next(j), j.key.clone())
+            let on_screen = reapers
+                .by_key
+                .get(&j.key)
+                .is_some_and(|cs| shown.contains(cs));
+            (
+                !j.job.running,
+                !on_screen,
+                !j.job.enabled,
+                next(j),
+                j.key.clone(),
+            )
         });
         let cap = world.ramp_capacity(&ap_id);
         omitted += list.len().saturating_sub(cap);
@@ -281,7 +341,9 @@ pub(super) fn apply_jobs(
         .map(|a| a.callsign.clone())
         .collect();
     for cs in dropped {
-        let on_ground = world.get_mut(&cs).is_some_and(|a| a.altitude <= 0.0 && !a.in_runway_sequence());
+        let on_ground = world
+            .get_mut(&cs)
+            .is_some_and(|a| a.altitude <= 0.0 && !a.in_runway_sequence());
         if on_ground {
             world.remove_by_callsign(&cs);
         } else if let Some(a) = world.get_mut(&cs) {
@@ -298,12 +360,18 @@ pub(super) fn apply_jobs(
             };
             world.add(Aircraft::reaper(&cs, &ap, slot, entry.job.clone()));
         }
-        if world.get_mut(&cs).is_some_and(|a| a.scheduled_job.is_none()) {
+        if world
+            .get_mut(&cs)
+            .is_some_and(|a| a.scheduled_job.is_none())
+        {
             let Some(slot) = world.free_ramp_slot(&ap.id) else {
                 omitted += 1;
                 continue;
             };
-            world.get_mut(&cs).expect("existing reaper").restore_reaper(slot);
+            world
+                .get_mut(&cs)
+                .expect("existing reaper")
+                .restore_reaper(slot);
         }
         // Loiter over the job's project sector when it has one on the map,
         // otherwise over the domain zone its title suggests.
@@ -315,16 +383,33 @@ pub(super) fn apply_jobs(
         };
         let a = world.get_mut(&cs).expect("reaper exists");
         a.set_airport(&ap);
-        a.device = Some(if ap.is_home { home_name.to_owned() } else { ap.name.clone() });
+        a.device = Some(if ap.is_home {
+            home_name.to_owned()
+        } else {
+            ap.name.clone()
+        });
         a.title = Some(entry.title.clone());
         a.model = entry.model.clone();
         a.assign(&zone);
-        let phase = a.scheduled_job.as_ref().map(|j| j.phase).unwrap_or_default();
-        a.scheduled_job = Some(ScheduledJob { phase, ..entry.job.clone() });
-        a.hold_reason = entry.job.last_run_failed().then(|| "last scheduled run failed".to_owned());
+        let phase = a
+            .scheduled_job
+            .as_ref()
+            .map(|j| j.phase)
+            .unwrap_or_default();
+        a.scheduled_job = Some(ScheduledJob {
+            phase,
+            ..entry.job.clone()
+        });
+        a.hold_reason = entry
+            .job
+            .last_run_failed()
+            .then(|| "last scheduled run failed".to_owned());
         let (environment, thread) = match remote::owner(&entry.key) {
             Some((env, _)) => (Some(env), entry.thread_id.clone()),
-            None => (local_environment.map(str::to_owned), entry.thread_id.clone()),
+            None => (
+                local_environment.map(str::to_owned),
+                entry.thread_id.clone(),
+            ),
         };
         bind_conversation(a, Some(&ap), environment.as_deref(), thread.as_deref());
     }

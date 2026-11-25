@@ -30,10 +30,13 @@ let selectedId = null;
 let onSend = null;
 let onApprove = null;
 let onClose = null;
+let onReject = null;
+let currentRequest = null;
 
-export function setupRadio({ send, approve, close }) {
+export function setupRadio({ send, approve, reject, close }) {
   onSend = send;
   onApprove = approve;
+  onReject = reject;
   onClose = close || null;
 }
 
@@ -84,6 +87,7 @@ export function updateRadio(aircraft) {
 }
 
 function render(a) {
+  currentRequest = a.approval_request_id || null;
   callsignEl.textContent = a.title || a.callsign;
   callsignEl.title = a.title ? a.callsign : '';
 
@@ -159,8 +163,9 @@ function render(a) {
   if (!isReaper(a)) holdReasonEl.classList.remove('reaper-failed');
   holdReasonEl.classList.toggle('reaper-details', isReaper(a));
   // Scheduled jobs are read-only: no messages, approvals, run-now or toggles.
-  if (inputRowEl) inputRowEl.hidden = a.kind === 'tanker' || isReaper(a);
-  actionsEl.hidden = a.state !== 'holding' || isReaper(a);
+  if (inputRowEl) inputRowEl.hidden = a.kind === 'tanker' || isReaper(a) || a.data_stale;
+  actionsEl.hidden = (a.driver === 'opencode' ? !currentRequest : a.state !== 'holding') || isReaper(a) || a.data_stale;
+  rejectBtn.hidden = a.driver !== 'opencode';
   renderConversation(a);
   renderLog();
 }
@@ -186,12 +191,12 @@ function renderConversation(aircraft) {
   let note;
   if (isReaper(aircraft)) {
     note = reference
-      ? 'Read-only view of a scheduled job. Open its thread in T3 to change or run it.'
-      : 'Read-only view of a scheduled job. It has no thread yet; manage it in T3.';
+      ? 'Read-only view of a scheduled job. Open its conversation in the backend to manage it.'
+      : 'Read-only view of a scheduled job. It has no thread yet; manage it in the backend.';
   } else if (!reference) note = 'No separate chat is available for this aircraft.';
   else if (aircraft.data_stale) note = 'Owning device is offline. Keep the thread reference to open it later.';
-  else if (!links) note = 'This chat cannot be opened from Skywatch. Use the thread reference in T3.';
-  else note = 'Web requires access to the owning device. The local harness requires the T3 Code desktop handler on this device.';
+  else if (!links) note = 'This chat cannot be opened from Skywatch. Use the session reference in the backend.';
+  else note = 'Web requires access to the owning device. Desktop links require the matching backend application.';
   if (conversationNote.textContent !== note) conversationNote.textContent = note;
 }
 
@@ -236,12 +241,12 @@ textEl.addEventListener('keydown', (ev) => {
 
 approveBtn.addEventListener('click', () => {
   if (selectedId === null || !onApprove) return;
-  appendHistory(selectedId, 'You', 'cleared to continue — approved.');
-  onApprove(selectedId);
+  appendHistory(selectedId, 'You', 'approval requested.');
+  onApprove(selectedId, currentRequest);
 });
 
 rejectBtn.addEventListener('click', () => {
-  closeRadio('request rejected locally.');
+  if (selectedId !== null && onReject && currentRequest) onReject(selectedId, currentRequest);
 });
 
 closeBtn.addEventListener('click', () => closeRadio());

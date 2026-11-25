@@ -252,3 +252,10 @@ Clicking any aircraft opens the right-hand Radio Panel, displaying its airframe 
 cd server
 cargo test
 ```
+
+### OpenCode v2 backend
+
+Set `SKYWATCH_DRIVER=opencode` and configure the OpenCode 2.4.1 server origin and
+password-file mount. The default remains T3. See [driver setup and parity limits](docs/opencode-driver.md)
+and [environment example](docs/opencode.env.example). OpenCode uses the same fleet
+and Reaper reconciliation, with real permission replies and capability-aware links.

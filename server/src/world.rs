@@ -273,6 +273,10 @@ pub struct Aircraft {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_links: Option<ChatLinks>,
     #[serde(default)]
+    pub driver: Option<String>,
+    #[serde(default)]
+    pub approval_request_id: Option<String>,
+    #[serde(default)]
     pub data_stale: bool,
     /// Parent aircraft id for escorting fighter wingmen (sub-agents).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -737,6 +741,8 @@ impl Aircraft {
             environment_id: None,
             thread_id: None,
             chat_links: None,
+            driver: None,
+            approval_request_id: None,
             data_stale: false,
             parent_id: None,
             wing_slot: None,
