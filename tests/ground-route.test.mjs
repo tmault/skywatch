@@ -19,3 +19,20 @@ test('broad home apron uses wider bends than narrow connectors', () => {
   const points=roundedRoute([[103,-40],[103,0],[120,0]]);
   assert.ok(points.some(([x,z])=>x>103.01 && z < -5));
 });
+
+test('production gate departure paints heading-aware reversal and arrival lead-in', async () => {
+  const { productionRoute } = await import('../web/ground-route.js');
+  const departure = productionRoute([[120,0],[103,0],[103,46],[84,46],[56,46]], {startHeading:0,endHeading:-Math.PI/2});
+  assert.ok(departure[1][0] > 120, 'nose initially moves east before reversing');
+  const arrival = productionRoute([[56,-66],[70,-66],[70,-88],[103,-88],[103,0],[120,0]], {endHeading:0});
+  assert.deepEqual(arrival[0],[56,-56]);
+  assert.ok(arrival.some(([x,z])=>x>56 && z>-66), 'exit is rounded interior vertex');
+});
+test('reversal pavement stays upward facing where offset shoulders fold', async()=>{
+  const THREE=await import('../web/vendor/three.module.js');
+  const {routeRibbon}=await import('../web/ground-route.js');
+  const route=roundedRoute([[120,0],[103,0],[103,46]],{startHeading:0});
+  const mesh=routeRibbon(THREE,route,12,3.2,new THREE.MeshBasicMaterial());
+  const normals=mesh.geometry.attributes.normal;
+  for(let i=0;i<normals.count;i++) assert.ok(normals.getY(i)>=0,`normal ${i} faces down`);
+});

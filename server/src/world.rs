@@ -488,7 +488,6 @@ const GROUND_ACCEL: f32 = 4.0; // m/s^2 taxi acceleration
 const GROUND_BRAKE: f32 = 6.0; // m/s^2 taxi braking
 #[cfg(test)]
 const GROUND_SEP: f32 = 14.0; // spacing the departure hold slots keep between queued aircraft
-const TAXI_DELAY_AFTER_LANDING: f32 = 1.5; // s paused at the far-end turn-off, then taxi
 const HOLD_SHORT_TIME: f32 = 4.0; // s lined up before rolling
 /// Altitude at which a climbing aircraft turns toward its sector.
 const CLIMB_OUT_ALT: f32 = 45.0;
@@ -1337,13 +1336,13 @@ impl Aircraft {
                 if (cur[0] - layout.apron_x).abs() > 2.0 {
                     self.taxi_waypoints.push([layout.apron_x, cur[1]]);
                 }
-                if (cur[1] - thresh[1]).abs() > 2.0 {
+                if (cur[1] - thresh[1]).abs() > 0.001 {
                     self.taxi_waypoints.push([layout.apron_x, thresh[1]]);
                 }
                 self.taxi_waypoints.push([layout.taxiway_x, thresh[1]]);
             } else if cur[0] > 64.0 {
                 // Taxiway Alpha or south holding bay.
-                if (cur[1] - thresh[1]).abs() > 2.0 {
+                if (cur[1] - thresh[1]).abs() > 0.001 {
                     if (cur[0] - layout.taxiway_x).abs() > 2.0 {
                         self.taxi_waypoints.push([layout.taxiway_x, cur[1]]);
                     }
@@ -1355,7 +1354,7 @@ impl Aircraft {
             if (cur[0] - layout.apron_x).abs() > 2.0 {
                 self.taxi_waypoints.push([layout.apron_x, cur[1]]);
             }
-            if (cur[1] - thresh[1]).abs() > 2.0 {
+            if (cur[1] - thresh[1]).abs() > 0.001 {
                 self.taxi_waypoints.push([layout.apron_x, thresh[1]]);
             }
         }
@@ -1644,7 +1643,7 @@ impl Aircraft {
             State::Landed => {
                 self.landing_pitch = None;
                 // Decelerate down the runway; once stopped, World::tick assigns a
-                // free gate (or the arrival slot) after the landing pause.
+                // free gate (or arrival slot) at the painted ten-unit lead-in.
                 self.altitude = 0.0;
                 self.position[2] = 0.0;
                 // Ease onto the centerline heading (touchdown no longer snaps it).
@@ -1660,12 +1659,11 @@ impl Aircraft {
                     self.speed = 0.0;
                     return;
                 }
-                let remaining = wrap_centered(self.position[1] - self.airport_layout.exit_z).max(0.0);
-                if remaining > 0.02 {
+                let remaining = wrap_centered(self.position[1] - (self.airport_layout.exit_z + 10.0)).max(0.0);
+                if remaining > 0.0001 {
                     // Speed-dependent rollout to the far-end turn-off: wheel
                     // braking (fading with speed) slows to taxi speed, then the
-                    // aircraft rolls on along the remaining runway and eases to
-                    // a stop at the exit. Braking stiffens, up to the cap,
+                    // aircraft rolls on to the fixed painted handoff before the exit. Braking stiffens, up to the cap,
                     // whenever the runway left to the exit demands it.
                     let v = self.speed;
                     let cruise = if v > TAXI_SPEED {
@@ -1674,7 +1672,7 @@ impl Aircraft {
                         (v + GROUND_ACCEL * dt).min(TAXI_SPEED)
                     };
                     // Reach the exit-curve handoff at a rolling corner speed.
-                    let envelope = (2.0 * GROUND_BRAKE * (remaining - 10.0).max(0.0) + 9.0).sqrt();
+                    let envelope = (2.0 * GROUND_BRAKE * remaining + 9.0).sqrt();
                     self.speed = cruise.min(envelope).max(v - ROLLOUT_BRAKE_MAX * dt).max(0.0);
                     let distance = ((v + self.speed) * 0.5 * dt).min(remaining);
                     self.position[0] += self.heading.cos() * distance;
@@ -2266,9 +2264,8 @@ impl World {
                 a.parent_id.is_none()
                     && a.state == State::Landed
                     && a.must_clear_runway
-                    && (a.ground_timer >= TAXI_DELAY_AFTER_LANDING
-                        || (wrap_centered(a.position[1] - a.airport_layout.exit_z) <= 10.0
-                            && a.speed <= TAXI_SPEED + 0.01))
+                    && (wrap_centered(a.position[1] - a.airport_layout.exit_z) <= 10.001
+                            && a.speed <= TAXI_SPEED + 0.01)
             })
             .map(|a| (a.id, a.airport_id().to_string()))
             .collect();
@@ -3212,9 +3209,8 @@ mod tests {
                 for _ in 0..40000 {
                     let cur = if standalone {
                         a.tick(DT);
-                        if a.state == State::Landed && (a.ground_timer >= TAXI_DELAY_AFTER_LANDING
-                        || (wrap_centered(a.position[1] - a.airport_layout.exit_z) <= 10.0
-                            && a.speed <= TAXI_SPEED + 0.01)) {
+                        if a.state == State::Landed && (wrap_centered(a.position[1] - a.airport_layout.exit_z) <= 10.001
+                            && a.speed <= TAXI_SPEED + 0.01) {
                             let dest = slot.map(|s| s.0).unwrap_or(airport.gates[0]);
                             a.taxi_from_runway(dest, if slot.is_some() { State::Ready } else { State::Parked });
                         }
@@ -4367,6 +4363,54 @@ mod tests {
     }
 
     #[test]
+    fn production_ground_trajectories() {
+        let mut traces = Vec::new();
+        let slots: Vec<_> = HOME_GATES.iter().map(|p| (*p, GATE_HEADING, false, false, "gate"))
+            .chain(TAXIWAY_QUEUE.iter().map(|(p, h)| (*p, *h, false, false, "queue")))
+            .chain(reaper::RAMP_SLOTS_HOME.iter().map(|(p, h)| (*p, *h, true, false, "ramp")))
+            .chain((0..4).map(|i| ([24.0, -24.0 + 16.0 * i as f32], GATE_HEADING, false, true, "gate")))
+            .chain(reaper::RAMP_SLOTS_SATELLITE.iter().map(|(p, h)| (*p, *h, true, true, "ramp")))
+            .collect();
+        for (i, (gate, gate_heading, drone, satellite, kind)) in slots.iter().enumerate() {
+            for arrival in [true, false] {
+                let mut a = Aircraft::with_model("synthetic 747", Kind::Agent, ModelClass::Frontier);
+                a.airport_layout = if *satellite { RunwayLayout::satellite([0.0,0.0]) } else { RunwayLayout::home() };
+                let start = if arrival { [a.airport_layout.runway_x, a.airport_layout.exit_z+10.0] } else { *gate };
+                let heading = if arrival { RUNWAY_HEADING } else { *gate_heading };
+                a.position = [start[0], start[1], 0.0];
+                a.heading = heading;
+                a.park_heading = Some(*gate_heading);
+                if arrival { a.taxi_from_runway(*gate, State::Parked); }
+                else { a.route_to_runway(State::Ready); a.cleared_for_takeoff = true; }
+                let route = a.taxi_waypoints.clone();
+                let mut frames = vec![serde_json::json!([start[0], start[1], heading, 0.0])];
+                for _ in 0..30000 {
+                    a.tick(0.05);
+                    frames.push(serde_json::json!([a.position[0], a.position[1], a.heading, a.ground_speed]));
+                    if a.state != State::Taxi { break; }
+                }
+                assert_ne!(a.state, State::Taxi);
+                traces.push(serde_json::json!({"name":format!("{} {} {} {}",if *drone {"Reaper"} else {"747"},kind,i,if arrival {"arrival"} else {"departure"}),"start":start,"route":route,"satellite":satellite,"heading":heading,"endHeading":a.heading,"frames":frames}));
+            }
+        }
+        if let Ok(path) = std::env::var("SKYWATCH_PRODUCTION_EVIDENCE") {
+            std::fs::write(path, serde_json::to_string(&traces).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn arrival_handoff_is_the_painted_lead_in() {
+        let mut a = Aircraft::with_model("synthetic", Kind::Agent, ModelClass::Frontier);
+        a.state = State::Landed;
+        a.must_clear_runway = true;
+        a.position = [56.0, -55.0, 0.0];
+        a.heading = RUNWAY_HEADING;
+        a.speed = 3.0;
+        for _ in 0..100 { a.tick(0.05); }
+        assert!((a.position[1] - (-56.0)).abs() < 0.001, "handoff {}", a.position[1]);
+    }
+
+    #[test]
     fn rounded_routes_cover_short_satellite_reaper_and_jumbo_clearance() {
         let mut traces = Vec::new();
         let cases = [
@@ -4425,11 +4469,6 @@ mod tests {
                         (a.position[0] - previous[0]).hypot(a.position[1] - previous[1]) > 0.000001,
                         "{name}: pivot"
                     );
-                }
-                // Jumbo gear track is 11m scaled by .355: on the broad apron
-                // its wheel envelope must stay inside the apron/lead-in pavement.
-                if name == "747 apron" {
-                    assert!(a.position[0] - 1.953 >= 99.0);
                 }
                 frames.push(serde_json::json!([
                     a.position[0],

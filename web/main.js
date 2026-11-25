@@ -22,7 +22,7 @@ import { liveryFor } from './livery.js';
 import { createLocalFlair } from './local-flair.js';
 import { createAlertManager, classifyAircraftUrgency, isPassiveHold } from './alerts.js';
 import { isReaper, reaperLabelStatus } from './reaper.js';
-import { roundedRoute, routeRibbon } from './ground-route.js';
+import { productionRoute, routeRibbon } from './ground-route.js';
 
 const WORLD_SIZE = 820;
 const INTERP_RATE = 10; // exponential smoothing constant (per second)
@@ -157,12 +157,12 @@ const radars = [];
 // lead-in lines, stand boxes, a hold-short bar and a couple of low hangars.
 // `slots` are [x, z, heading] in island-local coordinates (server
 // RAMP_SLOTS_*), `lane` the painted lead line(s) [x0, z0, x1, z1].
-function addRoundedGroundRoute(island, vertices, pavement, paint, width = 12, endHeading) {
+function addRoundedGroundRoute(island, vertices, pavement, paint, width = 12, endHeading, startHeading) {
   const start = vertices[0], end = vertices.at(-1);
   const runwayExit = (start[0] === 56 && start[1] === -66) || (start[0] === 4 && start[1] === -30.5);
   const runwayEntry = (end[0] === 56 && end[1] === 46) || (end[0] === 4 && end[1] === 30);
-  const points = roundedRoute(vertices, {
-    startHeading: runwayExit ? -Math.PI / 2 : undefined,
+  const points = productionRoute(vertices, {
+    startHeading: startHeading ?? (runwayExit ? -Math.PI / 2 : undefined),
     endHeading: endHeading ?? (runwayEntry ? -Math.PI / 2 : undefined),
   });
   // Existing slabs support the ribbons; the ribbon rounds their inside shoulders.
@@ -189,12 +189,6 @@ function buildReaperRamp(island, { pad, slots, lanes, hold, hangars }) {
     const horizontal = Math.abs(z1 - z0) < 0.01;
     const len = horizontal ? Math.abs(x1 - x0) : Math.abs(z1 - z0);
     island.add(makeMarking(horizontal ? len : 0.75, horizontal ? 0.75 : len, (x0 + x1) / 2, (z0 + z1) / 2, markY, yellow));
-  }
-  const spine = lanes[0][0];
-  for (const [x, z, heading] of slots) {
-    for (const direction of [-1, 1]) {
-      addRoundedGroundRoute(island, [[spine, z + direction * 10], [spine, z], [x, z]], rampMat, yellow, 8, heading);
-    }
   }
   // Stand boxes: a violet "R" stand outline per slot with a lead-in line.
   for (const [x, z, heading] of slots) {
@@ -351,8 +345,9 @@ function buildHomeAirport(ap) {
     }
   }
 
-  // Dedicated Parallel Taxiway Alpha: 14 wide x 134 long at [84, -8].
-  const taxiway = makeDeckSlab(14, 134, TARMAC_TOP_Y, 0.4, taxiMat);
+  // Dedicated Parallel Taxiway Alpha: 16 wide x 134 long at [84, -8] so jumbo
+  // nose gear stays inside both edges when turning into Alpha queue slots.
+  const taxiway = makeDeckSlab(16, 134, TARMAC_TOP_Y, 0.4, taxiMat);
   taxiway.position.x = 84;
   taxiway.position.z = -8;
   island.add(taxiway);
@@ -362,7 +357,7 @@ function buildHomeAirport(ap) {
   const blueLightMat = new THREE.MeshBasicMaterial({ color: 0x38a6ff });
   const amberLightMat = new THREE.MeshBasicMaterial({ color: 0xffb830 });
   for (let tz = -68; tz <= 52; tz += 15) {
-    for (const side of [-7.3, 7.3]) {
+    for (const side of [-8.3, 8.3]) {
       const bL = new THREE.Mesh(new THREE.SphereGeometry(0.32, 6, 6), blueLightMat);
       bL.position.set(84 + side, markY + 0.3, tz);
       island.add(bL);
@@ -459,13 +454,19 @@ function buildHomeAirport(ap) {
   // Full arrival loop and departure branches use the server's tangent fillets.
   for (const [gx, gz] of ap.gates) {
     addRoundedGroundRoute(island, [[56, -66], [70, -66], [70, -88], [103, -88], [103, gz], [gx, gz]], taxiMat, yellowLineMat);
-    addRoundedGroundRoute(island, [[gx, gz], [103, gz], [103, 46], [84, 46], [56, 46]], taxiMat, yellowLineMat);
+    addRoundedGroundRoute(island, [[gx, gz], [103, gz], [103, 46], [84, 46], [56, 46]], taxiMat, yellowLineMat, 12, -Math.PI / 2, 0);
   }
   for (const [x, z, heading] of [[78, 46, Math.PI], [84, 22, Math.PI / 2], [84, 0, Math.PI / 2], [84, -22, Math.PI / 2], [84, -44, Math.PI / 2], [84, -66, Math.PI / 2]]) {
     addRoundedGroundRoute(island, [[56, -66], [70, -66], [70, -88], [103, -88], [103, z], [x, z]], taxiMat, yellowLineMat, 12, heading);
   }
-  addRoundedGroundRoute(island, [[70, -66], [70, -88], [84, -88], [84, -126]], taxiMat, yellowLineMat);
-  addRoundedGroundRoute(island, [[84, -104], [84, -88], [103, -88], [103, 46], [90, 46]], taxiMat, yellowLineMat);
+  addRoundedGroundRoute(island, [[84, -66], [84, 46], [56, 46]], taxiMat, yellowLineMat, 12, -Math.PI / 2, Math.PI / 2);
+  // Full ramp routes retain the same endpoint blends as moving aircraft.
+  for (const [x, z, heading] of [[68, -104, 0], [100, -104, Math.PI], [68, -126, 0], [100, -126, Math.PI]]) {
+    addRoundedGroundRoute(island, [[56, -66], [70, -66], [70, -88], [84, -88], [84, z], [x, z]], taxiMat, yellowLineMat, 12, heading);
+    addRoundedGroundRoute(island, [[x, z], [84, z], [84, -88], [103, -88], [103, 46], [84, 46], [56, 46]], taxiMat, yellowLineMat, 12, -Math.PI / 2, heading);
+    addRoundedGroundRoute(island, [[x, z], [84, z], [84, -88], [103, -88], [103, 46], [96, 46]], taxiMat, yellowLineMat, 12, Math.PI, heading);
+    addRoundedGroundRoute(island, [[96, 46], [103, 46], [103, -88], [84, -88], [84, z], [x, z]], taxiMat, yellowLineMat, 12, heading, Math.PI);
+  }
   // Airport name banner above the tower.
   const label = makeBannerLabel(ap.name.toUpperCase(), 0xffffff, SWISS_RED, 10);
   label.position.set(towerSpot.x, 63, towerSpot.z);
@@ -582,6 +583,12 @@ function buildSatelliteAirport(ap, idx) {
     island.add(connector);
   }
 
+  // Jumbo nose gear sweeps beyond the narrow runway edge during the
+  // heading blend. This is production pavement, checked against rotated tyres.
+  const turnPad = makeDeckSlab(28, 16, TARMAC_TOP_Y - 0.03, 0.35, apronMat);
+  turnPad.position.set(4, turnPad.position.y, 30);
+  island.add(turnPad);
+
   // Elevated apron + small terminal + 4 gates.
   // Apron and terminal sit far enough east that a nose-in jet (gate x = +24,
   // nose up to ~15u ahead of it) stops well short of the terminal glass.
@@ -612,10 +619,15 @@ function buildSatelliteAirport(ap, idx) {
 
   for (const [gx, gz] of ap.gates) {
     const x = gx - cx, z = gz - cz;
-    addRoundedGroundRoute(island, [[4, -30.5], [16, -30.5], [16, z], [x, z]], apronMat, yellowLineMat, 6);
-    addRoundedGroundRoute(island, [[x, z], [16, z], [16, 30], [4, 30]], apronMat, yellowLineMat, 6);
+    addRoundedGroundRoute(island, [[4, -30.5], [16, -30.5], [16, z], [x, z]], apronMat, yellowLineMat, 12);
+    addRoundedGroundRoute(island, [[x, z], [16, z], [16, 30], [4, 30]], apronMat, yellowLineMat, 12, -Math.PI / 2, 0);
   }
-  addRoundedGroundRoute(island, [[4, -30.5], [16, -30.5], [16, -66], [30, -66]], apronMat, yellowLineMat, 6);
+  for (const z of [-46, -66]) {
+    addRoundedGroundRoute(island, [[4, -30.5], [16, -30.5], [16, z], [30, z]], apronMat, yellowLineMat, 12, Math.PI);
+    addRoundedGroundRoute(island, [[30, z], [16, z], [16, 30], [4, 30]], apronMat, yellowLineMat, 12, -Math.PI / 2, Math.PI);
+    addRoundedGroundRoute(island, [[30, z], [16, z], [16, 30]], apronMat, yellowLineMat, 12, Math.PI, Math.PI);
+    addRoundedGroundRoute(island, [[16, 30], [16, z], [30, z]], apronMat, yellowLineMat, 12, Math.PI, Math.PI);
+  }
   // Device name banner (updated dynamically when online/offline changes).
   const label = makeBannerLabel(
     ap.online ? ap.name.toUpperCase() : `${ap.name.toUpperCase()} (OFF)`,

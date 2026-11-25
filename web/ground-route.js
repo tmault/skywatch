@@ -53,6 +53,22 @@ export function routeRibbon(THREE, points, width, y, material) {
   }
   const geometry=new THREE.BufferGeometry();
   geometry.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));
+  // Offset shoulders can fold across a tight reversing centerline. Keep all
+  // pavement triangles upward facing instead of lighting folded faces black.
+  for(let i=0;i<indices.length;i+=3) {
+    const [a,b,c]=indices.slice(i,i+3).map(k=>[positions[k*3],positions[k*3+2]]);
+    if((b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])>0) [indices[i+1],indices[i+2]]=[indices[i+2],indices[i+1]];
+  }
   geometry.setIndex(indices);geometry.computeVertexNormals();
   return new THREE.Mesh(geometry,material);
+}
+
+// Production arrivals hand off at the fixed runway lead-in, ten units before
+// the exit vertex. Use this for both pavement and centerline (and evidence).
+export function productionRoute(vertices, {startHeading, endHeading} = {}) {
+  const [x,z] = vertices[0];
+  const arrival = (x === 56 && z === -66) || (x === 4 && z === -30.5);
+  return roundedRoute(arrival ? [[x,z+10], ...vertices] : vertices, {
+    startHeading: startHeading ?? (arrival ? -Math.PI/2 : undefined), endHeading,
+  });
 }
