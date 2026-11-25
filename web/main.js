@@ -29,7 +29,7 @@ import { createEnvironment } from './environment.js';
 import { setupThemePicker } from './theme-picker.js';
 import {
   SNAPSHOT_STALE_AFTER, clampFrameDt, createMotionTracker, trackSnapshot, stepRoll,
-  followPose, groundContactWeight,
+  followPose, groundContactWeight, shouldReleaseFollow,
 } from './motion.js';
 
 const TARMAC_TOP_Y = 3.2; // elevated runway/apron deck height (well above sand y=2.0)
@@ -1812,6 +1812,7 @@ function startFollow(id) {
   const entry = meshes.get(id);
   const a = currentSnapshot.get(id);
   if (!entry || !a) return;
+  if (shouldReleaseFollow(a.state, a.position?.[2])) return;
   followId = id;
   followLastPos = entry.group.position.clone();
   followSwoop = true;
@@ -2645,7 +2646,9 @@ function animate() {
   // Follow camera: track the selected aircraft while keeping OrbitControls active.
   if (followId !== null) {
     const entry = meshes.get(followId);
-    if (entry) {
+    if (entry && shouldReleaseFollow(entry.state, entry.altitude)) {
+      stopFollow(true);
+    } else if (entry) {
       const pos = entry.group.position;
       if (followLastPos) {
         const move = pos.clone().sub(followLastPos);

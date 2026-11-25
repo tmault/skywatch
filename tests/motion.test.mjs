@@ -3,6 +3,7 @@ import test from 'node:test';
 import * as THREE from '../web/vendor/three.module.js';
 import {
   clampFrameDt, createMotionTracker, trackSnapshot, stepRoll, followPose, groundContactWeight,
+  shouldReleaseFollow,
 } from '../web/motion.js';
 
 const TICK = 0.05;
@@ -169,4 +170,17 @@ test('deck contact correction fades in on approach and stays on through taxi', (
     assert.ok(weight >= previous && weight - previous < 0.02, `hop at ${alt}`);
     previous = weight;
   }
+});
+
+test('follow camera releases once a departing aircraft lifts off', () => {
+  assert.equal(shouldReleaseFollow('taxi', 0), false);
+  assert.equal(shouldReleaseFollow('ready', 0), false);
+  assert.equal(shouldReleaseFollow('takeoff', 40), false);
+  assert.equal(shouldReleaseFollow('cruising', 150), false);
+  assert.equal(shouldReleaseFollow('holding', 150), false);
+  assert.equal(shouldReleaseFollow('landing', 30), false);
+  assert.equal(shouldReleaseFollow('departing', 0), false);
+  assert.equal(shouldReleaseFollow('departing', 4.9), false);
+  assert.equal(shouldReleaseFollow('departing', 5.1), true);
+  assert.equal(shouldReleaseFollow('departing', 120), true);
 });

@@ -118,3 +118,11 @@ export function groundContactWeight(state, altitude) {
   const t = Math.max(0, Math.min(1, (24 - altitude) / 18));
   return t * t * (3 - 2 * t);
 }
+
+/**
+ * Release the follow camera once a finished (`departing`) aircraft has lifted
+ * off so the camera is never dragged off the map into the horizon.
+ */
+export function shouldReleaseFollow(state, altitude) {
+  return state === 'departing' && (altitude || 0) > 5;
+}
