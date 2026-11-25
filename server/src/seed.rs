@@ -527,7 +527,8 @@ mod tests {
                 }
             }
         };
-        run_until(&mut world, State::Takeoff, 60.0);
+        // Backtracking includes a moving U-turn to align with the runway.
+        run_until(&mut world, State::Takeoff, 120.0);
         assert_eq!(state_of(&world), State::Takeoff);
         run_until(&mut world, State::Cruising, 60.0);
         assert_eq!(state_of(&world), State::Cruising);
