@@ -316,10 +316,6 @@ function buildReaperRamp(island, { pad, slots, hold, hangars }) {
     h.rotation.y = rot;
     island.add(h);
   }
-  const sign = makeBannerLabel('REAPER RAMP', 0xd9d2ff, 0x3a2f6b, 4.2);
-  const [sx, sz] = pad[0];
-  sign.position.set(sx, TARMAC_TOP_Y + 9, sz);
-  island.add(sign);
 }
 
 function buildHomeAirport(ap) {
