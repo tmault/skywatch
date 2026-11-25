@@ -88,8 +88,6 @@ async fn main() {
         tokio::spawn(async move { while adapter_rx.recv().await.is_some() {} });
     }
 
-    tokio::spawn(usage::run(Arc::clone(&world)));
-
     // Sim ticker: advance the world at 20 Hz and broadcast full snapshots.
     {
         let world = Arc::clone(&world);

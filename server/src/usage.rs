@@ -1,4 +1,8 @@
 //! Authoritative allowance seam, independent of the thread/flight driver.
+//!
+//! Currently disabled: the server does not spawn `run`, so snapshots carry the
+//! default unavailable reading. The module is kept dormant for re-enabling.
+#![allow(dead_code)]
 use crate::time::{format_rfc3339, parse_rfc3339};
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};

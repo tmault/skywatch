@@ -9,7 +9,7 @@ import {
   appendHistory, stateColor,
 } from './radio.js';
 import {
-  buildAlpineIsland, makeSwissFlag, updateAlpine, SWISS_RED,
+  makeSwissFlag, updateAlpine, SWISS_RED,
   enableShadows,
 } from './alpine.js';
 import { addRunwayLights } from './runway-lights.js';
@@ -26,9 +26,6 @@ import { productionRoute, routeRibbon, dedupePolylines } from './ground-route.js
 import { createThemeState } from './theme-state.js';
 import { createEnvironment } from './environment.js';
 import { setupThemePicker } from './theme-picker.js';
-import { createFuelDepot } from './fuel-depot.js';
-import { syntheticFuelSnapshot } from './fuel-fixtures.js';
-const fuelDemo = new URLSearchParams(location.search).get('fuel-demo') === '1' ? syntheticFuelSnapshot() : null;
 
 const INTERP_RATE = 10; // exponential smoothing constant (per second)
 const TARMAC_TOP_Y = 3.2; // elevated runway/apron deck height (well above sand y=2.0)
@@ -118,29 +115,9 @@ let themeStorage;
 try { themeStorage = window.localStorage; } catch { /* disabled storage */ }
 const themeState = createThemeState(bootConfig.theme, themeStorage);
 const environment = createEnvironment({ scene, sun, hemisphere, state: themeState });
-const fuelDepot = createFuelDepot(scene, {
-  theme: themeState.theme,
-  decorate({ theme, THREE: T, radius }) {
-    const root = new T.Group();
-    buildAlpineIsland(root, {
-      seed: 4.7,
-      center: [0, 0],
-      radius: radius + 12,
-      hilliness: 1.5,
-      snowLine: 22,
-      pads: [{ x: 0, z: 0, hw: 24, hl: 24 }],
-      peaks: [],
-      treeCount: 14,
-      chaletCount: 0,
-      rockCount: 8,
-      theme,
-    });
-    return root;
-  },
-});
 const disposeThemePicker = setupThemePicker(themeState);
 window.addEventListener('pagehide', event => {
-  if (!event.persisted) { fuelDepot.dispose(); disposeThemePicker(); environment.dispose(); }
+  if (!event.persisted) { disposeThemePicker(); environment.dispose(); }
 });
 
 /* ----------------------------------------------------- runway events */
@@ -1890,11 +1867,6 @@ function releaseHeldKeys() {
 
 window.addEventListener('keydown', (ev) => {
   if (document.getElementById('theme-picker').open) return;
-  const fuelPanel = document.getElementById('fuel-depot-panel');
-  if (fuelPanel && !fuelPanel.hidden && (fuelPanel.contains(ev.target) || fuelPanel.contains(document.activeElement))) {
-    releaseHeldKeys();
-    return;
-  }
   if (ev.key === 'Escape' && followId !== null) {
     stopFollow(true);
     closeRadio();
@@ -2038,7 +2010,6 @@ function connect() {
 }
 
 function applySnapshot(snapshot) {
-  fuelDepot.update(fuelDemo || snapshot.usage);
   currentSnapshot.clear();
   for (const a of snapshot.aircraft || []) currentSnapshot.set(a.id, a);
   const aircraft = snapshot.aircraft || [];
