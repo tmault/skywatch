@@ -22,6 +22,9 @@ import { liveryFor } from './livery.js';
 import { createLocalFlair } from './local-flair.js';
 import { createAlertManager, classifyAircraftUrgency, isPassiveHold } from './alerts.js';
 import { isReaper, reaperLabelStatus } from './reaper.js';
+import { createFuelDepot } from './fuel-depot.js';
+import { syntheticFuelSnapshot } from './fuel-fixtures.js';
+const fuelDemo = new URLSearchParams(location.search).get('fuel-demo') === '1' ? syntheticFuelSnapshot() : null;
 
 const WORLD_SIZE = 820;
 const INTERP_RATE = 10; // exponential smoothing constant (per second)
@@ -39,6 +42,8 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
+const fuelDepot = createFuelDepot(scene);
+window.addEventListener('pagehide', () => fuelDepot.dispose(), { once: true });
 // Sky gradient background.
 {
   const skyCanvas = document.createElement('canvas');
@@ -1886,6 +1891,7 @@ function connect() {
 }
 
 function applySnapshot(snapshot) {
+  fuelDepot.update(fuelDemo || snapshot.usage);
   currentSnapshot.clear();
   for (const a of snapshot.aircraft || []) currentSnapshot.set(a.id, a);
   const aircraft = snapshot.aircraft || [];

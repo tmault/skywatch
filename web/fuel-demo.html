@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en" data-theme="alpine">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Skywatch fuel depot · synthetic fixture</title>
+<link rel="stylesheet" href="/style.css">
+<style>body{margin:0;background:#193747}canvas{display:block}#fixture-caption{position:fixed;top:18px;left:20px;color:white;font:16px/1.5 system-ui;background:#102936dd;padding:12px 18px;border-radius:8px}#fixture-caption strong{display:block}#fixture-caption select{margin-left:10px}#fuel-depot-panel{top:100px}</style>
+<canvas id="fixture-scene" aria-label="Synthetic subscription fuel tanks; use Fuel depot for text details"></canvas>
+<div id="fixture-caption"><strong>SYNTHETIC DEMO · no live account data</strong>Subscription fuel depot <select aria-label="Preview theme"><option>alpine</option><option>tropical</option><option>winter</option></select></div>
+<script type="importmap">{ "imports": { "three": "/vendor/three.module.js" } }</script>
+<script type="module">
+import * as THREE from './vendor/three.module.js';
+import { OrbitControls } from './vendor/OrbitControls.js';
+import { createFuelDepot } from './fuel-depot.js';
+import { syntheticFuelSnapshot } from './fuel-fixtures.js';
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0x284d60);
+scene.add(new THREE.HemisphereLight(0xe5f4ff, 0x67765b, 2));
+const sun = new THREE.DirectionalLight(0xffffff, 3); sun.position.set(120, 180, 80); scene.add(sun);
+const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.1, 1000);
+camera.position.set(192, 79, 234);
+const renderer = new THREE.WebGLRenderer({ canvas: document.querySelector('canvas'), antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); renderer.setSize(innerWidth, innerHeight);
+const controls = new OrbitControls(camera, renderer.domElement); controls.target.set(160, 7, 155); controls.update();
+const depot = createFuelDepot(scene); depot.update(syntheticFuelSnapshot());
+document.querySelector('select').onchange = e => {
+ document.documentElement.dataset.theme = e.target.value;
+ window.dispatchEvent(new CustomEvent('skywatch-theme-change', { detail: { theme: e.target.value } }));
+};
+let animation;
+function frame() { animation = requestAnimationFrame(frame); controls.update(); renderer.render(scene, camera); } frame();
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+addEventListener('pagehide', () => { cancelAnimationFrame(animation); depot.dispose(); controls.dispose(); renderer.dispose(); }, { once:true });
+</script>
+</html>

@@ -1921,6 +1921,7 @@ pub fn refuel_formation_position(
 /// Snapshot of the whole world, ready to serialise over the wire.
 #[derive(Clone, Debug, Serialize)]
 pub struct WorldSnapshot {
+    pub usage: crate::usage::UsageSnapshot,
     pub aircraft: Vec<Aircraft>,
     pub sectors: Vec<Sector>,
     pub airports: Vec<Airport>,
@@ -1954,6 +1955,7 @@ pub fn default_sectors() -> Vec<Sector> {
 
 #[derive(Clone, Debug)]
 pub struct World {
+    pub usage: crate::usage::UsageSnapshot,
     pub aircraft: Vec<Aircraft>,
     pub airports: Vec<Airport>,
     pub omitted_threads: usize,
@@ -1968,6 +1970,7 @@ pub struct World {
 impl Default for World {
     fn default() -> Self {
         Self {
+            usage: crate::usage::UsageSnapshot::unavailable(0),
             aircraft: Vec::new(),
             airports: vec![Airport::home("local", "Tower")],
             omitted_threads: 0,
@@ -2645,6 +2648,7 @@ impl World {
 
     pub fn snapshot(&self) -> WorldSnapshot {
         WorldSnapshot {
+            usage: self.usage.clone(),
             aircraft: self.aircraft.clone(),
             sectors: self.sectors.clone(),
             airports: self.airports.clone(),

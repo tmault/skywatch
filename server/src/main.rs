@@ -2,6 +2,7 @@ mod adapters;
 mod platform;
 mod seed;
 mod time;
+mod usage;
 mod world;
 mod ws;
 
@@ -72,6 +73,8 @@ async fn main() {
         // Neither adapter nor demo: drain the channel.
         tokio::spawn(async move { while adapter_rx.recv().await.is_some() {} });
     }
+
+    tokio::spawn(usage::run(Arc::clone(&world)));
 
     // Sim ticker: advance the world at 20 Hz and broadcast full snapshots.
     {
