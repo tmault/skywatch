@@ -22,7 +22,7 @@ import { liveryFor } from './livery.js';
 import { createLocalFlair } from './local-flair.js';
 import { createAlertManager, classifyAircraftUrgency, isPassiveHold } from './alerts.js';
 import { isReaper, reaperLabelStatus } from './reaper.js';
-import { productionRoute, routeRibbon } from './ground-route.js';
+import { productionRoute, routeRibbon, dedupePolylines } from './ground-route.js';
 import { createThemeState } from './theme-state.js';
 import { createEnvironment } from './environment.js';
 import { setupThemePicker } from './theme-picker.js';
@@ -163,11 +163,66 @@ function makeDeckSlab(w, l, topY, thickness, mat) {
   return mesh;
 }
 
+// Soft-edge mipmapped textures keep thin runway and taxiway lines crisp and
+// shimmer-free at shallow grazing angles instead of stair-stepping on raw edges.
+const smoothLineTextures = { rect: null, ribbon: null };
+function getSmoothLineTexture(ribbon) {
+  if (typeof document === 'undefined') return null;
+  const key = ribbon ? 'ribbon' : 'rect';
+  if (smoothLineTextures[key]) return smoothLineTextures[key];
+  const size = 64;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = ribbon ? 4 : size;
+  const ctx = canvas.getContext('2d');
+  const img = ctx.createImageData(canvas.width, canvas.height);
+  const smoothstep = (e0, e1, x) => {
+    const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0)));
+    return t * t * (3 - 2 * t);
+  };
+  for (let y = 0; y < canvas.height; y++) {
+    const v = (y + 0.5) / canvas.height;
+    const ay = ribbon ? 1 : smoothstep(0, 0.09, Math.min(v, 1 - v));
+    for (let x = 0; x < canvas.width; x++) {
+      const u = (x + 0.5) / canvas.width;
+      const ax = smoothstep(0, 0.12, Math.min(u, 1 - u));
+      const idx = (y * canvas.width + x) * 4;
+      img.data[idx] = 255;
+      img.data[idx + 1] = 255;
+      img.data[idx + 2] = 255;
+      img.data[idx + 3] = Math.round(255 * ax * ay);
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = ribbon ? THREE.RepeatWrapping : THREE.ClampToEdgeWrapping;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.anisotropy = Math.min(16, renderer?.capabilities?.getMaxAnisotropy?.() || 1);
+  tex.needsUpdate = true;
+  smoothLineTextures[key] = tex;
+  return tex;
+}
+
+function makeSmoothPaintMaterial(color, { ribbon = false, offset = -3 } = {}) {
+  const map = getSmoothLineTexture(ribbon);
+  return new THREE.MeshLambertMaterial({
+    color,
+    ...(map ? { map, transparent: true, depthWrite: false } : {}),
+    polygonOffset: true,
+    polygonOffsetFactor: offset,
+    polygonOffsetUnits: offset,
+  });
+}
+
 // Crisp painted tarmac marking hovering slightly above the deck with polygon offset.
 function makeMarking(w, l, x, z, y, mat) {
   const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, l), mat);
   mesh.rotation.x = -Math.PI / 2;
   mesh.position.set(x, y, z);
+  mesh.renderOrder = 2;
   return mesh;
 }
 
@@ -179,31 +234,53 @@ window.addEventListener('skywatch-theme-change', () => {
 });
 const radars = [];
 
-// Small Reaper ramp: a hangar apron for scheduled-job drones, with painted
-// lead-in lines, stand boxes, a hold-short bar and a couple of low hangars.
-// `slots` are [x, z, heading] in island-local coordinates (server
-// RAMP_SLOTS_*), `lane` the painted lead line(s) [x0, z0, x1, z1].
-function addRoundedGroundRoute(island, vertices, pavement, paint, width = 12, endHeading, startHeading) {
-  const start = vertices[0], end = vertices.at(-1);
-  const runwayExit = (start[0] === 56 && start[1] === -66) || (start[0] === 4 && start[1] === -30.5);
-  const runwayEntry = (end[0] === 56 && end[1] === 46) || (end[0] === 4 && end[1] === 30);
-  const points = productionRoute(vertices, {
-    startHeading: startHeading ?? (runwayExit ? -Math.PI / 2 : undefined),
-    endHeading: endHeading ?? (runwayEntry ? -Math.PI / 2 : undefined),
+// Emit deduplicated pavement and centerline ribbons for all routes on an
+// airport so shared trunks render once with zero coplanar Z-fighting.
+function addRoundedGroundRoutes(island, specs, pavement, paint) {
+  const polylines = specs.map(([vertices, width = 12, endHeading, startHeading]) => {
+    const start = vertices[0], end = vertices.at(-1);
+    const runwayExit = (start[0] === 56 && start[1] === -66) || (start[0] === 4 && start[1] === -30.5);
+    const runwayEntry = (end[0] === 56 && end[1] === 46) || (end[0] === 4 && end[1] === 30);
+    return {
+      width,
+      points: productionRoute(vertices, {
+        startHeading: startHeading ?? (runwayExit ? -Math.PI / 2 : undefined),
+        endHeading: endHeading ?? (runwayEntry ? -Math.PI / 2 : undefined),
+      }),
+    };
   });
-  // Existing slabs support the ribbons; the ribbon rounds their inside shoulders.
-  island.add(routeRibbon(THREE, points, width, TARMAC_TOP_Y + 0.015, pavement));
-  island.add(routeRibbon(THREE, points, 0.7, TARMAC_TOP_Y + 0.09, paint));
+  const pavementMat = pavement.clone();
+  pavementMat.polygonOffset = true;
+  pavementMat.polygonOffsetFactor = -1;
+  pavementMat.polygonOffsetUnits = -1;
+  // Group deduplication by pavement width (typically all 12u).
+  const byWidth = new Map();
+  for (const r of polylines) {
+    if (!byWidth.has(r.width)) byWidth.set(r.width, []);
+    byWidth.get(r.width).push(r.points);
+  }
+  for (const [width, group] of byWidth.entries()) {
+    for (const run of dedupePolylines(group)) {
+      const slab = routeRibbon(THREE, run, width, TARMAC_TOP_Y + 0.015, pavementMat);
+      slab.renderOrder = 1;
+      island.add(slab);
+    }
+  }
+  for (const run of dedupePolylines(polylines.map((r) => r.points))) {
+    const line = routeRibbon(THREE, run, 0.7, TARMAC_TOP_Y + 0.09, paint);
+    line.renderOrder = 3;
+    island.add(line);
+  }
 }
 
-function buildReaperRamp(island, { pad, slots, lanes, hold, hangars }) {
+function buildReaperRamp(island, { pad, slots, hold, hangars }) {
   const rampMat = new THREE.MeshStandardMaterial({ color: 0x353b44, roughness: 0.88 });
   const hangarMat = new THREE.MeshStandardMaterial({ color: 0x59636e, roughness: 0.7, metalness: 0.25 });
   const roofMat = new THREE.MeshStandardMaterial({ color: 0x3d4650, roughness: 0.6, metalness: 0.35 });
   const doorMat = new THREE.MeshStandardMaterial({ color: 0x1f262d, roughness: 0.8 });
-  const yellow = new THREE.MeshLambertMaterial({ color: 0xffc857, polygonOffset: true, polygonOffsetFactor: -2 });
-  const violet = new THREE.MeshLambertMaterial({ color: 0xa996ff, polygonOffset: true, polygonOffsetFactor: -2 });
-  const red = new THREE.MeshLambertMaterial({ color: 0xd93829, polygonOffset: true, polygonOffsetFactor: -2 });
+  const yellow = makeSmoothPaintMaterial(0xffc857);
+  const violet = makeSmoothPaintMaterial(0xa996ff);
+  const red = makeSmoothPaintMaterial(0xd93829);
   const markY = TARMAC_TOP_Y + 0.08;
 
   for (const [x, z, w, l] of pad) {
@@ -211,18 +288,13 @@ function buildReaperRamp(island, { pad, slots, lanes, hold, hangars }) {
     slab.position.set(x, slab.position.y, z);
     island.add(slab);
   }
-  for (const [x0, z0, x1, z1] of lanes) {
-    const horizontal = Math.abs(z1 - z0) < 0.01;
-    const len = horizontal ? Math.abs(x1 - x0) : Math.abs(z1 - z0);
-    island.add(makeMarking(horizontal ? len : 0.75, horizontal ? 0.75 : len, (x0 + x1) / 2, (z0 + z1) / 2, markY, yellow));
-  }
-  // Stand boxes: a violet "R" stand outline per slot with a lead-in line.
+  // Stand boxes: a violet "R" stand outline per slot (curved yellow lead-in
+  // lines are painted by the deduplicated ground-route ribbons).
   for (const [x, z, heading] of slots) {
     const dir = Math.cos(heading) >= 0 ? 1 : -1; // nose toward the lane
     island.add(makeMarking(0.6, 18, x - dir * 7, z, markY, violet));
     island.add(makeMarking(14, 0.6, x, z - 9, markY, violet));
     island.add(makeMarking(14, 0.6, x, z + 9, markY, violet));
-    island.add(makeMarking(9, 0.6, x + dir * 3, z, markY, yellow));
   }
   if (hold) {
     const [hx, hz, horizontal] = hold;
@@ -260,15 +332,10 @@ function buildHomeAirport(ap) {
   const pierWallMat = new THREE.MeshStandardMaterial({ color: 0x626b75, roughness: 0.85 });
   const terminalMat = new THREE.MeshStandardMaterial({ color: 0x4c6070, roughness: 0.6, metalness: 0.2 });
   const glassMat = new THREE.MeshStandardMaterial({ color: 0x7fd4f0, roughness: 0.2, metalness: 0.45 });
-  const lineMat = new THREE.MeshLambertMaterial({
-    color: 0xe6eae0, polygonOffset: true, polygonOffsetFactor: -2,
-  });
-  const yellowLineMat = new THREE.MeshLambertMaterial({
-    color: 0xffc857, polygonOffset: true, polygonOffsetFactor: -2,
-  });
-  const redBoxMat = new THREE.MeshLambertMaterial({
-    color: 0xd93829, polygonOffset: true, polygonOffsetFactor: -2,
-  });
+  const lineMat = makeSmoothPaintMaterial(0xe6eae0, { offset: -2 });
+  const yellowLineMat = makeSmoothPaintMaterial(0xffc857, { offset: -2 });
+  const yellowRibbonMat = makeSmoothPaintMaterial(0xffc857, { ribbon: true, offset: -3 });
+  const redBoxMat = makeSmoothPaintMaterial(0xd93829, { offset: -2 });
 
   // Alpine island: pebble shore, meadows and fir forest, the Tower on a
   // flat-topped summit (west), snowy peaks behind it, and flattened airfield
@@ -379,8 +446,8 @@ function buildHomeAirport(ap) {
   taxiway.position.z = -8;
   island.add(taxiway);
 
-  // Taxiway Alpha continuous yellow centerline + blue taxiway edge lights.
-  island.add(makeMarking(0.85, 126, 84, -10, markY, yellowLineMat));
+  // Taxiway Alpha blue edge lights (yellow centerline is painted cleanly by
+  // the deduplicated rounded ground routes below).
   const blueLightMat = new THREE.MeshBasicMaterial({ color: 0x38a6ff });
   const amberLightMat = new THREE.MeshBasicMaterial({ color: 0xffb830 });
   for (let tz = -68; tz <= 52; tz += 15) {
@@ -397,8 +464,9 @@ function buildHomeAirport(ap) {
     const conn = makeDeckSlab(16, 12, TARMAC_TOP_Y, 0.4, taxiMat);
     conn.position.set(71.5, conn.position.y, cz);
     island.add(conn);
-    island.add(makeMarking(20, 0.8, 72, cz, markY, yellowLineMat));
   }
+  // Midfield connector line (north z=-66 uses the smooth curved exit ribbon).
+  island.add(makeMarking(20, 0.7, 72, -10, markY, yellowLineMat));
 
   // Arrival return loop passes north of Alpha's six holding slots.
   // Matches the server route: (56,-66) -> (70,-66) -> (70,-88)
@@ -413,7 +481,6 @@ function buildHomeAirport(ap) {
   const holdBay = makeDeckSlab(24, 22, TARMAC_TOP_Y, 0.4, taxiMat);
   holdBay.position.set(74, holdBay.position.y, 46);
   island.add(holdBay);
-  island.add(makeMarking(24, 0.85, 72, 46, markY, yellowLineMat));
   island.add(makeMarking(0.65, 18, 68.2, 46, markY, yellowLineMat));
   island.add(makeMarking(0.65, 18, 69.3, 46, markY, yellowLineMat));
   island.add(makeMarking(3.6, 5.0, 72.5, 53.5, markY, redBoxMat));
@@ -437,8 +504,9 @@ function buildHomeAirport(ap) {
     const bridgePad = makeDeckSlab(16, 12, TARMAC_TOP_Y - 0.02, 0.4, taxiMat);
     bridgePad.position.set(95, bridgePad.position.y, cz);
     island.add(bridgePad);
-    island.add(makeMarking(18, 0.75, 93, cz, markY, yellowLineMat));
   }
+  // Midfield apron bridge line (north z=-66 & south z=46 use curved route ribbons).
+  island.add(makeMarking(19, 0.7, 93.5, -10, markY, yellowLineMat));
 
   // Extended Terminal Concourse + central glass atrium along x = 139.
   const terminal = new THREE.Mesh(new THREE.BoxGeometry(10, 6.4, 186), terminalMat);
@@ -451,11 +519,12 @@ function buildHomeAirport(ap) {
   terminalGlass.position.set(133.8, TARMAC_TOP_Y + 3.8, 0);
   island.add(terminalGlass);
 
-  // Gate stand markings + jetbridges for all 10 gates.
+  // Gate stand stop bars + jetbridges for all 10 gates (lead-in lines come from
+  // the curved route ribbons so there are no width steps or double-painted bars).
   const bridgeMat = new THREE.MeshStandardMaterial({ color: 0x9aa9b5, roughness: 0.5, metalness: 0.3 });
   for (const [gx, gz] of ap.gates) {
-    island.add(makeMarking(16, 0.75, gx, gz, markY, yellowLineMat));
-    island.add(makeMarking(0.75, 8, gx + 5.5, gz, markY, yellowLineMat));
+    island.add(makeMarking(5.5, 0.7, gx + 2.75, gz, markY, yellowLineMat));
+    island.add(makeMarking(0.7, 8, gx + 5.5, gz, markY, yellowLineMat));
 
     const bridge = new THREE.Mesh(new THREE.BoxGeometry(9.0, 1.5, 1.8), bridgeMat);
     bridge.position.set(gx + 10.5, TARMAC_TOP_Y + 2.8, gz - 3.2);
@@ -467,33 +536,37 @@ function buildHomeAirport(ap) {
   buildReaperRamp(island, {
     pad: [[84, -114, 50, 38], [84, -91, 14, 8], [84, -142, 44, 12]],
     slots: [[68, -104, 0], [100, -104, Math.PI], [68, -126, 0], [100, -126, Math.PI]],
-    lanes: [[84, -88, 84, -128], [70, -104, 98, -104], [70, -126, 98, -126]],
     hold: [84, -95, true],
     hangars: [[73, -142, 16, 10, 0], [95, -142, 16, 10, 0]],
   });
   // Due jobs hold short at the south apron connector (server HOME_HOLD).
-  const reaperHoldMat = new THREE.MeshLambertMaterial({
-    color: 0xa996ff, polygonOffset: true, polygonOffsetFactor: -2,
-  });
+  const reaperHoldMat = makeSmoothPaintMaterial(0xa996ff, { offset: -2 });
   island.add(makeMarking(0.55, 11, 89.2, 46, markY, reaperHoldMat));
   island.add(makeMarking(0.55, 11, 88.2, 46, markY, reaperHoldMat));
 
-  // Full arrival loop and departure branches use the server's tangent fillets.
+  // Full arrival loop and departure branches use deduplicated G2-smooth fillets.
+  const homeRoutes = [];
   for (const [gx, gz] of ap.gates) {
-    addRoundedGroundRoute(island, [[56, -66], [70, -66], [70, -88], [103, -88], [103, gz], [gx, gz]], taxiMat, yellowLineMat);
-    addRoundedGroundRoute(island, [[gx, gz], [103, gz], [103, 46], [84, 46], [56, 46]], taxiMat, yellowLineMat, 12, -Math.PI / 2, 0);
+    homeRoutes.push([[56, -66], [70, -66], [70, -88], [103, -88], [103, gz], [gx, gz]]);
+    homeRoutes.push([[[gx, gz], [103, gz], [103, 46], [84, 46], [56, 46]], 12, -Math.PI / 2, 0]);
   }
   for (const [x, z, heading] of [[78, 46, Math.PI], [84, 22, Math.PI / 2], [84, 0, Math.PI / 2], [84, -22, Math.PI / 2], [84, -44, Math.PI / 2], [84, -66, Math.PI / 2]]) {
-    addRoundedGroundRoute(island, [[56, -66], [70, -66], [70, -88], [103, -88], [103, z], [x, z]], taxiMat, yellowLineMat, 12, heading);
+    homeRoutes.push([[[56, -66], [70, -66], [70, -88], [103, -88], [103, z], [x, z]], 12, heading]);
   }
-  addRoundedGroundRoute(island, [[84, -66], [84, 46], [56, 46]], taxiMat, yellowLineMat, 12, -Math.PI / 2, Math.PI / 2);
+  homeRoutes.push([[[84, -66], [84, 46], [56, 46]], 12, -Math.PI / 2, Math.PI / 2]);
   // Full ramp routes retain the same endpoint blends as moving aircraft.
   for (const [x, z, heading] of [[68, -104, 0], [100, -104, Math.PI], [68, -126, 0], [100, -126, Math.PI]]) {
-    addRoundedGroundRoute(island, [[56, -66], [70, -66], [70, -88], [84, -88], [84, z], [x, z]], taxiMat, yellowLineMat, 12, heading);
-    addRoundedGroundRoute(island, [[x, z], [84, z], [84, -88], [103, -88], [103, 46], [84, 46], [56, 46]], taxiMat, yellowLineMat, 12, -Math.PI / 2, heading);
-    addRoundedGroundRoute(island, [[x, z], [84, z], [84, -88], [103, -88], [103, 46], [96, 46]], taxiMat, yellowLineMat, 12, Math.PI, heading);
-    addRoundedGroundRoute(island, [[96, 46], [103, 46], [103, -88], [84, -88], [84, z], [x, z]], taxiMat, yellowLineMat, 12, heading, Math.PI);
+    homeRoutes.push([[[56, -66], [70, -66], [70, -88], [84, -88], [84, z], [x, z]], 12, heading]);
+    homeRoutes.push([[[x, z], [84, z], [84, -88], [103, -88], [103, 46], [84, 46], [56, 46]], 12, -Math.PI / 2, heading]);
+    homeRoutes.push([[[x, z], [84, z], [84, -88], [103, -88], [103, 46], [96, 46]], 12, Math.PI, heading]);
+    homeRoutes.push([[[96, 46], [103, 46], [103, -88], [84, -88], [84, z], [x, z]], 12, heading, Math.PI]);
   }
+  addRoundedGroundRoutes(
+    island,
+    homeRoutes.map((r) => (Array.isArray(r[0][0]) ? r : [r])),
+    taxiMat,
+    yellowRibbonMat,
+  );
   // Airport name banner above the tower.
   const label = makeBannerLabel(ap.name.toUpperCase(), 0xffffff, SWISS_RED, 10);
   label.position.set(towerSpot.x, 63, towerSpot.z);
@@ -523,12 +596,9 @@ function buildSatelliteAirport(ap, idx) {
   const apronMat = new THREE.MeshStandardMaterial({ color: 0x394049, roughness: 0.85 });
   const terminalMat = new THREE.MeshStandardMaterial({ color: 0x4c6070, roughness: 0.6, metalness: 0.2 });
   const glassMat = new THREE.MeshStandardMaterial({ color: 0x7fd4f0, roughness: 0.2, metalness: 0.45 });
-  const lineMat = new THREE.MeshLambertMaterial({
-    color: 0xe6eae0, polygonOffset: true, polygonOffsetFactor: -2,
-  });
-  const yellowLineMat = new THREE.MeshLambertMaterial({
-    color: 0xffc857, polygonOffset: true, polygonOffsetFactor: -2,
-  });
+  const lineMat = makeSmoothPaintMaterial(0xe6eae0, { offset: -2 });
+  const yellowLineMat = makeSmoothPaintMaterial(0xffc857, { offset: -2 });
+  const yellowRibbonMat = makeSmoothPaintMaterial(0xffc857, { ribbon: true, offset: -3 });
 
   // Alpine islet: the tower on a grassy knoll west of the runway, a small
   // rocky peak (snow-dusted) to one side, firs and a chalet or two.
@@ -632,7 +702,8 @@ function buildSatelliteAirport(ap, idx) {
   island.add(tGlass);
 
   for (const [gx, gz] of ap.gates) {
-    island.add(makeMarking(10, 0.7, gx - cx + 2, gz - cz, markY, yellowLineMat));
+    island.add(makeMarking(4.8, 0.7, gx - cx + 2.4, gz - cz, markY, yellowLineMat));
+    island.add(makeMarking(0.7, 6.0, gx - cx + 4.8, gz - cz, markY, yellowLineMat));
   }
 
   // Two-stand Reaper ramp north of the apron (server RAMP_SLOTS_SATELLITE),
@@ -640,22 +711,23 @@ function buildSatelliteAirport(ap, idx) {
   buildReaperRamp(island, {
     pad: [[26, -57, 28, 34], [16, -36.5, 8, 3], [5, -60, 14, 16]],
     slots: [[30, -46, Math.PI], [30, -66, Math.PI]],
-    lanes: [[16, -30.5, 16, -70], [18, -46, 28, -46], [18, -66, 28, -66]],
     hold: null,
     hangars: [[5, -60, 10, 12, Math.PI / 2]],
   });
 
+  const satRoutes = [];
   for (const [gx, gz] of ap.gates) {
     const x = gx - cx, z = gz - cz;
-    addRoundedGroundRoute(island, [[4, -30.5], [16, -30.5], [16, z], [x, z]], apronMat, yellowLineMat, 12);
-    addRoundedGroundRoute(island, [[x, z], [16, z], [16, 30], [4, 30]], apronMat, yellowLineMat, 12, -Math.PI / 2, 0);
+    satRoutes.push([[[4, -30.5], [16, -30.5], [16, z], [x, z]], 12]);
+    satRoutes.push([[[x, z], [16, z], [16, 30], [4, 30]], 12, -Math.PI / 2, 0]);
   }
   for (const z of [-46, -66]) {
-    addRoundedGroundRoute(island, [[4, -30.5], [16, -30.5], [16, z], [30, z]], apronMat, yellowLineMat, 12, Math.PI);
-    addRoundedGroundRoute(island, [[30, z], [16, z], [16, 30], [4, 30]], apronMat, yellowLineMat, 12, -Math.PI / 2, Math.PI);
-    addRoundedGroundRoute(island, [[30, z], [16, z], [16, 30]], apronMat, yellowLineMat, 12, Math.PI, Math.PI);
-    addRoundedGroundRoute(island, [[16, 30], [16, z], [30, z]], apronMat, yellowLineMat, 12, Math.PI, Math.PI);
+    satRoutes.push([[[4, -30.5], [16, -30.5], [16, z], [30, z]], 12, Math.PI]);
+    satRoutes.push([[[30, z], [16, z], [16, 30], [4, 30]], 12, -Math.PI / 2, Math.PI]);
+    satRoutes.push([[[30, z], [16, z], [16, 30]], 12, Math.PI, Math.PI]);
+    satRoutes.push([[[16, 30], [16, z], [30, z]], 12, Math.PI, Math.PI]);
   }
+  addRoundedGroundRoutes(island, satRoutes, apronMat, yellowRibbonMat);
   // Device name banner (updated dynamically when online/offline changes).
   const label = makeBannerLabel(
     ap.online ? ap.name.toUpperCase() : `${ap.name.toUpperCase()} (OFF)`,

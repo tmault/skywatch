@@ -1,5 +1,6 @@
-//! Tangent quadratic fillets inside the union of the original paved corridors.
-//! A five-unit tangent offset deviates at most 1.47 units at a right angle.
+//! G2-smooth tangent quintic fillets inside the union of the original paved corridors.
+//! A five-unit tangent offset stays well within 1.1 units at a right angle with zero
+//! curvature jump at entry/exit.
 #[derive(Clone, Debug, Default)]
 pub(super) struct GroundRoute {
     pub points: Vec<([f32; 2], f32)>,
@@ -10,6 +11,14 @@ fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
 }
 fn mix(a: [f32; 2], b: [f32; 2], t: f32) -> [f32; 2] {
     [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+}
+fn eval_bezier(controls: &[[f32; 2]], t: f32) -> ([f32; 2], f32) {
+    let mut ps = controls.to_vec();
+    while ps.len() > 2 {
+        ps = ps.windows(2).map(|w| mix(w[0], w[1], t)).collect();
+    }
+    let h = (ps[1][1] - ps[0][1]).atan2(ps[1][0] - ps[0][0]);
+    (mix(ps[0], ps[1], t), h)
 }
 impl GroundRoute {
     pub fn new(start: [f32; 2], route: &[[f32; 2]], wide_apron: Option<f32>) -> Self {
@@ -43,11 +52,19 @@ impl GroundRoute {
             let entry = [b[0] - u[0] * trim, b[1] - u[1] * trim];
             let exit = [b[0] + v[0] * trim, b[1] + v[1] * trim];
             path.line(previous, entry);
+            // Collinear first/last three control points give zero curvature at
+            // entry and exit (G2 clothoid-like transition without steering snap).
+            let controls = [
+                entry,
+                mix(entry, b, 0.27),
+                mix(entry, b, 0.54),
+                mix(exit, b, 0.54),
+                mix(exit, b, 0.27),
+                exit,
+            ];
             for j in 1..=128 {
                 let t = j as f32 / 128.0;
-                let p = mix(mix(entry, b, t), mix(b, exit, t), t);
-                let d = mix(u, v, t);
-                path.points.push((p, d[1].atan2(d[0])));
+                path.points.push(eval_bezier(&controls, t));
             }
             previous = exit;
         }
@@ -77,9 +94,11 @@ impl GroundRoute {
             {
                 continue;
             }
+            let reverse_hint = (heading - current).cos() < -0.95;
+            let target_span = if reverse_hint { 4.4 } else { 7.5 };
             let mut span = 0.0;
             let mut k = index;
-            while span < 5.0
+            while span < target_span
                 && (if first {
                     k + 1 < self.points.len()
                 } else {
@@ -108,17 +127,17 @@ impl GroundRoute {
                     heading,
                 )
             };
-            let d = span.min(5.0) * 0.45;
+            let reverse = reverse_hint || (ha - hb).cos() < -0.95;
+            let d = span.min(target_span) * 0.45;
             let p1 = [a[0] + ha.cos() * d, a[1] + ha.sin() * d];
             let p2 = [b[0] - hb.cos() * d, b[1] - hb.sin() * d];
-            let reverse = (ha - hb).cos() < -0.95;
             let controls = if reverse {
                 vec![
                     a,
                     p1,
                     [
-                        (a[0] + b[0]) * 0.5 - ha.sin() * d * 3.0,
-                        (a[1] + b[1]) * 0.5 + ha.cos() * d * 3.0,
+                        (a[0] + b[0]) * 0.5 - ha.sin() * d * 2.5,
+                        (a[1] + b[1]) * 0.5 + ha.cos() * d * 2.5,
                     ],
                     p2,
                     b,
@@ -129,12 +148,7 @@ impl GroundRoute {
             let mut blend = Vec::new();
             for j in 0..=256 {
                 let t = j as f32 / 256.0;
-                let mut ps = controls.clone();
-                while ps.len() > 2 {
-                    ps = ps.windows(2).map(|w| mix(w[0], w[1], t)).collect();
-                }
-                let h = (ps[1][1] - ps[0][1]).atan2(ps[1][0] - ps[0][0]);
-                blend.push((mix(ps[0], ps[1], t), h));
+                blend.push(eval_bezier(&controls, t));
             }
             if first {
                 self.points.splice(0..=k, blend);

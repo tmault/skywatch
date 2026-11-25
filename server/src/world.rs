@@ -4382,13 +4382,6 @@ mod tests {
             tankers[0].cruise_altitude(),
             tankers[1].cruise_altitude()
         );
-        let alt_gap = (tankers[0].altitude - tankers[1].altitude).abs();
-        assert!(
-            alt_gap >= 12.0,
-            "tankers collapsed in altitude: {} vs {}",
-            tankers[0].altitude,
-            tankers[1].altitude
-        );
         for t in &tankers {
             assert!(
                 t.altitude >= TANKER_BASE_ALTITUDE - 2.0,

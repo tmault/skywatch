@@ -1,12 +1,12 @@
 // Evidence harness: execute the production airport builder verbatim. Only
 // scenery outside the movement area (terrain, labels, lights) is stubbed.
 import * as THREE from '../../../web/vendor/three.module.js';
-import {productionRoute, routeRibbon} from '../../../web/ground-route.js';
+import {productionRoute, routeRibbon, dedupePolylines} from '../../../web/ground-route.js';
 export function productionScene(source, satellite=false) {
   const code = source.slice(source.indexOf('function makeDeckSlab('), source.indexOf('const OFFLINE_ISLAND_TINT'));
   const scene = new THREE.Scene();
   const stub = () => new THREE.Group();
-  const build = new Function('THREE','productionRoute','routeRibbon','scene','TARMAC_TOP_Y','SWISS_RED','environment','window','makeSwissFlag','makeBannerLabel','addRunwayLights','enableShadows','runwayEvents','createRunwayEvents','applySatelliteOnlineState',`let homeRunwayLights; ${code}; return [buildHomeAirport,buildSatelliteAirport];`)(THREE,productionRoute,routeRibbon,scene,3.2,0xe53935,{island:()=>({heightAt:()=>3})},{addEventListener(){}},stub,stub,()=>({setOnline(){}}),()=>{},{},()=>({}),()=>{});
+  const build = new Function('THREE','productionRoute','routeRibbon','dedupePolylines','renderer','scene','TARMAC_TOP_Y','SWISS_RED','environment','window','makeSwissFlag','makeBannerLabel','addRunwayLights','enableShadows','runwayEvents','createRunwayEvents','applySatelliteOnlineState',`let homeRunwayLights; ${code}; return [buildHomeAirport,buildSatelliteAirport];`)(THREE,productionRoute,routeRibbon,dedupePolylines,{capabilities:{getMaxAnisotropy:()=>1}},scene,3.2,0xe53935,{island:()=>({heightAt:()=>3})},{addEventListener(){}},stub,stub,()=>({setOnline(){}}),()=>{},{},()=>({}),()=>{});
   build[satellite?1:0]({id:'synthetic',name:'SYNTHETIC',online:true,center:[0,0],gates:satellite?Array.from({length:4},(_,i)=>[24,-24+16*i]):Array.from({length:10},(_,i)=>[120,-85.5+19*i])},0);
   scene.updateMatrixWorld(true);
   return scene;
