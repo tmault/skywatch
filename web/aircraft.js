@@ -1011,7 +1011,7 @@ export function makeAgentMesh(model) {
   group.add(dot(kit.beacon, 0, (finBase + finH + 0.05) * 1.5, Z(7.95) * 1.5, 0.15));
 
   return finish(group, 0.92, kit, {
-    refuelPort: new THREE.Vector3(0, 1.56 * 1.5, Z(2.3) * 1.5),
+    refuelPort: new THREE.Vector3(0, -0.03 * 1.5, Z(-0.1) * 1.5),
     landingLightPos: new THREE.Vector3(0, -0.22 * 1.5, (Z(0.25) + 0.14) * 1.5),
   });
 }
@@ -1198,7 +1198,7 @@ export function makeJetMesh(model) {
   group.add(dot(kit.beacon, 0, -1.86, 4.5, 0.24));
 
   return finish(group, 0.74, kit, {
-    refuelPort: new THREE.Vector3(0, 1.82, 8.4),
+    refuelPort: new THREE.Vector3(0, -0.35, 13.0),
     landingLightPos: new THREE.Vector3(0, -0.5, 13.9), // just ahead of the nose tip (z=13.0)
     landingGlowScale: 0.6,
   });
@@ -1647,7 +1647,7 @@ export function makeJumboMesh(model) {
   group.add(dot(kit.beacon, 0, -3.46, M(20.0), 0.42));
 
   return finish(group, 0.345, kit, {
-    refuelPort: new THREE.Vector3(0, 2.25, M(3.6)),
+    refuelPort: new THREE.Vector3(0, -0.90, M(0.0)),
     landingLightPos: new THREE.Vector3(0, -1.2, M(-1.2)), // just ahead of nose radome (z=+34.3)
     landingGlowScale: 0.6,
   });
@@ -1797,7 +1797,7 @@ export function makeFighterMesh(model) {
   group.add(dot(kit.beacon, 0, 0.93, -1.2, 0.18));
 
   return finish(group, 0.72, kit, {
-    refuelPort: new THREE.Vector3(0, 0.92, 5.2),
+    refuelPort: new THREE.Vector3(0, -0.165, 9.5),
     landingLightPos: new THREE.Vector3(0, -0.35, 9.0),
   });
 }
@@ -1876,7 +1876,7 @@ export function makeDroneMesh(model) {
   group.add(dot(kit.beacon, 0, 1.4, 2.0, 0.2));
 
   return finish(group, 0.76, kit, {
-    refuelPort: new THREE.Vector3(0, 1.25, 5.0),
+    refuelPort: new THREE.Vector3(0, 0.30, 8.5),
     landingLightPos: new THREE.Vector3(0, 0.08, 8.25),
   });
 }

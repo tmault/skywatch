@@ -1354,6 +1354,7 @@ const PIPE_RADIAL = 6;
 const PIPE_RADIUS = 0.42;
 const PIPE_PULSES = 4;
 const PIPE_MAX_DIST = 105;
+const DROGUE_LENGTH = 2.0;
 
 const _pipeP0 = new THREE.Vector3();
 const _pipeP1 = new THREE.Vector3();
@@ -1414,8 +1415,8 @@ class RefuelPipe {
     this.tubeMesh.frustumCulled = false;
     this.group.add(this.tubeMesh);
 
-    // Flared high-visibility drogue basket opening toward the receiver receptacle.
-    this.drogueGeo = new THREE.CylinderGeometry(1.38, 0.45, 2.4, 12, 1, true);
+    // Flared high-visibility drogue basket cupped coaxial with the receiver nose.
+    this.drogueGeo = new THREE.CylinderGeometry(1.05, 0.38, DROGUE_LENGTH, 16, 1, true);
     this.drogueMat = new THREE.MeshBasicMaterial({
       color: 0xffa824,
       side: THREE.DoubleSide,
@@ -1461,14 +1462,25 @@ class RefuelPipe {
     this.group.visible = true;
 
     // Tanker aft vector (-Z in model space) & receiver forward vector (+Z).
-    _pipeBack.set(0, 0, -1).transformDirection(tankerEntry.group.matrixWorld);
-    _pipeFwd.set(0, 0, 1).transformDirection(receiverEntry.group.matrixWorld);
+    _pipeBack.set(0, 0, -1).transformDirection(tankerEntry.group.matrixWorld).normalize();
+    _pipeFwd.set(0, 0, 1).transformDirection(receiverEntry.group.matrixWorld).normalize();
 
-    const sag = Math.min(8.0, dist * 0.14);
-    _pipeC1.copy(_pipeP0).addScaledVector(_pipeBack, dist * 0.34);
+    // Place flared drogue basket coaxial with the receiver nose: wide mouth (+Y)
+    // cupped over the nose tip (_pipeP1) and narrow collar (-Y) meeting the hose.
+    const collarOffset = DROGUE_LENGTH * 0.95;
+    this.drogue.position.copy(_pipeP1).addScaledVector(_pipeFwd, DROGUE_LENGTH * 0.45);
+    _pipeTan.copy(_pipeFwd).negate();
+    _pipeQuat.setFromUnitVectors(_pipeUp, _pipeTan);
+    this.drogue.quaternion.copy(_pipeQuat);
+
+    // End the hose at the drogue's narrow collar with a straight horizontal entry
+    // along _pipeFwd so the catenary never kinks upward into the cone.
+    _pipeP1.addScaledVector(_pipeFwd, collarOffset);
+    const hoseDist = _pipeP0.distanceTo(_pipeP1);
+    const sag = Math.min(7.5, hoseDist * 0.13);
+    _pipeC1.copy(_pipeP0).addScaledVector(_pipeBack, hoseDist * 0.36);
     _pipeC1.y -= sag;
-    _pipeC2.copy(_pipeP1).addScaledVector(_pipeFwd, dist * 0.28);
-    _pipeC2.y -= sag * 0.45;
+    _pipeC2.copy(_pipeP1).addScaledVector(_pipeFwd, hoseDist * 0.28);
 
     for (let i = 0; i <= PIPE_SEGS; i++) {
       cubicBezierPoint(this.pts[i], _pipeP0, _pipeC1, _pipeC2, _pipeP1, i / PIPE_SEGS);
@@ -1502,13 +1514,7 @@ class RefuelPipe {
     posAttr.needsUpdate = true;
     this.tubeGeo.computeVertexNormals();
 
-    // Place flared drogue basket just ahead of the receiver's receptacle.
-    _pipeTan.subVectors(this.pts[PIPE_SEGS], this.pts[PIPE_SEGS - 1]).normalize();
-    this.drogue.position.copy(_pipeP1).addScaledVector(_pipeTan, -1.1);
-    _pipeQuat.setFromUnitVectors(_pipeUp, _pipeTan);
-    this.drogue.quaternion.copy(_pipeQuat);
-
-    // Animate glowing token pulses flowing from tanker (t=0) to waiting plane (t=1).
+    // Animate glowing token pulses flowing from tanker (t=0) to drogue collar (t=1).
     for (let i = 0; i < this.pulses.length; i++) {
       const t = (now * 0.42 + i / this.pulses.length) % 1;
       cubicBezierPoint(this.pulses[i].position, _pipeP0, _pipeC1, _pipeC2, _pipeP1, t);
