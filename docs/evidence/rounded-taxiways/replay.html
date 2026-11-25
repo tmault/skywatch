@@ -1,0 +1,22 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Production taxi turns — synthetic evidence</title><style>body{margin:0;background:#17212b;color:white;font:16px system-ui}header{padding:12px}main{display:flex}section{width:50%}canvas{width:100%}h2,p{margin:8px 16px}</style></head><body><header>Synthetic deterministic telemetry · actual production movement-area meshes · 12-unit route ribbons · no enlarged evidence corridor</header><main><section><h2>747 gate departure reversal</h2><canvas id="c0"></canvas><p id="s0"></p></section><section><h2>Reaper arrival turn</h2><canvas id="c1"></canvas><p id="s1"></p></section></main><script type="module">
+import * as THREE from '../../../web/vendor/three.module.js';
+import {makeJumboMesh,makeDroneMesh} from '../../../web/aircraft.js';
+import {productionScene} from './production-scene.js';
+const source=await(await fetch('../../../web/main.js')).text();
+const traces=await(await fetch('./production-trajectories.json')).json();
+const selected=[traces.find(t=>t.name==='747 gate 4 departure'),traces.find(t=>t.name==='Reaper ramp 17 arrival')];
+const panels=selected.map((trace,i)=>{
+ const scene=productionScene(source);scene.background=new THREE.Color(0x526b52);
+ scene.add(new THREE.HemisphereLight(0xffffff,0x53636b,2.5));const sun=new THREE.DirectionalLight(0xffffff,3);sun.position.set(50,100,30);scene.add(sun);
+ const built=i?makeDroneMesh('local'):makeJumboMesh('gpt-6-astra'),mesh=built.group;mesh.scale.setScalar(built.scale);scene.add(mesh);
+ const renderer=new THREE.WebGLRenderer({canvas:document.querySelector('#c'+i),antialias:true});renderer.setSize(700,650,false);
+ const center=i?[81,-95]:[117,-9.5],camera=new THREE.OrthographicCamera(-29,29,27,-27,.1,500);camera.position.set(center[0],180,center[1]+.001);camera.lookAt(center[0],0,center[1]);
+ // Begin just before the production reversal / return-loop bend.
+ const start=i?trace.frames.findIndex(f=>f[0]>70.1&&f[1]<-86)/20:0;
+ return {trace,mesh,built,scene,renderer,camera,start};
+});
+let epoch=performance.now(),frozen=null;
+window.demoSeek=t=>{frozen=t;render(performance.now());};window.demoPlay=()=>{epoch=performance.now();frozen=null;};
+function render(now){const elapsed=frozen??((now-epoch)/1000)%16;panels.forEach((p,i)=>{const t=p.start+elapsed,f=p.trace.frames[Math.min(p.trace.frames.length-1,Math.floor(t*20))];p.mesh.position.set(f[0],3.2+p.built.wheelDrop,f[1]);p.mesh.rotation.y=Math.PI/2-f[2];document.querySelector('#s'+i).textContent=`${f[3].toFixed(2)} units/s · heading ${(f[2]*180/Math.PI).toFixed(1)}° · ${t.toFixed(1)} s`;p.renderer.render(p.scene,p.camera);});}
+function frame(now){render(now);requestAnimationFrame(frame);}requestAnimationFrame(frame);window.evidenceReady=true;
+</script></body></html>

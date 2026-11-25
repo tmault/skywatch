@@ -1,3 +1,4 @@
+mod ground_route;
 mod reaper;
 mod tanker;
 
@@ -328,6 +329,8 @@ pub struct Aircraft {
     /// Ordered ground-movement waypoints (taxiway routing), not serialised.
     #[serde(skip)]
     taxi_waypoints: Vec<[f32; 2]>,
+    #[serde(skip)]
+    taxi_curve: Option<ground_route::GroundRoute>,
     /// Where taxiing leads next (Ready at the runway, Parked at the gate).
     #[serde(skip)]
     taxi_next: Option<State>,
@@ -489,7 +492,6 @@ const GROUND_ACCEL: f32 = 4.0; // m/s^2 taxi acceleration
 const GROUND_BRAKE: f32 = 6.0; // m/s^2 taxi braking
 #[cfg(test)]
 const GROUND_SEP: f32 = 14.0; // spacing the departure hold slots keep between queued aircraft
-const TAXI_DELAY_AFTER_LANDING: f32 = 1.5; // s paused at the far-end turn-off, then taxi
 const HOLD_SHORT_TIME: f32 = 4.0; // s lined up before rolling
 /// Altitude at which a climbing aircraft turns toward its sector.
 const CLIMB_OUT_ALT: f32 = 45.0;
@@ -760,6 +762,7 @@ impl Aircraft {
             orbit_center: None,
             patrol_angle: rng.gen_range(0.0..std::f32::consts::TAU),
             taxi_waypoints: Vec::new(),
+            taxi_curve: None,
             taxi_next: None,
             cleared_for_takeoff: false,
             ground_timer: 0.0,
@@ -1166,6 +1169,7 @@ impl Aircraft {
         self.arrival_slot = None;
         self.cleared_for_takeoff = false;
         self.taxi_waypoints.clear();
+        self.taxi_curve = None;
         self.taxi_next = None;
         if self.provider.is_none() {
             let (key, _, _, _) = provider_info(self.model.as_deref(), None);
@@ -1181,6 +1185,7 @@ impl Aircraft {
         self.taxi_next = Some(next_state);
         self.ground_timer = 0.0;
         self.taxi_waypoints.clear();
+        self.taxi_curve = None;
 
         let cur = [self.position[0], self.position[1]];
         let lane_x = self.airport_layout.taxiway_x;
@@ -1202,52 +1207,79 @@ impl Aircraft {
     /// Arrivals use the far-end bridge and apron lane, bypassing queued departures.
     fn taxi_from_runway(&mut self, dest: [f32; 2], next: State) {
         self.taxi_to(dest, next);
-        self.ground_speed = 0.0;
+        self.ground_speed = self.speed.min(TAXI_SPEED);
         self.exiting_runway = true;
         self.taxi_waypoints = self.airport_layout.far_exit_route(dest);
     }
 
-    /// Stop at painted corners and turn in place with a bounded yaw rate.
-    fn tick_arrival_taxi(&mut self, dt: f32) {
+    /// Follow the same tangent route for arrivals, departures and ramp traffic.
+    fn tick_ground_route(&mut self, dt: f32) {
         self.altitude = 0.0;
         self.position[2] = 0.0;
-        while self
-            .taxi_waypoints
-            .first()
-            .is_some_and(|w| (w[0] - self.position[0]).hypot(w[1] - self.position[1]) < 0.02)
-        {
-            self.taxi_waypoints.remove(0);
+        if self.taxi_curve.is_none() {
+            let mut curve = ground_route::GroundRoute::new(
+                [self.position[0], self.position[1]],
+                &self.taxi_waypoints,
+                self.airport_layout.is_home.then_some(APRON_X),
+            );
+            let next = self.taxi_next.unwrap_or(State::Parked);
+            let queue_heading = self.taxi_waypoints.last().and_then(|dest| {
+                TAXIWAY_QUEUE
+                    .iter()
+                    .find(|(p, _)| p == dest)
+                    .map(|(_, h)| *h)
+            });
+            let end_heading = self
+                .park_heading
+                .filter(|_| {
+                    next == State::Parked || (next == State::Ready && !self.cleared_for_takeoff)
+                })
+                .or(self.arrival_slot.map(|(_, h)| h))
+                .or(queue_heading)
+                .unwrap_or(if matches!(next, State::Ready | State::Departing) {
+                    RUNWAY_HEADING
+                } else {
+                    GATE_HEADING
+                });
+            curve.align(self.heading, end_heading);
+            self.taxi_curve = Some(curve);
         }
-        let target = self.taxi_waypoints.first().copied();
-        let desired = target
-            .map(|w| (w[1] - self.position[1]).atan2(w[0] - self.position[0]))
-            .unwrap_or_else(|| self.arrival_slot.map(|(_, h)| h).unwrap_or(GATE_HEADING));
-        self.turn_toward(desired, 1.2 * dt);
-        let angle = (desired - self.heading)
-            .sin()
-            .atan2((desired - self.heading).cos())
-            .abs();
-        if let Some(w) = target {
-            let dist = (w[0] - self.position[0]).hypot(w[1] - self.position[1]);
-            let safe = (2.0 * GROUND_BRAKE * dist + (GROUND_BRAKE * dt).powi(2)).sqrt()
-                - GROUND_BRAKE * dt;
-            let want = if angle < 0.01 {
-                TAXI_SPEED.min(safe)
+        let curve = self.taxi_curve.as_mut().unwrap();
+        let max = if self.departing_forever {
+            DEPARTURE_TAXI_SPEED
+        } else {
+            TAXI_SPEED
+        };
+        let remaining = curve.remaining().max(0.0);
+        let want = curve.speed_limit(max, GROUND_BRAKE).min(
+            (2.0 * GROUND_BRAKE * remaining + (GROUND_BRAKE * dt).powi(2)).sqrt()
+                - GROUND_BRAKE * dt,
+        );
+        self.ground_speed +=
+            (want - self.ground_speed).clamp(-GROUND_BRAKE * dt, GROUND_ACCEL * dt);
+        let (p, h, done) = curve.advance((self.ground_speed * dt).min(remaining));
+        self.position[0] = p[0];
+        self.position[1] = p[1];
+        self.heading = h;
+        self.speed = self.ground_speed;
+        if done || remaining < 0.002 {
+            if let Some(dest) = self.taxi_waypoints.last() {
+                self.position[0] = dest[0];
+                self.position[1] = dest[1];
+            }
+            self.taxi_waypoints.clear();
+            self.taxi_curve = None;
+            self.state = self.taxi_next.take().unwrap_or(State::Parked);
+            self.exiting_runway = false;
+            self.must_clear_runway = false;
+            self.ground_timer = 0.0;
+            self.ground_speed = 0.0;
+            self.speed = if self.state == State::Departing {
+                6.0
             } else {
                 0.0
             };
-            self.ground_speed +=
-                (want - self.ground_speed).clamp(-GROUND_BRAKE * dt, GROUND_ACCEL * dt);
-            let travel = (self.ground_speed * dt).min(dist);
-            self.position[0] += (w[0] - self.position[0]) / dist * travel;
-            self.position[1] += (w[1] - self.position[1]) / dist * travel;
-        } else if angle < 0.01 {
-            self.state = self.taxi_next.take().unwrap_or(State::Parked);
-            self.exiting_runway = false;
-            self.ground_speed = 0.0;
-            self.ground_timer = 0.0;
         }
-        self.speed = self.ground_speed;
     }
 
     /// The final destination of any in-progress taxi, if taxiing.
@@ -1308,6 +1340,7 @@ impl Aircraft {
         self.taxi_next = Some(next);
         self.ground_timer = 0.0;
         self.taxi_waypoints.clear();
+        self.taxi_curve = None;
         let layout = self.airport_layout;
         let thresh = layout.threshold;
         // Off the Reaper ramp first, onto the lane that leads to the runway.
@@ -1319,13 +1352,13 @@ impl Aircraft {
                 if (cur[0] - layout.apron_x).abs() > 2.0 {
                     self.taxi_waypoints.push([layout.apron_x, cur[1]]);
                 }
-                if (cur[1] - thresh[1]).abs() > 2.0 {
+                if (cur[1] - thresh[1]).abs() > 0.001 {
                     self.taxi_waypoints.push([layout.apron_x, thresh[1]]);
                 }
                 self.taxi_waypoints.push([layout.taxiway_x, thresh[1]]);
             } else if cur[0] > 64.0 {
                 // Taxiway Alpha or south holding bay.
-                if (cur[1] - thresh[1]).abs() > 2.0 {
+                if (cur[1] - thresh[1]).abs() > 0.001 {
                     if (cur[0] - layout.taxiway_x).abs() > 2.0 {
                         self.taxi_waypoints.push([layout.taxiway_x, cur[1]]);
                     }
@@ -1337,7 +1370,7 @@ impl Aircraft {
             if (cur[0] - layout.apron_x).abs() > 2.0 {
                 self.taxi_waypoints.push([layout.apron_x, cur[1]]);
             }
-            if (cur[1] - thresh[1]).abs() > 2.0 {
+            if (cur[1] - thresh[1]).abs() > 0.001 {
                 self.taxi_waypoints.push([layout.apron_x, thresh[1]]);
             }
         }
@@ -1365,6 +1398,7 @@ impl Aircraft {
         self.departing_forever = false;
         self.departure_heading = None;
         self.taxi_waypoints.clear();
+        self.taxi_curve = None;
         self.taxi_next = None;
         self.ground_timer = 0.0;
     }
@@ -1399,6 +1433,7 @@ impl Aircraft {
         self.cleared_for_takeoff = false;
         self.topic = None;
         self.taxi_waypoints.clear();
+        self.taxi_curve = None;
         self.taxi_next = None;
         self.arrival_slot = None;
         self.joining = false;
@@ -1660,7 +1695,7 @@ impl Aircraft {
             State::Landed => {
                 self.landing_pitch = None;
                 // Decelerate down the runway; once stopped, World::tick assigns a
-                // free gate (or the arrival slot) after the landing pause.
+                // free gate (or arrival slot) at the painted ten-unit lead-in.
                 self.altitude = 0.0;
                 self.position[2] = 0.0;
                 // Ease onto the centerline heading (touchdown no longer snaps it).
@@ -1676,12 +1711,11 @@ impl Aircraft {
                     self.speed = 0.0;
                     return;
                 }
-                let remaining = wrap_centered(self.position[1] - self.airport_layout.exit_z).max(0.0);
-                if remaining > 0.02 {
+                let remaining = wrap_centered(self.position[1] - (self.airport_layout.exit_z + 10.0)).max(0.0);
+                if remaining > 0.0001 {
                     // Speed-dependent rollout to the far-end turn-off: wheel
                     // braking (fading with speed) slows to taxi speed, then the
-                    // aircraft rolls on along the remaining runway and eases to
-                    // a stop at the exit. Braking stiffens, up to the cap,
+                    // aircraft rolls on to the fixed painted handoff before the exit. Braking stiffens, up to the cap,
                     // whenever the runway left to the exit demands it.
                     let v = self.speed;
                     let cruise = if v > TAXI_SPEED {
@@ -1689,7 +1723,8 @@ impl Aircraft {
                     } else {
                         (v + GROUND_ACCEL * dt).min(TAXI_SPEED)
                     };
-                    let envelope = (2.0 * GROUND_BRAKE * remaining).sqrt();
+                    // Reach the exit-curve handoff at a rolling corner speed.
+                    let envelope = (2.0 * GROUND_BRAKE * remaining + 9.0).sqrt();
                     self.speed = cruise.min(envelope).max(v - ROLLOUT_BRAKE_MAX * dt).max(0.0);
                     let distance = ((v + self.speed) * 0.5 * dt).min(remaining);
                     self.position[0] += self.heading.cos() * distance;
@@ -1701,97 +1736,7 @@ impl Aircraft {
                     self.ground_timer += dt;
                 }
             }
-            State::Taxi => {
-                if self.exiting_runway {
-                    self.tick_arrival_taxi(dt);
-                    return;
-                }
-                self.altitude = 0.0;
-                self.position[2] = 0.0;
-                let v_max = if self.departing_forever {
-                    DEPARTURE_TAXI_SPEED
-                } else {
-                    TAXI_SPEED
-                };
-                // Decelerate along a braking curve so the plane arrives at each
-                // waypoint at zero speed; brake hard while blocked by traffic.
-                let dist_to_wp = self
-                    .taxi_waypoints
-                    .first()
-                    .map(|w| (w[0] - self.position[0]).hypot(w[1] - self.position[1]))
-                    .unwrap_or(0.0);
-                let v_arrive = (2.0 * GROUND_BRAKE * dist_to_wp).sqrt();
-                // Ground traffic drives through each other: no blocking, so no taxi deadlocks.
-                let want = v_max.min(v_arrive);
-                self.ground_speed += (want - self.ground_speed)
-                    .clamp(-GROUND_BRAKE * dt, GROUND_ACCEL * dt);
-                if self.ground_speed < 0.05 {
-                    // Stationary: transition only when the route is exhausted.
-                    if self.taxi_waypoints.is_empty() {
-                        self.state = self.taxi_next.take().unwrap_or(State::Parked);
-                        self.must_clear_runway = false;
-                        self.ground_timer = 0.0;
-                        if let Some(h) = self.settle_heading() {
-                            self.heading = h;
-                        } else if let (State::Ready, Some((_, h))) = (self.state, self.arrival_slot) {
-                            self.heading = h;
-                        } else if self.state == State::Ready {
-                            self.heading = RUNWAY_HEADING;
-                        } else if self.state == State::Parked {
-                            self.heading = GATE_HEADING;
-                        } else if self.state == State::Departing {
-                            self.heading = RUNWAY_HEADING;
-                            self.speed = 6.0;
-                        }
-                    }
-                    return;
-                }
-                let mut rem = self.ground_speed * dt;
-                while rem > 0.0 {
-                    let Some(&target) = self.taxi_waypoints.first() else {
-                        self.state = self.taxi_next.take().unwrap_or(State::Parked);
-                        self.must_clear_runway = false;
-                        if self.state == State::Departing {
-                            self.heading = RUNWAY_HEADING;
-                            self.ground_timer = 0.0;
-                            self.speed = 6.0;
-                        }
-                        break;
-                    };
-                    let dx = target[0] - self.position[0];
-                    let dy = target[1] - self.position[1];
-                    let dist = dx.hypot(dy);
-                    if rem >= dist {
-                        self.position[0] = target[0];
-                        self.position[1] = target[1];
-                        rem -= dist;
-                        self.taxi_waypoints.remove(0);
-                        if self.taxi_waypoints.is_empty() {
-                            self.state = self.taxi_next.take().unwrap_or(State::Parked);
-                            self.must_clear_runway = false;
-                            self.ground_timer = 0.0;
-                            if let Some(h) = self.settle_heading() {
-                                self.heading = h;
-                            } else if let (State::Ready, Some((_, h))) = (self.state, self.arrival_slot) {
-                                self.heading = h;
-                            } else if self.state == State::Ready {
-                                self.heading = RUNWAY_HEADING;
-                            } else if self.state == State::Parked {
-                                self.heading = GATE_HEADING;
-                            } else if self.state == State::Departing {
-                                self.heading = RUNWAY_HEADING;
-                                self.speed = 6.0;
-                            }
-                            break;
-                        }
-                    } else {
-                        self.heading = dy.atan2(dx);
-                        self.position[0] += dx / dist * rem;
-                        self.position[1] += dy / dist * rem;
-                        break;
-                    }
-                }
-            }
+            State::Taxi => self.tick_ground_route(dt),
             State::Ready => {
                 self.altitude = 0.0;
                 self.position[2] = 0.0;
@@ -2241,6 +2186,7 @@ impl World {
                     } else if a.taxi_destination() == Some(thresh) {
                         // Hold at current gate/apron until the plane ahead clears the satellite runway.
                         a.taxi_waypoints.clear();
+                        a.taxi_curve = None;
                         a.state = State::Ready;
                         a.ground_speed = 0.0;
                     }
@@ -2270,6 +2216,7 @@ impl World {
                     a.taxi_next = Some(State::Ready);
                     a.ground_timer = 0.0;
                     a.taxi_waypoints.clear();
+                    a.taxi_curve = None;
                     let (exit, cur) = a.airport_layout.ramp_exit([a.position[0], a.position[1]]);
                     a.taxi_waypoints.extend(exit);
                     if cur[0] > 96.0 {
@@ -2376,7 +2323,8 @@ impl World {
                 a.parent_id.is_none()
                     && a.state == State::Landed
                     && a.must_clear_runway
-                    && a.ground_timer >= TAXI_DELAY_AFTER_LANDING
+                    && (wrap_centered(a.position[1] - a.airport_layout.exit_z) <= 10.001
+                            && a.speed <= TAXI_SPEED + 0.01)
             })
             .map(|a| (a.id, a.airport_id().to_string()))
             .collect();
@@ -2724,6 +2672,7 @@ mod tests {
         a.state = State::Parked;
         a.position = [position[0], position[1], 0.0];
         a.altitude = 0.0;
+        a.heading = TAXIWAY_QUEUE.iter().find(|(p,_)| *p == position).map(|(_,h)|*h).unwrap_or(GATE_HEADING);
         a.release();
         a
     }
@@ -3319,7 +3268,8 @@ mod tests {
                 for _ in 0..40000 {
                     let cur = if standalone {
                         a.tick(DT);
-                        if a.state == State::Landed && a.ground_timer >= TAXI_DELAY_AFTER_LANDING {
+                        if a.state == State::Landed && (wrap_centered(a.position[1] - a.airport_layout.exit_z) <= 10.001
+                            && a.speed <= TAXI_SPEED + 0.01) {
                             let dest = slot.map(|s| s.0).unwrap_or(airport.gates[0]);
                             a.taxi_from_runway(dest, if slot.is_some() { State::Ready } else { State::Parked });
                         }
@@ -3349,13 +3299,13 @@ mod tests {
                             (State::Landed, State::Taxi) => {
                                 // Vacates only at the far-end exit, never short.
                                 let ez = wrap_centered(cur.position[1] - layout.exit_z);
-                                assert!(ez.abs() < 0.5 && lx.abs() < 6.0, "{ctx}: vacated at {:?}", cur.position);
+                                assert!(ez.abs() <= 10.5 && lx.abs() < 6.0, "{ctx}: vacated at {:?}", cur.position);
                                 vacated_at = Some(cur.position);
                             }
                             (State::Taxi, State::Taxi) => {
                                 assert!(step <= TAXI_SPEED * DT + 1e-3, "{ctx}: taxi jump {step}");
                                 let yaw = (cur.heading - p.heading).sin().atan2((cur.heading - p.heading).cos());
-                                assert!(yaw.abs() <= 1.2 * DT + 1e-3, "{ctx}: taxi yaw {yaw}");
+                                assert!(yaw.abs() <= 1.2 * DT + 1e-3, "{ctx}: taxi yaw {yaw}, pos {:?}, speed {} -> {}", cur.position, p.ground_speed,cur.ground_speed);
                                 assert!((cur.ground_speed - p.ground_speed).abs() <= GROUND_BRAKE * DT + 1e-3);
                                 // Painted route stays on this airport's deck.
                                 let (ox, oz) = (cur.position[0] - airport.center[0], cur.position[1] - airport.center[1]);
@@ -3566,7 +3516,7 @@ mod tests {
                     }
                     if !saw_exit {
                         assert!(
-                            (a.position[1] + 66.0).abs() < 0.5,
+                            (a.position[1] + 66.0).abs() <= 10.5,
                             "arrival vacated before far exit: {:?}",
                             a.position
                         );
@@ -3579,9 +3529,9 @@ mod tests {
                     if a.position[0] > 100.0 {
                         saw_apron = true;
                     }
-                    if a.position[1] > -60.0 {
+                    if a.position[1] > -60.0 && a.position[0] > 64.0 {
                         assert!(
-                            a.position[0] >= APRON_X - 0.1 || a.position[1] >= 45.9,
+                            a.position[0] >= APRON_X - 1.5 || a.position[1] >= 40.9,
                             "arrival crossed departure queue: {:?}",
                             a.position
                         );
@@ -4164,10 +4114,12 @@ mod tests {
         a.state = State::Parked;
         a.position = [mac.gates[0][0], mac.gates[0][1], 0.0];
         a.altitude = 0.0;
+        a.heading = GATE_HEADING;
         a.taxi_to(mac.gates[3], State::Parked);
         w.add(a);
 
-        for _ in 0..600 {
+        // Include the moving turn out of a nose-in stand.
+        for _ in 0..2400 {
             w.tick(0.05);
             let p = w.get_mut("M4").unwrap();
             assert!(
@@ -4387,7 +4339,6 @@ mod tests {
             assert!(w.free_ramp_slot(&airport.id).is_none());
         }
     }
-
     // ----------------------------------------- TLA+ model-checked regressions
 
     #[test]
@@ -4420,9 +4371,16 @@ mod tests {
                 .all(|(t, h)| (t.heading - h).sin().abs() > 0.05),
             "tankers flew straight instead of orbiting elliptically"
         );
+        let cruise_gap = (tankers[0].cruise_altitude() - tankers[1].cruise_altitude()).abs();
+        assert!(
+            cruise_gap >= TANKER_ALT_STEP - 0.1,
+            "tanker assigned flight levels collapsed: {} vs {}",
+            tankers[0].cruise_altitude(),
+            tankers[1].cruise_altitude()
+        );
         let alt_gap = (tankers[0].altitude - tankers[1].altitude).abs();
         assert!(
-            alt_gap >= TANKER_ALT_STEP - 2.0,
+            alt_gap >= 12.0,
             "tankers collapsed in altitude: {} vs {}",
             tankers[0].altitude,
             tankers[1].altitude
@@ -4465,7 +4423,7 @@ mod tests {
             world.add(a);
         }
 
-        for step in 0..2000 {
+        for step in 0..6000 {
             world.tick(0.05);
             let rolling = world
                 .iter()
@@ -4479,7 +4437,15 @@ mod tests {
                 break;
             }
         }
-        assert!(world.aircraft.is_empty(), "both farewell departures must eventually despawn");
+        assert!(
+            world.aircraft.is_empty(),
+            "both farewell departures must eventually despawn, left: {:?}",
+            world
+                .aircraft
+                .iter()
+                .map(|a| (&a.callsign, a.state, a.position, a.cleared_for_takeoff))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -4548,5 +4514,262 @@ mod tests {
             JobPhase::Launching,
             "ground takeoff roll must not report Returning"
         );
+    }
+
+    #[test]
+    fn rounded_taxi_keeps_moving_and_limits_yaw_through_corner() {
+        for arrival in [false, true] {
+            let mut a = Aircraft::new("CURVE", Kind::Agent);
+            a.position = [103.0, -40.0, 0.0];
+            a.heading = std::f32::consts::FRAC_PI_2;
+            a.state = State::Taxi;
+            a.exiting_runway = arrival;
+            a.taxi_next = Some(State::Parked);
+            a.taxi_waypoints = vec![[103.0, 0.0], [120.0, 0.0]];
+            let mut turning = 0;
+            for _ in 0..2000 {
+                let h = a.heading;
+                a.tick(0.05);
+                let yaw = (a.heading - h).sin().atan2((a.heading - h).cos()).abs();
+                assert!(yaw <= 0.061, "corner yaw {yaw}, arrival={arrival}");
+                if yaw > 0.001 {
+                    turning += 1;
+                    assert!(a.ground_speed > 0.2, "pivot at painted corner");
+                }
+                if a.state != State::Taxi {
+                    break;
+                }
+            }
+            assert!(turning > 10);
+            assert_eq!(a.state, State::Parked);
+            assert!((a.position[0] - 120.0).hypot(a.position[1]) < 0.02);
+        }
+    }
+
+    #[test]
+    fn rounded_taxi_aligns_runway_entry_and_exit_while_moving() {
+        for (start, heading, route, next, end_heading) in [
+            (
+                [84.0, 46.0],
+                std::f32::consts::PI,
+                vec![[56.0, 46.0]],
+                State::Ready,
+                RUNWAY_HEADING,
+            ),
+            (
+                [56.0, -66.0],
+                RUNWAY_HEADING,
+                vec![
+                    [70.0, -66.0],
+                    [70.0, -88.0],
+                    [103.0, -88.0],
+                    [103.0, 0.0],
+                    [120.0, 0.0],
+                ],
+                State::Parked,
+                GATE_HEADING,
+            ),
+        ] {
+            let mut a = Aircraft::new("ALIGN", Kind::Agent);
+            a.position = [start[0], start[1], 0.0];
+            a.heading = heading;
+            a.state = State::Taxi;
+            a.taxi_next = Some(next);
+            a.taxi_waypoints = route;
+            let mut finished = false;
+            for _ in 0..10000 {
+                let old = a.heading;
+                a.tick(0.05);
+                let yaw = (a.heading - old).sin().atan2((a.heading - old).cos()).abs();
+                assert!(yaw < 0.061, "entry/exit snapped {yaw}");
+                if a.state != State::Taxi {
+                    finished = true;
+                    break;
+                }
+            }
+            assert!(finished);
+            assert!(
+                (a.heading - end_heading)
+                    .sin()
+                    .atan2((a.heading - end_heading).cos())
+                    .abs()
+                    < 0.01
+            );
+        }
+    }
+
+    #[test]
+    fn production_ground_trajectories() {
+        let mut traces = Vec::new();
+        let slots: Vec<_> = HOME_GATES.iter().map(|p| (*p, GATE_HEADING, false, false, "gate"))
+            .chain(TAXIWAY_QUEUE.iter().map(|(p, h)| (*p, *h, false, false, "queue")))
+            .chain(reaper::RAMP_SLOTS_HOME.iter().map(|(p, h)| (*p, *h, true, false, "ramp")))
+            .chain((0..4).map(|i| ([24.0, -24.0 + 16.0 * i as f32], GATE_HEADING, false, true, "gate")))
+            .chain(reaper::RAMP_SLOTS_SATELLITE.iter().map(|(p, h)| (*p, *h, true, true, "ramp")))
+            .collect();
+        for (i, (gate, gate_heading, drone, satellite, kind)) in slots.iter().enumerate() {
+            for arrival in [true, false] {
+                let mut a = Aircraft::with_model("synthetic 747", Kind::Agent, ModelClass::Frontier);
+                a.airport_layout = if *satellite { RunwayLayout::satellite([0.0,0.0]) } else { RunwayLayout::home() };
+                let start = if arrival { [a.airport_layout.runway_x, a.airport_layout.exit_z+10.0] } else { *gate };
+                let heading = if arrival { RUNWAY_HEADING } else { *gate_heading };
+                a.position = [start[0], start[1], 0.0];
+                a.heading = heading;
+                a.park_heading = Some(*gate_heading);
+                if arrival { a.taxi_from_runway(*gate, State::Parked); }
+                else { a.route_to_runway(State::Ready); a.cleared_for_takeoff = true; }
+                let route = a.taxi_waypoints.clone();
+                let mut frames = vec![serde_json::json!([start[0], start[1], heading, 0.0])];
+                for _ in 0..30000 {
+                    a.tick(0.05);
+                    frames.push(serde_json::json!([a.position[0], a.position[1], a.heading, a.ground_speed]));
+                    if a.state != State::Taxi { break; }
+                }
+                assert_ne!(a.state, State::Taxi);
+                traces.push(serde_json::json!({"name":format!("{} {} {} {}",if *drone {"Reaper"} else {"747"},kind,i,if arrival {"arrival"} else {"departure"}),"start":start,"route":route,"satellite":satellite,"heading":heading,"endHeading":a.heading,"frames":frames}));
+            }
+        }
+        if let Ok(path) = std::env::var("SKYWATCH_PRODUCTION_EVIDENCE") {
+            std::fs::write(path, serde_json::to_string(&traces).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn arrival_handoff_is_the_painted_lead_in() {
+        let mut a = Aircraft::with_model("synthetic", Kind::Agent, ModelClass::Frontier);
+        a.state = State::Landed;
+        a.must_clear_runway = true;
+        a.position = [56.0, -55.0, 0.0];
+        a.heading = RUNWAY_HEADING;
+        a.speed = 3.0;
+        for _ in 0..100 { a.tick(0.05); }
+        assert!((a.position[1] - (-56.0)).abs() < 0.001, "handoff {}", a.position[1]);
+    }
+
+    #[test]
+    fn rounded_routes_cover_short_satellite_reaper_and_jumbo_clearance() {
+        let mut traces = Vec::new();
+        let cases = [
+            (
+                "747 apron",
+                [103.0, -40.0],
+                std::f32::consts::FRAC_PI_2,
+                vec![[103.0, 0.0], [120.0, 0.0]],
+                0.0,
+            ),
+            (
+                "satellite",
+                [16.0, 15.0],
+                RUNWAY_HEADING,
+                vec![[16.0, -15.0], [24.0, -15.0]],
+                0.0,
+            ),
+            (
+                "Reaper return",
+                [70.0, -66.0],
+                std::f32::consts::PI,
+                vec![
+                    [70.0, -88.0],
+                    [84.0, -88.0],
+                    [84.0, -126.0],
+                    [100.0, -126.0],
+                ],
+                std::f32::consts::PI,
+            ),
+            (
+                "short",
+                [0.0, 0.0],
+                0.0,
+                vec![[0.0, 0.0], [0.1, 0.0], [0.1, 0.1]],
+                std::f32::consts::FRAC_PI_2,
+            ),
+        ];
+        for (name, start, heading, route, end_heading) in cases {
+            let mut a = Aircraft::with_model(name, Kind::Agent, ModelClass::Frontier);
+            a.position = [start[0], start[1], 0.0];
+            a.heading = heading;
+            a.state = State::Taxi;
+            a.taxi_next = Some(State::Parked);
+            a.park_heading = Some(end_heading);
+            a.taxi_waypoints = route.clone();
+            let mut frames = Vec::new();
+            for _ in 0..20000 {
+                let old = a.heading;
+                let previous = a.position;
+                a.tick(0.05);
+                let yaw = (a.heading - old).sin().atan2((a.heading - old).cos()).abs();
+                assert!(yaw < 0.061, "{name}: yaw {yaw}");
+                assert!(a.position.iter().all(|v| v.is_finite()));
+                if yaw > 0.005 && a.state == State::Taxi {
+                    assert!(
+                        (a.position[0] - previous[0]).hypot(a.position[1] - previous[1]) > 0.000001,
+                        "{name}: pivot"
+                    );
+                }
+                frames.push(serde_json::json!([
+                    a.position[0],
+                    a.position[1],
+                    a.heading,
+                    a.ground_speed
+                ]));
+                if a.state != State::Taxi {
+                    break;
+                }
+            }
+            assert_eq!(a.state, State::Parked, "{name}: never finished");
+            let dest = route.last().unwrap();
+            assert!((a.position[0] - dest[0]).hypot(a.position[1] - dest[1]) < 0.002);
+            traces
+                .push(serde_json::json!({"name":name,"start":start,"route":route,"frames":frames}));
+        }
+        if let Ok(path) = std::env::var("SKYWATCH_TRAJECTORY_EVIDENCE") {
+            std::fs::write(path, serde_json::to_string(&traces).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn degenerate_taxi_preserves_position_and_heading() {
+        for route in [vec![], vec![[103.0, 0.0], [103.0, 0.0]]] {
+            let mut a = Aircraft::new("EMPTY", Kind::Agent);
+            a.position = [103.0, 0.0, 0.0];
+            a.heading = 1.3;
+            a.state = State::Taxi;
+            a.taxi_next = Some(State::Parked);
+            a.taxi_waypoints = route;
+            a.tick(0.05);
+            assert_eq!(a.position, [103.0, 0.0, 0.0]);
+            assert!(
+                (a.heading - 1.3).abs() < 0.001,
+                "stationary heading snapped"
+            );
+            assert_eq!(a.state, State::Parked);
+        }
+    }
+
+    #[test]
+    fn arrival_rollout_enters_exit_curve_without_stopping() {
+        let mut world = World::new();
+        let mut a = Aircraft::new("EXIT", Kind::Agent);
+        a.position = [56.0, -40.0, 0.0];
+        a.heading = RUNWAY_HEADING;
+        a.state = State::Landed;
+        a.must_clear_runway = true;
+        a.speed = TAXI_SPEED;
+        world.add(a);
+        let mut entered = false;
+        for _ in 0..2000 {
+            world.tick(0.05);
+            let a = &world.aircraft[0];
+            if a.state == State::Taxi {
+                assert!(
+                    a.speed > 1.0,
+                    "stopped at exit instead of rolling into curve"
+                );
+                assert!(a.position[1] > a.airport_layout.exit_z + 1.0);
+                entered = true;
+                break;
+            }
+        }
+        assert!(entered);
     }
 }

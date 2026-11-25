@@ -1,0 +1,256 @@
+{
+  "method": "Conservative planar swept vertex envelope of production jumbo mesh (scale 0.345) at every fourth 20 Hz frame; broad-phase object checks only, no continuous triangle collision solver.",
+  "span": 22.276462876146407,
+  "homeGateSpacing": 19,
+  "adjacentHomeJumboEnvelopeOverlap": 3.2764628761464074,
+  "satelliteGateSpacing": 16,
+  "adjacentSatelliteJumboEnvelopeOverlap": 6.276462876146407,
+  "routes": [
+    {
+      "name": "747 gate 0 arrival",
+      "satellite": false,
+      "minimumTerminalPlanGap": 1.6665002632141181,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 0 departure",
+      "satellite": false,
+      "minimumTerminalPlanGap": 0.5728120390210449,
+      "wingBridgeBroadPhaseCandidateFrames": 58
+    },
+    {
+      "name": "747 gate 1 arrival",
+      "satellite": false,
+      "minimumTerminalPlanGap": 1.6715738105773994,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 1 departure",
+      "satellite": false,
+      "minimumTerminalPlanGap": 0.5767750952385313,
+      "wingBridgeBroadPhaseCandidateFrames": 57
+    },
+    {
+      "name": "747 gate 2 arrival",
+      "satellite": false,
+      "minimumTerminalPlanGap": 1.6668054389953681,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 2 departure",
+      "satellite": false,
+      "minimumTerminalPlanGap": 0.5767568715929485,
+      "wingBridgeBroadPhaseCandidateFrames": 57
+    },
+    {
+      "name": "747 gate 3 arrival",
+      "satellite": false,
+      "minimumTerminalPlanGap": 1.6665002632141181,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 3 departure",
+      "satellite": false,
+      "minimumTerminalPlanGap": 0.5767647838543155,
+      "wingBridgeBroadPhaseCandidateFrames": 57
+    },
+    {
+      "name": "747 gate 4 arrival",
+      "satellite": false,
+      "minimumTerminalPlanGap": 1.6911126899719306,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 4 departure",
+      "satellite": false,
+      "minimumTerminalPlanGap": 0.576765083302945,
+      "wingBridgeBroadPhaseCandidateFrames": 57
+    },
+    {
+      "name": "747 gate 5 arrival",
+      "satellite": false,
+      "minimumTerminalPlanGap": 1.6798822212219306,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 5 departure",
+      "satellite": false,
+      "minimumTerminalPlanGap": 0.576765083302945,
+      "wingBridgeBroadPhaseCandidateFrames": 57
+    },
+    {
+      "name": "747 gate 6 arrival",
+      "satellite": false,
+      "minimumTerminalPlanGap": 1.6717263984680244,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 6 departure",
+      "satellite": false,
+      "minimumTerminalPlanGap": 0.5767647838543155,
+      "wingBridgeBroadPhaseCandidateFrames": 57
+    },
+    {
+      "name": "747 gate 7 arrival",
+      "satellite": false,
+      "minimumTerminalPlanGap": 1.668110065460212,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 7 departure",
+      "satellite": false,
+      "minimumTerminalPlanGap": 0.5776392952014646,
+      "wingBridgeBroadPhaseCandidateFrames": 58
+    },
+    {
+      "name": "747 gate 8 arrival",
+      "satellite": false,
+      "minimumTerminalPlanGap": 1.6668054389953681,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 8 departure",
+      "satellite": false,
+      "minimumTerminalPlanGap": 0.5767749456114757,
+      "wingBridgeBroadPhaseCandidateFrames": 57
+    },
+    {
+      "name": "747 gate 9 arrival",
+      "satellite": false,
+      "minimumTerminalPlanGap": 1.678638629913337,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 9 departure",
+      "satellite": false,
+      "minimumTerminalPlanGap": 0.5728120390210449,
+      "wingBridgeBroadPhaseCandidateFrames": 57
+    },
+    {
+      "name": "747 queue 10 arrival",
+      "satellite": false,
+      "minimumTerminalPlanGap": 18.6037306943672,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 queue 10 departure",
+      "satellite": false,
+      "minimumTerminalPlanGap": 42.99374966581773,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 queue 11 arrival",
+      "satellite": false,
+      "minimumTerminalPlanGap": 18.6037306943672,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 queue 11 departure",
+      "satellite": false,
+      "minimumTerminalPlanGap": 37.432400857738955,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 queue 12 arrival",
+      "satellite": false,
+      "minimumTerminalPlanGap": 18.60799001064339,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 queue 12 departure",
+      "satellite": false,
+      "minimumTerminalPlanGap": 37.41839831540696,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 queue 13 arrival",
+      "satellite": false,
+      "minimumTerminalPlanGap": 18.608435805976114,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 queue 13 departure",
+      "satellite": false,
+      "minimumTerminalPlanGap": 37.42047667196533,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 queue 14 arrival",
+      "satellite": false,
+      "minimumTerminalPlanGap": 18.603730978996694,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 queue 14 departure",
+      "satellite": false,
+      "minimumTerminalPlanGap": 37.43240060434273,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 queue 15 arrival",
+      "satellite": false,
+      "minimumTerminalPlanGap": 18.60381337488886,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 queue 15 departure",
+      "satellite": false,
+      "minimumTerminalPlanGap": 37.418405591738775,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 20 arrival",
+      "satellite": true,
+      "minimumTerminalPlanGap": 4.232964496612546,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 20 departure",
+      "satellite": true,
+      "minimumTerminalPlanGap": 3.118875487174712,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 21 arrival",
+      "satellite": true,
+      "minimumTerminalPlanGap": 4.218533496856686,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 21 departure",
+      "satellite": true,
+      "minimumTerminalPlanGap": 3.1188750977750175,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 22 arrival",
+      "satellite": true,
+      "minimumTerminalPlanGap": 4.231457691192624,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 22 departure",
+      "satellite": true,
+      "minimumTerminalPlanGap": 3.118874030574247,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 23 arrival",
+      "satellite": true,
+      "minimumTerminalPlanGap": 4.216500263214108,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    },
+    {
+      "name": "747 gate 23 departure",
+      "satellite": true,
+      "minimumTerminalPlanGap": 3.1246508574368406,
+      "wingBridgeBroadPhaseCandidateFrames": 0
+    }
+  ],
+  "limits": [
+    "Positive terminal gaps (home +0.57 u, satellite +3.12 u) are sampled planar envelope results, not continuous swept collision certification.",
+    "Jetbridge broad-phase candidates need a full 3D triangle test; these static decorations are not collision-resolved.",
+    "Adjacent parked 747 wing envelopes overlap at both home (19-unit spacing, +3.28 u overlap) and satellite (16-unit spacing, +6.28 u overlap) stands; do not interpret wheel-on-pavement proof as wing, object, or traffic clearance.",
+    "No steering-axle/off-tracking tyre dynamics; tyres use rigid displayed airframe pose. Contact patches sampled at 20 Hz, not continuously between frames."
+  ]
+}

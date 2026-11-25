@@ -323,13 +323,6 @@ impl Aircraft {
         self.ramp_slot
     }
 
-    /// Heading to settle on at the end of a ground taxi, if one was requested.
-    pub(super) fn settle_heading(&self) -> Option<f32> {
-        let settle = self.state == State::Parked
-            || (self.state == State::Ready && !self.cleared_for_takeoff && self.arrival_slot.is_none());
-        self.park_heading.filter(|_| settle)
-    }
-
     fn at(&self, p: [f32; 2], tol: f32) -> bool {
         (self.position[0] - p[0]).hypot(self.position[1] - p[1]) < tol
     }
@@ -344,6 +337,7 @@ impl Aircraft {
         self.ground_timer = 0.0;
         self.park_heading = Some(heading);
         self.taxi_waypoints = route;
+        self.taxi_curve = None;
     }
 
     fn airborne(&self) -> bool {
