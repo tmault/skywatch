@@ -380,6 +380,9 @@ pub struct Aircraft {
     /// pushes from several conflicts never make an aircraft bob.
     #[serde(skip)]
     sep_alt: f32,
+    /// Rate-limited velocity at which the lateral TCAS offset is changing.
+    #[serde(skip)]
+    sep_vel: [f32; 2],
     /// True after climb-out: fly a smooth transit to the sector's patrol path
     /// instead of snapping onto it.
     #[serde(skip)]
@@ -448,6 +451,25 @@ const TCAS_SOFT_VERT_RATE: f32 = 14.0; // u/s soft vertical separation rate (sca
 const SEP_ALT_SMOOTHING: f32 = 1.0;    // per-second low-pass on the vertical TCAS offset
 const SEP_HOLD_TIME: f32 = 10.0;       // seconds a separation offset is held after the last conflict
 const SEP_DECAY_RATE: f32 = 0.2;       // per-second relaxation of the offset once released
+const TCAS_LAT_RATE: f32 = 18.0;       // u/s lateral sidestep rate at full urgency
+const TCAS_LAT_RATE_MAX: f32 = 30.0;   // u/s ceiling when several conflicts add up
+const TCAS_LAT_ACCEL: f32 = 36.0;      // u/s^2 limit so a sidestep never starts or stops with a kick
+const SEP_LAT_LIMIT: f32 = 32.0;       // largest lateral offset per axis from the nominal path
+const SEP_ALT_MIN: f32 = -26.0;        // soft vertical offset bounds...
+const SEP_ALT_MAX: f32 = 36.0;
+const SEP_ALT_HARD_LIMIT: f32 = 96.0;  // ...which only the hard safety floor may exceed
+const VERT_RATE_SMOOTHING: f32 = 4.0;  // per-second low-pass on the CPA vertical rate
+const TCAS_MIN_ALT: f32 = 30.0;        // separation never pushes an aircraft below this
+const FORMATION_MIN_ALT: f32 = 20.0;   // wingmen below this are escorting ground/runway traffic
+/// Depth of the three-lobe patrol loop. Deeper lobes pinch into corners far
+/// tighter than the 0.65 rad/s turn limit, which made the heading demand swing.
+const LOBE_DEPTH: f32 = 0.1;
+/// Patrol guidance: steer at a point this far ahead on the path's tangent...
+const JOIN_LOOKAHEAD: f32 = 30.0;
+/// ...blending into direct pursuit between these distances from the moving path point.
+const JOIN_NEAR_DIST: f32 = 30.0;
+const JOIN_FAR_DIST: f32 = 90.0;
+const WINGMAN_MAX_CLIMB: f32 = 45.0;   // u/s formation-keeping vertical rate limit
 const ALT_EASE_RATE: f32 = 10.0;       // u/s bounded easing rate toward a target altitude
 
 /// Home airport geometry (matches the client's island rendering).
@@ -571,6 +593,30 @@ pub const SATELLITE_SLOTS: [[f32; 2]; 5] = [
 /// centred on the origin (where the home island sits).
 pub(crate) fn wrap_centered(v: f32) -> f32 {
     (v + AREA_SIZE / 2.0).rem_euclid(AREA_SIZE) - AREA_SIZE / 2.0
+}
+
+/// Signed shortest angle in `[-PI, PI)`.
+fn wrap_angle(a: f32) -> f32 {
+    (a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+}
+
+/// Turn from `base` toward `goal`. A goal almost dead astern could be reached
+/// either way round, so keep the turn `heading` is already making instead of
+/// flipping sides with the sign.
+fn committed_swing(base: f32, goal: f32, heading: f32) -> f32 {
+    let swing = wrap_angle(goal - base);
+    let turning = wrap_angle(heading - base);
+    if swing.abs() > 2.6 && swing * turning < 0.0 {
+        swing + std::f32::consts::TAU.copysign(turning)
+    } else {
+        swing
+    }
+}
+
+/// Ease from 0 at `from` to 1 at `to`, flat at both ends.
+fn smoothstep(from: f32, to: f32, x: f32) -> f32 {
+    let t = ((x - from) / (to - from)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// Base domain sectors always present on the map: (name, centre [x, z], radius).
@@ -800,6 +846,7 @@ impl Aircraft {
             sep_offset: [0.0, 0.0, 0.0],
             sep_hold: 0.0,
             sep_alt: 0.0,
+            sep_vel: [0.0, 0.0],
             joining: false,
             on_final: false,
             approach_leg: 0,
@@ -1232,12 +1279,22 @@ impl Aircraft {
         let dz = wrap_centered(target[1] - self.position[1]);
         let dist = dx.hypot(dz);
         // Follow the moving route with bounded physical motion, never copy its coordinates.
+        // Near the route, close the cross-track error on its tangent and absorb the
+        // along-track error with speed. Pointing straight at a nearby moving point
+        // would swing the nose back and forth every time it is overtaken.
+        let (ux, uz) = (path_heading.cos(), path_heading.sin());
+        let along = dx * ux + dz * uz;
+        let cross = ux * dz - uz * dx;
+        let pursuit = smoothstep(JOIN_NEAR_DIST, JOIN_FAR_DIST, dist);
         let cruise = self.cruise_speed();
-        let transit = cruise * (1.0 + (dist / 180.0).clamp(0.0, 0.65));
+        let near_speed = cruise + (0.2 * along).clamp(-0.25 * cruise, 0.65 * cruise);
+        let far_speed = cruise * (1.0 + (dist / 180.0).clamp(0.0, 0.65));
+        let transit = near_speed + (far_speed - near_speed) * pursuit;
         self.speed += (transit - self.speed).clamp(-5.0 * dt, 5.0 * dt);
         self.altitude += (target_alt - self.altitude).clamp(-ALT_EASE_RATE * dt, ALT_EASE_RATE * dt);
-        let heading = if dist > 4.0 { dz.atan2(dx) } else { path_heading };
-        self.turn_toward(heading, 0.65 * dt);
+        let near_heading = path_heading + cross.atan2(JOIN_LOOKAHEAD);
+        let swing = committed_swing(near_heading, dz.atan2(dx), self.heading);
+        self.turn_toward(near_heading + pursuit * swing, 0.65 * dt);
         self.advance(dt);
         self.joining = dist > 20.0 || (target_alt - self.altitude).abs() > 2.0;
         self.position[2] = self.altitude;
@@ -1673,30 +1730,36 @@ impl Aircraft {
             State::Refueling => {
                 // Driven in formation by `World::tick` once linked to a provider tanker;
                 // if ticked standalone (e.g. in unit tests), hold a calm high orbit.
-                let target_alt = TANKER_BASE_ALTITUDE - 10.0;
+                let target_alt = TANKER_BASE_ALTITUDE - 10.0 + self.sep_alt;
                 self.altitude +=
                     (target_alt - self.altitude).clamp(-ALT_EASE_RATE * dt, ALT_EASE_RATE * dt);
                 self.position[2] = self.altitude;
                 self.advance(dt);
             }
             State::Holding => {
+                // The orbit is the nominal path; the TCAS offset rides on top of it, so
+                // a sidestep is never projected back onto the circle on the next tick.
+                let [ox, oz, _] = self.sep_offset;
                 if self.orbit_center.is_none() {
                     let r = HOLD_TURN_RADIUS;
-                    let cx = self.position[0] - self.heading.sin() * r;
-                    let cy = self.position[1] + self.heading.cos() * r;
+                    let cx = self.position[0] - ox - self.heading.sin() * r;
+                    let cy = self.position[1] - oz + self.heading.cos() * r;
                     self.orbit_center = Some([cx, cy]);
                 }
                 let [cx, cy] = self.orbit_center.unwrap();
-                let angle = (self.position[1] - cy).atan2(self.position[0] - cx);
+                // Wrapped deltas: an orbit may straddle the map edge.
+                let angle = wrap_centered(self.position[1] - oz - cy)
+                    .atan2(wrap_centered(self.position[0] - ox - cx));
                 let omega = HOLD_DRIFT_SPEED / HOLD_TURN_RADIUS;
                 let angle = angle + omega * dt;
-                let nx = cx + angle.cos() * HOLD_TURN_RADIUS;
-                let ny = cy + angle.sin() * HOLD_TURN_RADIUS;
+                let nx = cx + angle.cos() * HOLD_TURN_RADIUS + ox;
+                let ny = cy + angle.sin() * HOLD_TURN_RADIUS + oz;
                 self.heading = angle + std::f32::consts::FRAC_PI_2;
                 self.position[0] = wrap_centered(nx);
                 self.position[1] = wrap_centered(ny);
-                let hold_alt = self.cruise_altitude();
-                self.altitude += (hold_alt-self.altitude).clamp(-10.0*dt,10.0*dt);
+                let hold_alt = (self.cruise_altitude() + self.sep_alt).max(TCAS_MIN_ALT);
+                self.altitude +=
+                    (hold_alt - self.altitude).clamp(-ALT_EASE_RATE * dt, ALT_EASE_RATE * dt);
                 self.position[2] = self.altitude;
             }
             State::Cruising => {
@@ -1740,8 +1803,8 @@ impl Aircraft {
                             _ => {
                                 let a = span * 0.88;
                                 (
-                                    a * (-t.sin() - 0.66 * (3.0 * t).sin()),
-                                    a * (t.cos() - 0.66 * (3.0 * t).cos()),
+                                    a * (-t.sin() - 3.0 * LOBE_DEPTH * (3.0 * t).sin()),
+                                    a * (t.cos() - 3.0 * LOBE_DEPTH * (3.0 * t).cos()),
                                 )
                             }
                         };
@@ -1769,10 +1832,10 @@ impl Aircraft {
                             _ => {
                                 let a = span * 0.88;
                                 (
-                                    a * (t.cos() + 0.22 * (3.0 * t).cos()),
-                                    a * (t.sin() - 0.22 * (3.0 * t).sin()),
-                                    a * (-t.sin() - 0.66 * (3.0 * t).sin()),
-                                    a * (t.cos() - 0.66 * (3.0 * t).cos()),
+                                    a * (t.cos() + LOBE_DEPTH * (3.0 * t).cos()),
+                                    a * (t.sin() - LOBE_DEPTH * (3.0 * t).sin()),
+                                    a * (-t.sin() - 3.0 * LOBE_DEPTH * (3.0 * t).sin()),
+                                    a * (t.cos() - 3.0 * LOBE_DEPTH * (3.0 * t).cos()),
                                 )
                             }
                         };
@@ -2043,6 +2106,9 @@ pub fn refuel_formation_position(
 /// Snapshot of the whole world, ready to serialise over the wire.
 #[derive(Clone, Debug, Serialize)]
 pub struct WorldSnapshot {
+    /// Simulated seconds ticked so far; the client times heading and climb rates
+    /// from this rather than from jittery frame arrival.
+    pub sim_time: f64,
     pub usage: crate::usage::UsageSnapshot,
     pub aircraft: Vec<Aircraft>,
     pub sectors: Vec<Sector>,
@@ -2077,6 +2143,7 @@ pub fn default_sectors() -> Vec<Sector> {
 
 #[derive(Clone, Debug)]
 pub struct World {
+    sim_time: f64,
     pub usage: crate::usage::UsageSnapshot,
     pub aircraft: Vec<Aircraft>,
     pub airports: Vec<Airport>,
@@ -2092,6 +2159,7 @@ pub struct World {
 impl Default for World {
     fn default() -> Self {
         Self {
+            sim_time: 0.0,
             usage: crate::usage::UsageSnapshot::unavailable(0),
             aircraft: Vec::new(),
             airports: vec![Airport::home("local", "Tower")],
@@ -2214,6 +2282,7 @@ impl World {
     /// receivers track their provider tanker, and fighter wingmen smoothly
     /// track their parent's wing formation.
     pub fn tick(&mut self, dt: f32) {
+        self.sim_time += f64::from(dt);
         self.sync_tankers();
         let sectors = self.sectors.clone();
 
@@ -2468,17 +2537,18 @@ impl World {
         }
 
         // Snapshot parent telemetry so wingmen can read it without borrow conflict.
-        let parents: std::collections::HashMap<u64, ([f32; 3], f32, State, bool)> = self
+        let parents: std::collections::HashMap<u64, ([f32; 3], f32, State, bool, f32)> = self
             .aircraft
             .iter()
             .filter(|a| a.parent_id.is_none())
-            .map(|a| (a.id, (a.position, a.heading, a.state, a.is_departing())))
+            .map(|a| (a.id, (a.position, a.heading, a.state, a.is_departing(), a.speed)))
             .collect();
 
         let blend = (6.0 * dt).min(1.0);
         for a in &mut self.aircraft {
             let Some(pid) = a.parent_id else { continue };
-            let Some(&(p_pos, p_heading, p_state, p_departing)) = parents.get(&pid) else {
+            let Some(&(p_pos, p_heading, p_state, p_departing, p_speed)) = parents.get(&pid)
+            else {
                 // Parent vanished: cruise independently until reconciled.
                 a.tick_with_sectors(dt, &sectors);
                 continue;
@@ -2488,47 +2558,33 @@ impl World {
                 State::Parked | State::Landed | State::Taxi | State::Ready
             ) || (matches!(p_state, State::Departing | State::Takeoff) && p_pos[2] <= 0.5);
 
-            if p_departing || p_state == State::Departing {
-                // Follow departing parent unwrapped out over the mountains into the horizon.
-                let target = formation_position_raw(p_pos, p_heading, on_ground, a.wing_slot.unwrap_or(0));
-                let dx = target[0] - a.position[0];
-                let dz = target[1] - a.position[1];
-                a.position[0] += dx * blend;
-                a.position[1] += dz * blend;
-                a.altitude += (target[2] - a.altitude) * blend;
-                a.position[2] = a.altitude;
-            } else {
-                let target = formation_position(p_pos, p_heading, on_ground, a.wing_slot.unwrap_or(0));
-
-                // Shortest-path delta in wrapped world coordinates.
-                let mut dx = target[0] - a.position[0];
-                let mut dz = target[1] - a.position[1];
-                if dx > AREA_SIZE * 0.5 {
-                    dx -= AREA_SIZE;
-                } else if dx < -AREA_SIZE * 0.5 {
-                    dx += AREA_SIZE;
-                }
-                if dz > AREA_SIZE * 0.5 {
-                    dz -= AREA_SIZE;
-                } else if dz < -AREA_SIZE * 0.5 {
-                    dz += AREA_SIZE;
-                }
-
-                a.position[0] = wrap_centered(a.position[0] + dx * blend);
-                a.position[1] = wrap_centered(a.position[1] + dz * blend);
-                a.altitude += (target[2] - a.altitude) * blend;
-                a.position[2] = a.altitude;
+            // Departing parents are followed unwrapped, out over the mountains into
+            // the horizon; otherwise take the shortest way around the wrapped map.
+            let unwrapped = p_departing || p_state == State::Departing;
+            // Ease onto the parent's heading first and hang the slot off the eased
+            // value: on a ~30 unit lever arm, every parent yaw step would shake it.
+            a.heading += wrap_angle(p_heading - a.heading) * blend;
+            let slot = a.wing_slot.unwrap_or(0);
+            let target = formation_position_raw(p_pos, a.heading, on_ground, slot);
+            // Slot plus this wingman's own TCAS offset, so avoidance isn't undone.
+            let mut dx = target[0] + a.sep_offset[0] - a.position[0];
+            let mut dz = target[1] + a.sep_offset[1] - a.position[1];
+            if !unwrapped {
+                dx = wrap_centered(dx);
+                dz = wrap_centered(dz);
             }
-
-            // Match parent heading smoothly.
-            let mut dh = p_heading - a.heading;
-            while dh > std::f32::consts::PI {
-                dh -= std::f32::consts::TAU;
+            // Bounded catch-up: a slot that jumps is flown to, never snapped to.
+            let reach = (p_speed + FIGHTER_SPEED) * dt;
+            let step = blend.min(reach / dx.hypot(dz).max(0.001));
+            a.position[0] += dx * step;
+            a.position[1] += dz * step;
+            if !unwrapped {
+                a.position[0] = wrap_centered(a.position[0]);
+                a.position[1] = wrap_centered(a.position[1]);
             }
-            while dh < -std::f32::consts::PI {
-                dh += std::f32::consts::TAU;
-            }
-            a.heading += dh * blend;
+            let climb = (target[2] + a.sep_alt - a.altitude) * blend;
+            a.altitude += climb.clamp(-WINGMAN_MAX_CLIMB * dt, WINGMAN_MAX_CLIMB * dt);
+            a.position[2] = a.altitude;
 
             a.state = match p_state {
                 State::Holding => State::Holding,
@@ -2556,10 +2612,13 @@ impl World {
             });
         }
 
-        // Vertical rates for CPA prediction (smoothed over the tick).
+        // Low-passed vertical rates for CPA prediction, so one tick's correction
+        // can't toggle a predicted conflict on and off.
         if dt > 0.0 {
+            let alpha = 1.0 - (-VERT_RATE_SMOOTHING * dt).exp();
             for a in &mut self.aircraft {
-                a.vr = ((a.altitude - a.prev_alt) / dt).clamp(-30.0, 30.0);
+                let rate = ((a.altitude - a.prev_alt) / dt).clamp(-30.0, 30.0);
+                a.vr += (rate - a.vr) * alpha;
                 a.prev_alt = a.altitude;
             }
         }
@@ -2574,8 +2633,10 @@ impl World {
     fn enforce_air_separation(&mut self, dt: f32) {
         // Takeoffs and approaches are sequenced by the tower, not TCAS (its
         // 30u altitude floor would yank them off the glidepath).
-        let is_airborne =
-            |s: State| matches!(s, State::Cruising | State::Holding | State::Refueling);
+        let is_airborne = |a: &Aircraft| {
+            matches!(a.state, State::Cruising | State::Holding | State::Refueling)
+                && (a.parent_id.is_none() || a.altitude >= FORMATION_MIN_ALT)
+        };
         let is_formation_pair = |a: &Aircraft, b: &Aircraft| {
             a.parent_id == Some(b.id)
                 || b.parent_id == Some(a.id)
@@ -2585,23 +2646,24 @@ impl World {
                 || (a.refuel_connected && b.refuel_connected && a.tanker_id == b.tanker_id)
         };
 
-        // Gently relax previous TCAS offsets back toward zero when clear.
-        // The latched evasion side releases once the offset has decayed away.
+        // Gently relax previous TCAS offsets back toward zero when clear (the
+        // lateral part is relaxed below, through the same rate limiter that
+        // builds it). The latched evasion side releases once the offset has
+        // decayed away.
         let decay = (-SEP_DECAY_RATE * dt).exp();
         for a in &mut self.aircraft {
-            if is_airborne(a.state) {
+            if is_airborne(a) {
                 a.sep_alt += (a.sep_offset[2] - a.sep_alt) * (1.0 - (-SEP_ALT_SMOOTHING * dt).exp());
                 a.sep_hold = (a.sep_hold - dt).max(0.0);
                 if a.sep_hold <= 0.0 {
-                    a.sep_offset[0] *= decay;
-                    a.sep_offset[1] *= decay;
                     a.sep_offset[2] *= decay;
-                }
-                if a.sep_offset[0].abs() + a.sep_offset[1].abs() < 4.0 {
-                    a.avoid_side = 0.0;
+                    if a.sep_offset[0].abs() + a.sep_offset[1].abs() < 4.0 {
+                        a.avoid_side = 0.0;
+                    }
                 }
             } else {
                 a.sep_offset = [0.0, 0.0, 0.0];
+                a.sep_vel = [0.0, 0.0];
                 a.sep_alt = 0.0;
                 a.avoid_side = 0.0;
             }
@@ -2623,11 +2685,11 @@ impl World {
         let mut hard_alt: Vec<f32> = vec![0.0; n];
 
         for i in 0..n {
-            if !is_airborne(self.aircraft[i].state) {
+            if !is_airborne(&self.aircraft[i]) {
                 continue;
             }
             for j in (i + 1)..n {
-                if !is_airborne(self.aircraft[j].state) {
+                if !is_airborne(&self.aircraft[j]) {
                     continue;
                 }
                 if is_formation_pair(&self.aircraft[i], &self.aircraft[j]) {
@@ -2734,15 +2796,17 @@ impl World {
                     }
                 };
                 self.aircraft[evader].avoid_side = side;
-                let lat_step = 18.0 * urgency * dt * side;
+                let lat_rate = TCAS_LAT_RATE * urgency * side;
                 // Perp to the canonical axis; a fixed physical side of the line.
-                push[evader][0] += -nz * lat_step;
-                push[evader][1] += nx * lat_step;
+                push[evader][0] += -nz * lat_rate;
+                push[evader][1] += nx * lat_rate;
 
                 // Hard vertical safety floor whenever two planes cross tightly,
                 // applied at a bounded rate so it never snaps an aircraft.
                 if hdist < TCAS_HARD_HORIZ && vdist < TCAS_HARD_VERT {
-                    let need = (TCAS_HARD_VERT - vdist) * 0.5 + 0.5;
+                    // Proportional to the shortfall: a fixed extra kick here would
+                    // overshoot, ease back and re-trigger every other tick.
+                    let need = (TCAS_HARD_VERT + 0.05 - vdist) * 0.5;
                     let step = need.min(VERT_HARD_RATE * dt);
                     hard_alt[c] -= sgn * step;
                     hard_alt[d] += sgn * step;
@@ -2751,28 +2815,70 @@ impl World {
         }
 
         for i in 0..n {
-            if !is_airborne(self.aircraft[i].state) {
+            if !is_airborne(&self.aircraft[i]) {
                 continue;
             }
             let a = &mut self.aircraft[i];
-            a.sep_offset[0] = (a.sep_offset[0] + push[i][0]).clamp(-32.0, 32.0);
-            a.sep_offset[1] = (a.sep_offset[1] + push[i][1]).clamp(-32.0, 32.0);
-            a.sep_offset[2] = (a.sep_offset[2] + push[i][2] + hard_alt[i]).clamp(-26.0, 36.0);
-
-            if push[i][0] != 0.0 || push[i][1] != 0.0 || push[i][2] != 0.0 || hard_alt[i] != 0.0 {
+            let [px, pz, pv] = push[i];
+            if px != 0.0 || pz != 0.0 || pv != 0.0 || hard_alt[i] != 0.0 {
                 a.sep_hold = SEP_HOLD_TIME;
-                a.position[0] = wrap_centered(a.position[0] + push[i][0]);
-                a.position[1] = wrap_centered(a.position[1] + push[i][1]);
-                // Soft vertical resolution flows through the smoothed `sep_alt` target. Only
-                // the rare hard safety floor moves altitude directly (bounded rate).
-                a.altitude = (a.altitude + hard_alt[i]).max(30.0);
+            }
+
+            // Lateral: ease the sidestep velocity toward the demand (or the
+            // relaxation back to the nominal path), then move the aircraft and its
+            // offset together so no flight model steers against the correction.
+            let desired = if px != 0.0 || pz != 0.0 {
+                let scale = (TCAS_LAT_RATE_MAX / px.hypot(pz).max(0.001)).min(1.0);
+                [px * scale, pz * scale]
+            } else if a.sep_hold > 0.0 {
+                [0.0, 0.0]
+            } else {
+                [-a.sep_offset[0] * SEP_DECAY_RATE, -a.sep_offset[1] * SEP_DECAY_RATE]
+            };
+            let (cx, cz) = (desired[0] - a.sep_vel[0], desired[1] - a.sep_vel[1]);
+            let limit = (TCAS_LAT_ACCEL * dt / cx.hypot(cz).max(0.000_001)).min(1.0);
+            a.sep_vel[0] += cx * limit;
+            a.sep_vel[1] += cz * limit;
+            for axis in 0..2 {
+                let old = a.sep_offset[axis];
+                // Brake into the offset limit rather than stopping dead against it.
+                let braking = |room: f32| {
+                    let step = TCAS_LAT_ACCEL * dt;
+                    (2.0 * TCAS_LAT_ACCEL * room.max(0.0) + step * step).sqrt() - step
+                };
+                a.sep_vel[axis] = a.sep_vel[axis]
+                    .clamp(-braking(SEP_LAT_LIMIT + old), braking(SEP_LAT_LIMIT - old));
+                let new = (old + a.sep_vel[axis] * dt).clamp(-SEP_LAT_LIMIT, SEP_LAT_LIMIT);
+                if new != old {
+                    a.sep_offset[axis] = new;
+                    a.position[axis] = wrap_centered(a.position[axis] + new - old);
+                }
+            }
+
+            // Soft vertical resolution flows through the smoothed `sep_alt` target.
+            let soft = a.sep_offset[2];
+            a.sep_offset[2] =
+                (soft + pv).clamp(soft.min(SEP_ALT_MIN), soft.max(SEP_ALT_MAX));
+
+            // Only the hard safety floor moves altitude directly (bounded rate). It
+            // shifts the target by the same amount, or altitude easing would pull the
+            // aircraft straight back into the conflict on the next tick.
+            if hard_alt[i] != 0.0 {
+                let step = hard_alt[i].clamp(-VERT_HARD_RATE * dt, VERT_HARD_RATE * dt);
+                let floor = a.altitude.min(TCAS_MIN_ALT);
+                let moved = (a.altitude + step).max(floor) - a.altitude;
+                a.altitude += moved;
                 a.position[2] = a.altitude;
+                for offset in [&mut a.sep_offset[2], &mut a.sep_alt] {
+                    *offset = (*offset + moved).clamp(-SEP_ALT_HARD_LIMIT, SEP_ALT_HARD_LIMIT);
+                }
             }
         }
     }
 
     pub fn snapshot(&self) -> WorldSnapshot {
         WorldSnapshot {
+            sim_time: self.sim_time,
             usage: self.usage.clone(),
             aircraft: self.aircraft.clone(),
             sectors: self.sectors.clone(),
@@ -4958,5 +5064,277 @@ mod tests {
             }
         }
         assert!(entered);
+    }
+
+    /// Last position, heading and `[vx, vz, climb, yaw]` rates of one aircraft.
+    type Sample = ([f32; 3], f32, Option<[f32; 4]>);
+
+    /// Per-tick motion of one aircraft, for spotting shake between snapshots.
+    #[derive(Default)]
+    struct Shake {
+        last: std::collections::HashMap<u64, Sample>,
+        yaw_reversals: u32,
+        climb_reversals: u32,
+        max_speed_step: f32,
+    }
+
+    impl Shake {
+        fn observe(&mut self, world: &World) {
+            let dt = 0.05;
+            for a in &world.aircraft {
+                let Some(&(p, h, rates)) = self.last.get(&a.id) else {
+                    self.last.insert(a.id, (a.position, a.heading, None));
+                    continue;
+                };
+                let now = [
+                    wrap_centered(a.position[0] - p[0]) / dt,
+                    wrap_centered(a.position[1] - p[1]) / dt,
+                    (a.position[2] - p[2]) / dt,
+                    wrap_angle(a.heading - h) / dt,
+                ];
+                if let Some(old) = rates {
+                    let reversed = |i: usize, floor: f32| {
+                        old[i] * now[i] < 0.0 && old[i].abs() > floor && now[i].abs() > floor
+                    };
+                    self.yaw_reversals += u32::from(reversed(3, 0.05));
+                    self.climb_reversals += u32::from(reversed(2, 1.0));
+                    self.max_speed_step = self
+                        .max_speed_step
+                        .max((now[0] - old[0]).hypot(now[1] - old[1]));
+                }
+                self.last.insert(a.id, (a.position, a.heading, Some(now)));
+            }
+        }
+    }
+
+    /// An aircraft with fixed identity and pose, independent of the random seed.
+    fn placed(id: u64, class: ModelClass, position: [f32; 3], heading: f32) -> Aircraft {
+        let mut a = Aircraft::with_model(&format!("M{id}"), Kind::Agent, class);
+        a.id = id;
+        a.position = position;
+        a.altitude = position[2];
+        a.prev_alt = position[2];
+        a.heading = heading;
+        a.patrol_angle = (id % 7) as f32 * 0.9;
+        a
+    }
+
+    #[test]
+    fn holding_conflicts_separate_without_altitude_sawtooth_or_snapback() {
+        let mut world = World::new();
+        for i in 0..8u64 {
+            // Same id class => same nominal flight level, bunched together.
+            let mut a = placed(
+                6000 + i * 6,
+                ModelClass::Frontier,
+                [i as f32 * 14.0, (i % 3) as f32 * 9.0, 148.0],
+                i as f32 * 0.77,
+            );
+            a.hold("awaiting approval");
+            world.add(a);
+        }
+        let mut shake = Shake::default();
+        // Pair-ticks briefly inside the hard envelope, while one aircraft is
+        // squeezed between two others and the floor is rate limited.
+        let mut squeezed = 0;
+        for tick in 0..2400 {
+            world.tick(0.05);
+            if tick < 200 {
+                continue; // the deliberately overlapping start is resolving
+            }
+            shake.observe(&world);
+            for (i, a) in world.aircraft.iter().enumerate() {
+                for b in &world.aircraft[i + 1..] {
+                    let h = wrap_centered(a.position[0] - b.position[0])
+                        .hypot(wrap_centered(a.position[1] - b.position[1]));
+                    let v = (a.position[2] - b.position[2]).abs();
+                    if h < TCAS_HARD_HORIZ - 0.5 && v < TCAS_HARD_VERT - 0.5 {
+                        squeezed += 1;
+                        assert!(v > 6.0, "separation lost at tick {tick}: {h} / {v}");
+                    }
+                }
+            }
+        }
+        assert!(squeezed <= 10, "separation floor breached for {squeezed} pair-ticks");
+        assert!(shake.climb_reversals <= 8, "altitude sawtooth: {}", shake.climb_reversals);
+        assert_eq!(shake.yaw_reversals, 0);
+        assert!(shake.max_speed_step < 3.0, "sidestep kick: {}", shake.max_speed_step);
+    }
+
+    #[test]
+    fn patrol_guidance_never_swings_the_heading_back_and_forth() {
+        let sectors = default_sectors();
+        // Every patrol pattern (id % 3) for both airframe speeds, one at a time.
+        for id in 7000..7006u64 {
+            for class in [ModelClass::Local, ModelClass::Frontier] {
+                let centre = sectors[0].center;
+                let mut a = placed(id, class, [centre[0] + 40.0, centre[1], 100.0], 1.0);
+                a.assign(&sectors[0].name);
+                let mut world = World::new();
+                world.add(a);
+                let mut shake = Shake::default();
+                for _ in 0..6000 {
+                    world.tick(0.05);
+                    shake.observe(&world);
+                    let p = world.aircraft[0].position;
+                    let range = wrap_centered(p[0] - centre[0]).hypot(wrap_centered(p[1] - centre[1]));
+                    assert!(range < sectors[0].radius * 1.7, "left the sector: {range}");
+                }
+                // A couple while first intercepting the path is a real turn reversal.
+                assert!(shake.yaw_reversals <= 3, "{id} {class:?} yaw {}", shake.yaw_reversals);
+                assert!(shake.max_speed_step < 1.0, "{id} {class:?} {}", shake.max_speed_step);
+            }
+        }
+    }
+
+    #[test]
+    fn wingmen_follow_patrol_turns_without_shaking() {
+        let sectors = default_sectors();
+        let centre = sectors[0].center;
+        let mut parent = placed(7101, ModelClass::Frontier, [centre[0], centre[1], 158.0], 0.0);
+        parent.assign(&sectors[0].name);
+        let mut world = World::new();
+        for slot in 0..4 {
+            world.add(Aircraft::wingman(
+                &format!("W{slot}"),
+                parent.id,
+                slot,
+                parent.position,
+                0.0,
+            ));
+        }
+        world.add(parent);
+        let mut shake = Shake::default();
+        for tick in 0..6000 {
+            world.tick(0.05);
+            if tick >= 200 {
+                shake.observe(&world);
+            }
+        }
+        assert!(shake.yaw_reversals <= 4, "yaw {}", shake.yaw_reversals);
+        assert_eq!(shake.climb_reversals, 0);
+        assert!(shake.max_speed_step < 3.0, "formation kick: {}", shake.max_speed_step);
+    }
+
+    #[test]
+    fn head_on_sidestep_ramps_in_and_out_within_the_acceleration_limit() {
+        let mut world = World::new();
+        for (id, x, heading) in [(7201, 90.0, std::f32::consts::PI), (7202, -90.0, 0.0)] {
+            let mut a = placed(id, ModelClass::Frontier, [x, 0.0, 148.0], heading);
+            a.speed = 30.0;
+            world.add(a);
+        }
+        let mut sidestepped = 0.0f32;
+        for _ in 0..800 {
+            let before: Vec<_> = world.aircraft.iter().map(|a| a.sep_vel).collect();
+            world.tick(0.05);
+            for (a, old) in world.aircraft.iter().zip(before) {
+                let step = (a.sep_vel[0] - old[0]).hypot(a.sep_vel[1] - old[1]);
+                // Braking into the offset limit is bounded per axis.
+                assert!(
+                    step <= TCAS_LAT_ACCEL * 0.05 * 1.5,
+                    "lateral velocity jumped by {step}"
+                );
+                sidestepped = sidestepped.max(a.sep_offset[1].abs());
+            }
+        }
+        assert!(sidestepped > 3.0, "nobody sidestepped: {sidestepped}");
+    }
+
+    #[test]
+    fn holding_orbit_across_the_map_edge_stays_continuous() {
+        let mut a = placed(7301, ModelClass::Frontier, [405.0, 0.0, 158.0], std::f32::consts::FRAC_PI_2);
+        a.hold("awaiting input");
+        // Orbit centre lies beyond the edge, so the circle crosses it twice.
+        a.heading = -std::f32::consts::FRAC_PI_2;
+        let mut world = World::new();
+        world.add(a);
+        let mut shake = Shake::default();
+        let mut crossings = 0;
+        let mut last_x = 405.0f32;
+        for _ in 0..2600 {
+            world.tick(0.05);
+            shake.observe(&world);
+            let x = world.aircraft[0].position[0];
+            crossings += u32::from((x - last_x).abs() > AREA_SIZE / 2.0);
+            last_x = x;
+        }
+        assert!(crossings >= 2, "orbit never crossed the edge");
+        assert!(shake.max_speed_step < 0.5, "orbit jumped: {}", shake.max_speed_step);
+        assert_eq!(shake.yaw_reversals, 0);
+    }
+
+    #[test]
+    fn refuelling_join_has_no_velocity_steps_and_stays_connected() {
+        let mut world = World::new();
+        for i in 0..3u64 {
+            let mut a = placed(7400 + i, ModelClass::Frontier, [i as f32 * 70.0 - 70.0, 30.0, 150.0], 0.3);
+            a.provider = Some("anthropic".into());
+            a.refuel("limit", None);
+            world.add(a);
+        }
+        let mut shake = Shake::default();
+        let mut connected = std::collections::HashSet::new();
+        for tick in 0..4800 {
+            world.tick(0.05);
+            if tick >= 200 {
+                shake.observe(&world);
+            }
+            for a in &world.aircraft {
+                if a.refuel_connected {
+                    connected.insert(a.id);
+                } else {
+                    assert!(!connected.contains(&a.id), "{} dropped the hose at {tick}", a.callsign);
+                }
+            }
+        }
+        assert_eq!(connected.len(), 3, "receivers never all connected");
+        // Under 6 units/s per tick: a turn and slow-down, not a jump between modes.
+        assert!(shake.max_speed_step < 6.0, "join kick: {}", shake.max_speed_step);
+    }
+
+    #[test]
+    fn receiver_overshooting_its_slot_turns_back_without_waggling() {
+        for ahead in [14.0, 20.0, 26.0, 32.0] {
+            for lateral in [-0.4, 0.0, 0.4] {
+                let mut world = World::new();
+                let mut receiver = placed(7500, ModelClass::Frontier, [0.0, 0.0, 225.0], 0.0);
+                receiver.provider = Some("anthropic".into());
+                receiver.refuel("limit", None);
+                world.add(receiver);
+                world.sync_tankers();
+                let tanker = world.aircraft.iter().find(|a| a.kind == Kind::Tanker).unwrap();
+                let slot = refuel_formation_position(tanker.position, tanker.heading, 0);
+                let (fwd, heading) = ([tanker.heading.cos(), tanker.heading.sin()], tanker.heading);
+                let a = &mut world.aircraft[0];
+                a.position = [
+                    slot[0] + fwd[0] * ahead - fwd[1] * lateral,
+                    slot[1] + fwd[1] * ahead + fwd[0] * lateral,
+                    slot[2],
+                ];
+                a.altitude = slot[2];
+                a.heading = heading;
+                let mut shake = Shake::default();
+                for _ in 0..2400 {
+                    world.tick(0.05);
+                    shake.observe(&world);
+                }
+                assert!(world.aircraft[0].refuel_connected, "{ahead}/{lateral} never rejoined");
+                assert!(
+                    shake.yaw_reversals <= 4,
+                    "{ahead}/{lateral} waggled {} times",
+                    shake.yaw_reversals
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapshots_carry_simulated_time() {
+        let mut world = World::new();
+        for _ in 0..20 {
+            world.tick(0.05);
+        }
+        assert!((world.snapshot().sim_time - 1.0).abs() < 1e-6);
     }
 }

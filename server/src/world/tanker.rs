@@ -1,8 +1,8 @@
 use super::{
-    provider_info, refuel_formation_position, wrap_centered, Aircraft, Kind, State, World,
+    committed_swing, provider_info, refuel_formation_position, smoothstep, wrap_angle,
+    wrap_centered, Aircraft, Kind, State, World,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::f32::consts::{PI, TAU};
 
 use super::TANKER_SPEED;
 
@@ -128,36 +128,40 @@ impl World {
                 continue;
             };
             let target = refuel_formation_position(position, heading, slot);
-            let dx = wrap_centered(target[0] - a.position[0]);
-            let dz = wrap_centered(target[1] - a.position[1]);
+            // Slot plus this receiver's TCAS offset, so avoidance isn't undone.
+            let dx = wrap_centered(target[0] + a.sep_offset[0] - a.position[0]);
+            let dz = wrap_centered(target[1] + a.sep_offset[1] - a.position[1]);
             let distance = dx.hypot(dz);
-            let altitude_error = target[2] - a.altitude;
-            let heading_error = (heading - a.heading + PI).rem_euclid(TAU) - PI;
+            let altitude_error = target[2] + a.sep_alt - a.altitude;
+            let heading_error = wrap_angle(heading - a.heading);
 
-            if distance > 22.0 {
-                // Intercept from below until clear of the tanker's flight path.
-                let intercept_speed = (a.cruise_speed() * 2.2).max(26.0);
-                a.speed += (intercept_speed - a.speed).clamp(-8.0 * dt, 8.0 * dt);
-                a.turn_toward(dz.atan2(dx), (0.85 + 24.0 / distance) * dt);
-                a.advance(dt);
-            } else {
-                let blend = (5.0 * dt).min(1.0).min(26.0 * dt / distance.max(0.01));
-                a.position[0] = wrap_centered(a.position[0] + dx * blend);
-                a.position[1] = wrap_centered(a.position[1] + dz * blend);
-                a.turn_toward(heading, 1.2 * dt);
-                a.speed += (TANKER_SPEED - a.speed).clamp(-8.0 * dt, 8.0 * dt);
-            }
-            let join_altitude = if distance > 60.0 {
-                altitude_error - 20.0
-            } else {
-                altitude_error
-            };
+            // Cross-fade from flying the intercept (beyond 40 units) to closing on
+            // the formation slot (inside 12), so velocity never steps between them.
+            let intercept = smoothstep(12.0, 40.0, distance);
+            let intercept_speed = (a.cruise_speed() * 2.2).max(26.0);
+            let speed = TANKER_SPEED + (intercept_speed - TANKER_SPEED) * intercept;
+            a.speed += (speed - a.speed).clamp(-8.0 * dt, 8.0 * dt);
+            let swing = committed_swing(heading, dz.atan2(dx), a.heading);
+            let turn_rate = 1.2 + (24.0 / distance.max(16.0) - 0.35) * intercept;
+            a.turn_toward(heading + swing * intercept, turn_rate * dt);
+            let blend = (5.0 * dt).min(1.0).min(26.0 * dt / distance.max(0.01));
+            let travel = a.speed * dt * intercept;
+            let close = blend * (1.0 - intercept);
+            a.position[0] =
+                wrap_centered(a.position[0] + a.heading.cos() * travel + dx * close);
+            a.position[1] =
+                wrap_centered(a.position[1] + a.heading.sin() * travel + dz * close);
+            // Phase out the intercept-from-below bias smoothly between 80 and 40 units.
+            let join_altitude = altitude_error - 20.0 * smoothstep(40.0, 80.0, distance);
             a.altitude += join_altitude.clamp(-18.0 * dt, 18.0 * dt);
             a.position[2] = a.altitude;
-            a.refuel_connected = distance < 6.0
-                && altitude_error.abs() < 4.0
-                && heading_error.abs() < 0.35
-                && (a.speed - TANKER_SPEED).abs() < 3.0;
+            // Hysteresis: a connected receiver needs a clearly larger error to drop
+            // off, so the hose and the formation separation exemption never flicker.
+            let slack = if a.refuel_connected { 1.5 } else { 1.0 };
+            a.refuel_connected = distance < 6.0 * slack
+                && altitude_error.abs() < 4.0 * slack
+                && heading_error.abs() < 0.35 * slack
+                && (a.speed - TANKER_SPEED).abs() < 3.0 * slack;
         }
     }
 }
