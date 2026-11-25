@@ -368,7 +368,9 @@ export function createLocalFlair(scene, a) {
         && (entry.altitude || 0) > 40;
 
       if (rollActive) {
-        if (!canStunt) {
+        // Only the ground cuts a roll short. Dropping it mid-air when the state
+        // changes would snap the wings level in a single frame.
+        if (!airborne) {
           rollActive = false;
           rollElapsed = 0;
           smokeBurstTail = 0;

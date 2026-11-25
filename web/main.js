@@ -28,9 +28,12 @@ import { createEnvironment } from './environment.js';
 import { setupThemePicker } from './theme-picker.js';
 import { createFuelDepot } from './fuel-depot.js';
 import { syntheticFuelSnapshot } from './fuel-fixtures.js';
+import {
+  SNAPSHOT_STALE_AFTER, clampFrameDt, createMotionTracker, trackSnapshot, stepRoll,
+  followPose, groundContactWeight,
+} from './motion.js';
 const fuelDemo = new URLSearchParams(location.search).get('fuel-demo') === '1' ? syntheticFuelSnapshot() : null;
 
-const INTERP_RATE = 10; // exponential smoothing constant (per second)
 const TARMAC_TOP_Y = 3.2; // elevated runway/apron deck height (well above sand y=2.0)
 
 /* ---------------------------------------------------------------- scene */
@@ -1652,14 +1655,14 @@ function ensureMesh(a) {
   built.target = built.group.position.clone();
   built.heading = a.heading;
   built.targetHeading = a.heading;
-  built.snapX = a.position[0];
-  built.snapZ = a.position[1];
+  built.lead = built.group.position.clone();
+  built.leadHeading = a.heading;
+  built.motion = createMotionTracker();
   built.altitude = a.position[2];
   built.speed = a.speed ?? 0;
   built.dustClock = 0;
   built.roll = 0;
   built.pitch = 0;
-  built.flightPitch = 0;
   built.group.rotation.y = Math.PI / 2 - a.heading;
   built.state = a.state;
   built.kind = a.kind;
@@ -2038,6 +2041,9 @@ function connect() {
 }
 
 function applySnapshot(snapshot) {
+  lastSnapshotAt = performance.now() / 1000;
+  // Simulated time keeps turn and climb rates steady however frames arrive.
+  const simTime = snapshot.sim_time ?? lastSnapshotAt;
   fuelDepot.update(fuelDemo || snapshot.usage);
   currentSnapshot.clear();
   for (const a of snapshot.aircraft || []) currentSnapshot.set(a.id, a);
@@ -2059,20 +2065,9 @@ function applySnapshot(snapshot) {
     entry.target.set(a.position[0], y, a.position[1]);
     entry.targetHeading = a.heading;
     detectRunwayEvent(a, entry, lastStates.get(a.id), entry.altitude);
-    const snapDx = a.position[0] - entry.snapX;
-    const snapDz = a.position[1] - entry.snapZ;
-    const snapDh = Math.hypot(snapDx, snapDz);
-    const snapDAlt = a.position[2] - entry.altitude;
     const onGround = ['parked', 'ready', 'taxi', 'landed'].includes(a.state)
       || ((a.state === 'takeoff' || a.state === 'departing') && a.position[2] <= 0);
-    if (onGround) {
-      entry.flightPitch = 0;
-    } else if (snapDh >= 0.05 && snapDh < 200 && Math.abs(snapDAlt) < 25) {
-      // Negative rotation.x pitches the +Z nose UP; positive pitches nose DOWN.
-      entry.flightPitch = -Math.atan2(snapDAlt, snapDh);
-    }
-    entry.snapX = a.position[0];
-    entry.snapZ = a.position[1];
+    trackSnapshot(entry.motion, a, simTime, onGround);
     entry.altitude = a.position[2];
     entry.speed = a.speed ?? 0;
     entry.landingPitch = a.landing_pitch ?? null;
@@ -2440,31 +2435,22 @@ canvas.addEventListener('pointerup', (ev) => {
 
 const currentSnapshot = new Map();
 const clock = new THREE.Clock();
+let lastSnapshotAt = 0;
 
 function animate() {
   requestAnimationFrame(animate);
-  const dt = clock.getDelta();
-  const k = 1 - Math.exp(-INTERP_RATE * dt);
+  const dt = clampFrameDt(clock.getDelta());
 
   const now = performance.now() / 1000;
+  const liveFeed = now - lastSnapshotAt < SNAPSHOT_STALE_AFTER;
   const reduceMotion = reducedMotionQuery.matches;
   for (const [id, entry] of meshes.entries()) {
     entry.group.position.y -= entry.clearanceAdjustment || 0;
     entry.clearanceAdjustment = 0;
-    const wrapped = entry.state !== 'departing' && entry.group.position.distanceToSquared(entry.target) > 40000;
-    if (wrapped) {
-      entry.group.position.copy(entry.target);
+    if (followPose(entry, dt)) {
       if (entry.contrails) for (const c of entry.contrails) c.clear();
       if (entry.localFlair) entry.localFlair.reset();
-    } else {
-      entry.group.position.lerp(entry.target, k);
     }
-
-    let dh = entry.targetHeading - entry.heading;
-    while (dh > Math.PI) dh -= 2 * Math.PI;
-    while (dh < -Math.PI) dh += 2 * Math.PI;
-    const stepH = dh * k;
-    entry.heading += stepH;
     entry.group.rotation.y = Math.PI / 2 - entry.heading;
 
     // Bank smoothly into turns when airborne; keep wings level on the ground.
@@ -2473,14 +2459,11 @@ function animate() {
     const departingAirborne = entry.state === 'departing' && alt > 0;
     const airborne = ['cruising', 'holding', 'refueling', 'landing'].includes(entry.state)
       || takeoffAirborne || departingAirborne;
-    const omega = dt > 0.001 ? stepH / dt : 0;
     const maxBank = entry.kind === 'tanker'
       ? 0.22
       : (entry.isFlagship ? 0.26 : (entry.kind === 'fighter' ? 0.52 : (entry.model_class === 'frontier' ? 0.32 : 0.4)));
-    const targetRoll = airborne
-      ? Math.max(-maxBank, Math.min(maxBank, omega * 1.15))
-      : 0;
-    entry.roll += (targetRoll - entry.roll) * (1 - Math.exp(-5 * dt));
+    const turnRate = airborne && liveFeed ? entry.motion.turnRate : 0;
+    entry.roll = stepRoll(entry.roll, turnRate, maxBank, dt);
 
     const stunt = entry.localFlair ? entry.localFlair.updateStunt(entry, dt, airborne) : null;
     const totalRoll = entry.roll + (stunt ? stunt.roll : 0);
@@ -2492,7 +2475,7 @@ function animate() {
     const maxDescent = entry.kind === 'fighter' ? 0.44 : (entry.isFlagship ? 0.30 : (entry.model_class === 'frontier' ? 0.34 : 0.36));
     let targetPitch = 0;
     if (airborne) {
-      targetPitch = THREE.MathUtils.clamp((entry.flightPitch || 0) * 1.15, -maxClimb, maxDescent);
+      targetPitch = THREE.MathUtils.clamp(entry.motion.flightPitch * 1.15, -maxClimb, maxDescent);
       if (entry.state === 'landing' && entry.landingPitch !== null) {
         targetPitch = -entry.landingPitch;
       } else if (entry.state === 'landing' && alt < 6 && targetPitch > 0) {
@@ -2519,14 +2502,15 @@ function animate() {
 
     // Preserve wheel/deck clearance as the airframe rotates around its origin.
     // Remove this adjustment before the next interpolation step to avoid drift.
-    if (['landing', 'landed'].includes(entry.state)) {
+    const contact = groundContactWeight(entry.state, alt);
+    if (contact > 0) {
       const sx = Math.sin(entry.pitch), cx = Math.cos(entry.pitch);
       const sz = Math.sin(totalRoll), cz = Math.cos(totalRoll);
       let bottom = Infinity;
       for (const p of entry.contactPoints) {
         bottom = Math.min(bottom, cx * (sz * p.x + cz * p.y) - sx * p.z);
       }
-      entry.clearanceAdjustment = -bottom * entry.scale - entry.wheelDrop;
+      entry.clearanceAdjustment = contact * (-bottom * entry.scale - entry.wheelDrop);
       entry.group.position.y += entry.clearanceAdjustment;
     }
 
@@ -2687,7 +2671,6 @@ function animate() {
   }
 
   // Follow camera: track the selected aircraft while keeping OrbitControls active.
-  const camDt = Math.min(dt, 0.1);
   if (followId !== null) {
     const entry = meshes.get(followId);
     if (entry) {
@@ -2700,7 +2683,7 @@ function animate() {
       }
       followLastPos = pos.clone();
 
-      const camK = 1 - Math.exp(-5.5 * camDt);
+      const camK = 1 - Math.exp(-5.5 * dt);
       controls.target.lerp(pos, camK);
 
       if (followSwoop) {
@@ -2712,7 +2695,7 @@ function animate() {
       }
     }
   } else if (airportGlideTarget) {
-    const camK = 1 - Math.exp(-5.0 * camDt);
+    const camK = 1 - Math.exp(-5.0 * dt);
     camera.position.lerp(airportGlideTarget.cam, camK);
     controls.target.lerp(airportGlideTarget.target, camK);
     if (camera.position.distanceTo(airportGlideTarget.cam) < 2.0
@@ -2720,7 +2703,7 @@ function animate() {
       airportGlideTarget = null;
     }
   } else if (returnOverview) {
-    const camK = 1 - Math.exp(-4.5 * camDt);
+    const camK = 1 - Math.exp(-4.5 * dt);
     camera.position.lerp(OVERVIEW_CAM, camK);
     controls.target.lerp(OVERVIEW_TARGET, camK);
     if (camera.position.distanceTo(OVERVIEW_CAM) < 2.0 && controls.target.distanceTo(OVERVIEW_TARGET) < 1.0) {
