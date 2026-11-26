@@ -69,6 +69,13 @@ export function formatAge(ms, isHold = false) {
  */
 export function classifyAircraftUrgency(a) {
   if (!a || a.kind === 'tanker') return null;
+  if (a.scheduled_job) {
+    if (!a.scheduled_job.running && a.scheduled_job.last_run_status === 'failed') {
+      return { kind: 'failed', label: 'FAILED', severity: 'danger', isHold: false,
+        reason: 'Last scheduled run failed · open in T3' };
+    }
+    return null;
+  }
   if (a.state === 'refueling') return null;
 
   const reason = (a.hold_reason || '').trim();

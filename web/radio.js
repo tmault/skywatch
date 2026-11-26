@@ -3,6 +3,7 @@
 import { isFlagshipAgent } from './flagship.js';
 import { liveryFor } from './livery.js';
 import { formatTankerWait } from './tanker.js';
+import { isReaper, reaperDetails, reaperStateText } from './reaper.js';
 
 const panel = document.getElementById('radio-panel');
 const callsignEl = document.getElementById('radio-callsign');
@@ -29,10 +30,13 @@ let selectedId = null;
 let onSend = null;
 let onApprove = null;
 let onClose = null;
+let onReject = null;
+let currentRequest = null;
 
-export function setupRadio({ send, approve, close }) {
+export function setupRadio({ send, approve, reject, close }) {
   onSend = send;
   onApprove = approve;
+  onReject = reject;
   onClose = close || null;
 }
 
@@ -83,11 +87,13 @@ export function updateRadio(aircraft) {
 }
 
 function render(a) {
+  currentRequest = a.approval_request_id || null;
   callsignEl.textContent = a.title || a.callsign;
   callsignEl.title = a.title ? a.callsign : '';
 
   let airframe;
-  if (a.kind === 'tanker') airframe = 'AERIAL TANKER';
+  if (isReaper(a)) airframe = 'REAPER · SCHEDULED JOB';
+  else if (a.kind === 'tanker') airframe = 'AERIAL TANKER';
   else if (a.kind === 'fighter') airframe = 'FIGHTER · SUB-AGENT';
   else if (a.kind === 'drone') airframe = 'REAPER DRONE';
   else if (isFlagshipAgent(a)) airframe = 'AGENT · FLAGSHIP 747';
@@ -109,7 +115,8 @@ function render(a) {
   kindEl.textContent = parts.join(' · ');
 
   let state = a.state;
-  if (a.kind === 'tanker') state = 'refuelling track';
+  if (isReaper(a)) state = reaperStateText(a);
+  else if (a.kind === 'tanker') state = 'refuelling track';
   else if (a.state === 'refueling') {
     if (a.data_stale) state = 'rendezvous suspended';
     else if (!a.refuel_connected) state = 'en route to tanker';
@@ -121,7 +128,12 @@ function render(a) {
   stateEl.textContent = state;
   stateEl.style.color = stateColor(a.state);
 
-  if (a.kind === 'tanker') {
+  if (isReaper(a)) {
+    const details = reaperDetails(a).join('\n');
+    if (holdReasonEl.textContent !== details) holdReasonEl.textContent = details;
+    holdReasonEl.hidden = false;
+    holdReasonEl.classList.toggle('reaper-failed', a.scheduled_job.last_run_status === 'failed');
+  } else if (a.kind === 'tanker') {
     holdReasonEl.textContent = a.hold_reason
       ? `AERIAL REFUEL: ${a.hold_reason} — orbiting above airspace zones`
       : 'AERIAL REFUEL: orbiting above airspace zones';
@@ -148,8 +160,12 @@ function render(a) {
     holdReasonEl.hidden = true;
   }
 
-  if (inputRowEl) inputRowEl.hidden = a.kind === 'tanker';
-  actionsEl.hidden = a.state !== 'holding';
+  if (!isReaper(a)) holdReasonEl.classList.remove('reaper-failed');
+  holdReasonEl.classList.toggle('reaper-details', isReaper(a));
+  // Scheduled jobs are read-only: no messages, approvals, run-now or toggles.
+  if (inputRowEl) inputRowEl.hidden = a.kind === 'tanker' || isReaper(a) || a.data_stale;
+  actionsEl.hidden = (a.driver === 'opencode' ? !currentRequest : a.state !== 'holding') || isReaper(a) || a.data_stale;
+  rejectBtn.hidden = a.driver !== 'opencode';
   renderConversation(a);
   renderLog();
 }
@@ -173,10 +189,14 @@ function renderConversation(aircraft) {
   threadReference.hidden = !reference;
 
   let note;
-  if (!reference) note = 'No separate chat is available for this aircraft.';
+  if (isReaper(aircraft)) {
+    note = reference
+      ? 'Read-only view of a scheduled job. Open its conversation in the backend to manage it.'
+      : 'Read-only view of a scheduled job. It has no thread yet; manage it in the backend.';
+  } else if (!reference) note = 'No separate chat is available for this aircraft.';
   else if (aircraft.data_stale) note = 'Owning device is offline. Keep the thread reference to open it later.';
-  else if (!links) note = 'This chat cannot be opened from Skywatch. Use the thread reference in T3.';
-  else note = 'Web requires access to the owning device. The local harness requires the T3 Code desktop handler on this device.';
+  else if (!links) note = 'This chat cannot be opened from Skywatch. Use the session reference in the backend.';
+  else note = 'Web requires access to the owning device. Desktop links require the matching backend application.';
   if (conversationNote.textContent !== note) conversationNote.textContent = note;
 }
 
@@ -204,7 +224,7 @@ function renderLog() {
 
 function submit() {
   const text = textEl.value.trim();
-  if (!text || selectedId === null || !onSend) return;
+  if (!text || selectedId === null || !onSend || inputRowEl?.hidden) return;
   onSend(selectedId, text);
   appendHistory(selectedId, 'You', text);
   textEl.value = '';
@@ -221,12 +241,12 @@ textEl.addEventListener('keydown', (ev) => {
 
 approveBtn.addEventListener('click', () => {
   if (selectedId === null || !onApprove) return;
-  appendHistory(selectedId, 'You', 'cleared to continue — approved.');
-  onApprove(selectedId);
+  appendHistory(selectedId, 'You', 'approval requested.');
+  onApprove(selectedId, currentRequest);
 });
 
 rejectBtn.addEventListener('click', () => {
-  closeRadio('request rejected locally.');
+  if (selectedId !== null && onReject && currentRequest) onReject(selectedId, currentRequest);
 });
 
 closeBtn.addEventListener('click', () => closeRadio());

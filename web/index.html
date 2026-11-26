@@ -7,12 +7,24 @@
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
+  <dialog id="theme-picker" aria-labelledby="theme-heading" aria-describedby="theme-description">
+    <form method="dialog">
+      <h2 id="theme-heading">Environment</h2>
+      <p id="theme-description">Choose your scenery. Saved in this browser.</p>
+      <fieldset><legend>Theme</legend>
+        <label><input type="radio" name="theme" value="alpine"> Alpine <span>Swiss lakes &amp; mountain meadows</span></label>
+        <label><input type="radio" name="theme" value="tropical"> Tropical <span>Palms, sand &amp; turquoise water</span></label>
+        <label><input type="radio" name="theme" value="winter"> Swiss winter <span>Snowy fields, firs &amp; chalets</span></label>
+      </fieldset>
+      <button class="theme-done" type="submit">Done</button>
+    </form>
+  </dialog>
   <div id="app">
     <canvas id="scene"></canvas>
 
     <div id="hud-layer">
       <header id="hud">
-        <h1>SKYWATCH</h1>
+        <h1><button id="theme-trigger" type="button" aria-haspopup="dialog" aria-controls="theme-picker" aria-label="Skywatch environment theme">SKYWATCH</button></h1>
         <span id="hud-status">connecting…</span>
         <button id="hud-follow" hidden title="Exit follow camera (Esc) · Arrows orbit · +/− zoom"></button>
         <div id="hud-right-meta">

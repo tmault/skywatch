@@ -227,6 +227,11 @@ function faceColor(field, x, z, h, normalY, out) {
     out.lerp(C.mown, field.padWeight(x, z) * 0.85);
     if (h > snowLine - 8) out.lerp(C.rock, smoothstep(snowLine - 8, snowLine, h) * 0.5);
   }
+  if (field.spec.theme === 'winter') out.copy(C.snow).lerp(C.rock, normalY < 0.6 ? 0.35 : 0.02);
+  if (field.spec.theme === 'tropical') {
+    out.setHex(h < 3 || field.padWeight(x, z) > 0.5 ? 0xe8d2a0 : 0x61974a);
+    if (normalY < 0.6) out.setHex(0x8c9780);
+  }
   // Subtle per-face shimmer so flat areas still read as facets.
   const jitter = 0.94 + fine * 0.1;
   out.r *= jitter;
@@ -425,6 +430,16 @@ function addFir(buf, x, y, z, size, rng, snowy) {
   }
 }
 
+function addPalm(buf, x, y, z, size, rng) {
+  const h = 9 * size;
+  buf.add(PRIM.trunk, place(x, y + h / 2, z, size * 1.5, h, size * 1.5, 0, 0, 0.08), C.trunk, 0.1, rng);
+  for (let i = 0; i < 7; i++) {
+    const a = i * Math.PI * 2 / 7;
+    buf.add(PRIM.blob, place(x + Math.sin(a) * 2.2 * size, y + h, z + Math.cos(a) * 2.2 * size,
+      0.65 * size, 0.3 * size, 3.7 * size, 0.18, a), C.leaf, 0.15, rng);
+  }
+}
+
 function addLeafTree(buf, x, y, z, size, rng) {
   const trunkH = 2.2 * size;
   buf.add(PRIM.trunk, place(x, y + trunkH / 2 - 0.3, z, size * 1.1, trunkH, size * 1.1), C.trunk, 0.1, rng);
@@ -438,7 +453,7 @@ function addRock(buf, x, y, z, size, rng) {
 
 // A small Swiss chalet: stone/plaster ground floor, timber upper storey,
 // deep overhanging gable roof and red shutters.
-function addChalet(buf, x, y, z, size, rot, rng) {
+function addChalet(buf, x, y, z, size, rot, rng, snowy = false) {
   const w = 5.5 * size;
   const l = 7 * size;
   const cos = Math.cos(rot);
@@ -446,7 +461,7 @@ function addChalet(buf, x, y, z, size, rot, rng) {
   const at = (lx, lz) => [x + lx * cos + lz * sin, z - lx * sin + lz * cos];
   buf.add(PRIM.box, place(x, y + 1.0 * size - 0.6, z, w, 2.0 * size + 1.2, l, 0, rot), C.plaster, 0.04, rng);
   buf.add(PRIM.box, place(x, y + 3.1 * size, z, w * 0.98, 2.2 * size, l * 0.98, 0, rot), C.wood, 0.08, rng);
-  buf.add(PRIM.roof, place(x, y + 4.2 * size, z, w * 1.45, 3.0 * size, l * 1.25, 0, rot), C.roof, 0.06, rng);
+  buf.add(PRIM.roof, place(x, y + 4.2 * size, z, w * 1.45, 3.0 * size, l * 1.25, 0, rot), snowy ? C.snow : C.roof, 0.06, rng);
   // Shutters on the long walls.
   for (const side of [-1, 1]) {
     for (const lz of [-l * 0.22, l * 0.22]) {
@@ -542,6 +557,7 @@ export function buildAlpineIsland(group, spec) {
   const cell = spec.cell ?? (spec.radius > 100 ? 3.2 : 2.6);
   const { terrain, shallows } = buildTerrainMesh(field, extent, cell);
   group.add(terrain, shallows);
+  shallows.visible = spec.theme !== 'winter';
 
   // ---- vegetation, rocks and chalets (one merged mesh) ----
   const rng = mulberry32(spec.seed * 0.137 + 0.5);
@@ -551,7 +567,7 @@ export function buildAlpineIsland(group, spec) {
   const occupied = [];
   const free = (x, z, r) => {
     for (const k of clear) if (Math.hypot(x - k.x, z - k.z) < k.r + r) return false;
-    for (const p of spec.pads) if (sdRect(x, z, p) < 9 + r) return false;
+    for (const p of [...spec.pads, ...(spec.sceneryClear ?? [])]) if (sdRect(x, z, p) < 9 + r) return false;
     for (const o of occupied) if (Math.hypot(x - o[0], z - o[1]) < o[2] + r) return false;
     return true;
   };
@@ -579,7 +595,7 @@ export function buildAlpineIsland(group, spec) {
       field.height(x - 3, z - 3), field.height(x + 3, z - 3),
       field.height(x - 3, z + 3), field.height(x + 3, z + 3),
     );
-    addChalet(buf, x, ground, z, size, rng() * Math.PI, rng);
+    addChalet(buf, x, ground, z, size, rng() * Math.PI, rng, spec.theme === 'winter');
     occupied.push([x, z, 7]);
     chalets++;
   }
@@ -595,7 +611,8 @@ export function buildAlpineIsland(group, spec) {
     if (rng() > smoothstep(0.38, 0.62, mask) + 0.06) continue;
     if (!free(x, z, 1.6)) continue;
     const size = 0.75 + rng() * 0.6 - smoothstep(snowLine - 14, snowLine, h) * 0.3;
-    if (rng() < 0.82) addFir(buf, x, h, z, size, rng, h > snowLine - 7);
+    if (spec.theme === 'tropical') addPalm(buf, x, h, z, size, rng);
+    else if (spec.theme === 'winter' || rng() < 0.82) addFir(buf, x, h, z, size, rng, spec.theme === 'winter' || h > snowLine - 7);
     else addLeafTree(buf, x, h, z, size * 0.9, rng);
     occupied.push([x, z, 1.4 * size]);
     trees++;
@@ -628,7 +645,7 @@ export function buildAlpineIsland(group, spec) {
  * A ring of snow-capped Alps surrounding the lake, from `inner` (shoreline)
  * out to `outer`. One flat-shaded mesh; fog softens the far ranges.
  */
-export function buildAlpineBackdrop(scene, inner = 600, outer = 1500) {
+export function buildAlpineBackdrop(scene, inner = 600, outer = 1500, theme = 'alpine') {
   const seed = 4.2;
   const radial = 34;
   const around = 220;
@@ -656,7 +673,7 @@ export function buildAlpineBackdrop(scene, inner = 600, outer = 1500) {
       const z = Math.sin(a) * rr;
       vx.push(x);
       vz.push(z);
-      vy.push(heightAt(x, z, rr));
+      vy.push(heightAt(x, z, rr) * (theme === 'tropical' ? 0.32 : 1));
     }
   }
 
@@ -692,6 +709,8 @@ export function buildAlpineBackdrop(scene, inner = 600, outer = 1500) {
     else if (my > snowLine - 60) color.copy(scree).lerp(alp, 0.3);
     else if (my > 45) color.copy(alp).lerp(forest, smoothstep(0.4, 0.7, n));
     else color.copy(forest).lerp(alp, n * 0.5);
+    if (theme === 'winter') color.copy(C.snow).lerp(scree, nrm.y < 0.6 ? 0.3 : 0.03);
+    if (theme === 'tropical') color.copy(forest).lerp(C.leaf, n);
     const f = 0.94 + hash2(Math.floor(a.x), Math.floor(a.z), 3) * 0.1;
     color.multiplyScalar(f);
     for (const v of [a, b, c]) {
@@ -806,4 +825,20 @@ export function enableShadows(root, { receive = true } = {}) {
     o.castShadow = !mats.some((m) => m.polygonOffset);
     o.receiveShadow = receive;
   });
+}
+
+/** Small farm clusters on the snow plain, outside all five airport envelopes. */
+export function buildWinterCountryside(group) {
+  const buf = new MergeBuffer();
+  const rng = mulberry32(91.7);
+  for (const [cx, cz] of [[-190, 0], [190, -140], [-170, 180], [170, 140]]) {
+    for (let i = 0; i < 3; i++) {
+      const x = cx + (i - 1) * 18, z = cz + (rng() - 0.5) * 22;
+      addChalet(buf, x, 0, z, 0.8 + rng() * 0.2, rng() * 0.4, rng, true);
+      for (let j = 0; j < 5; j++) addFir(buf, x + (rng() - 0.5) * 16, 0, z + 14 + rng() * 12, 0.7 + rng() * 0.3, rng, true);
+    }
+  }
+  const mesh = buf.build();
+  mesh.castShadow = mesh.receiveShadow = true;
+  group.add(mesh);
 }

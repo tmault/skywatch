@@ -9,8 +9,8 @@ import {
   appendHistory, stateColor,
 } from './radio.js';
 import {
-  buildAlpineIsland, buildAlpineBackdrop, makeSwissFlag, updateAlpine, SWISS_RED,
-  makeLakeMaterial, enableShadows,
+  makeSwissFlag, updateAlpine, SWISS_RED,
+  enableShadows,
 } from './alpine.js';
 import { addRunwayLights } from './runway-lights.js';
 import { addLandingLights, createRunwayEvents } from './runway-events.js';
@@ -18,12 +18,20 @@ import {
   makeAgentMesh, makeJetMesh, makeJumboMesh, makeFighterMesh, makeDroneMesh, makeTankerMesh,
 } from './aircraft.js';
 import { isFlagshipAgent } from './flagship.js';
+import { gearTarget, advanceGear, easeGear } from './landing-gear.js';
 import { liveryFor } from './livery.js';
 import { createLocalFlair } from './local-flair.js';
 import { createAlertManager, classifyAircraftUrgency, isPassiveHold } from './alerts.js';
+import { isReaper, reaperLabelStatus } from './reaper.js';
+import { productionRoute, routeRibbon, dedupePolylines } from './ground-route.js';
+import { createThemeState } from './theme-state.js';
+import { createEnvironment } from './environment.js';
+import { setupThemePicker } from './theme-picker.js';
+import {
+  SNAPSHOT_STALE_AFTER, clampFrameDt, createMotionTracker, trackSnapshot, stepRoll,
+  followPose, groundContactWeight, shouldReleaseFollow,
+} from './motion.js';
 
-const WORLD_SIZE = 820;
-const INTERP_RATE = 10; // exponential smoothing constant (per second)
 const TARMAC_TOP_Y = 3.2; // elevated runway/apron deck height (well above sand y=2.0)
 
 /* ---------------------------------------------------------------- scene */
@@ -73,7 +81,8 @@ controls.minDistance = 18;
 controls.maxDistance = 900;
 
 // Alpine daylight: cool sky fill, meadow-green bounce, warm low sun.
-scene.add(new THREE.HemisphereLight(0xcfe6ff, 0x3f5a34, 0.78));
+const hemisphere = new THREE.HemisphereLight(0xcfe6ff, 0x3f5a34, 0.78);
+scene.add(hemisphere);
 scene.add(new THREE.AmbientLight(0x8094a8, 0.2));
 // Mid-afternoon sun (~37° up) so peaks, trees and terminals throw long,
 // readable shadows; aircraft shadows on the lake show their altitude.
@@ -99,26 +108,21 @@ const rim = new THREE.DirectionalLight(0x9cc8f0, 0.4);
 rim.position.set(-260, 180, -240);
 scene.add(rim);
 
-// Alpine lake, a faint Swiss-style layout grid, and the mountains around it.
-{
-  const lake = new THREE.Mesh(
-    new THREE.CircleGeometry(1300, 96),
-    makeLakeMaterial(),
-  );
-  lake.receiveShadow = true;
-  lake.rotation.x = -Math.PI / 2;
-  lake.position.y = 0;
-  scene.add(lake);
-
-  const grid = new THREE.GridHelper(WORLD_SIZE, 35, 0xffffff, 0xffffff);
-  grid.material.transparent = true;
-  grid.material.opacity = 0.1;
-  grid.material.depthWrite = false;
-  grid.position.y = 0.35;
-  scene.add(grid);
-
-  buildAlpineBackdrop(scene, 620, 1500);
-}
+// Public boot configuration contains only the validated theme name. Older
+// servers without this endpoint continue with Alpine and a local override.
+let bootConfig = {};
+try {
+  const response = await fetch('/config.json');
+  if (response.ok) bootConfig = await response.json();
+} catch { /* legacy/offline server */ }
+let themeStorage;
+try { themeStorage = window.localStorage; } catch { /* disabled storage */ }
+const themeState = createThemeState(bootConfig.theme, themeStorage);
+const environment = createEnvironment({ scene, sun, hemisphere, state: themeState });
+const disposeThemePicker = setupThemePicker(themeState);
+window.addEventListener('pagehide', event => {
+  if (!event.persisted) { disposeThemePicker(); environment.dispose(); }
+});
 
 /* ----------------------------------------------------- runway events */
 
@@ -140,16 +144,160 @@ function makeDeckSlab(w, l, topY, thickness, mat) {
   return mesh;
 }
 
+// Soft-edge mipmapped textures keep thin runway and taxiway lines crisp and
+// shimmer-free at shallow grazing angles instead of stair-stepping on raw edges.
+const smoothLineTextures = { rect: null, ribbon: null };
+function getSmoothLineTexture(ribbon) {
+  if (typeof document === 'undefined') return null;
+  const key = ribbon ? 'ribbon' : 'rect';
+  if (smoothLineTextures[key]) return smoothLineTextures[key];
+  const size = 64;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = ribbon ? 4 : size;
+  const ctx = canvas.getContext('2d');
+  const img = ctx.createImageData(canvas.width, canvas.height);
+  const smoothstep = (e0, e1, x) => {
+    const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0)));
+    return t * t * (3 - 2 * t);
+  };
+  for (let y = 0; y < canvas.height; y++) {
+    const v = (y + 0.5) / canvas.height;
+    const ay = ribbon ? 1 : smoothstep(0, 0.09, Math.min(v, 1 - v));
+    for (let x = 0; x < canvas.width; x++) {
+      const u = (x + 0.5) / canvas.width;
+      const ax = smoothstep(0, 0.12, Math.min(u, 1 - u));
+      const idx = (y * canvas.width + x) * 4;
+      img.data[idx] = 255;
+      img.data[idx + 1] = 255;
+      img.data[idx + 2] = 255;
+      img.data[idx + 3] = Math.round(255 * ax * ay);
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = ribbon ? THREE.RepeatWrapping : THREE.ClampToEdgeWrapping;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.anisotropy = Math.min(16, renderer?.capabilities?.getMaxAnisotropy?.() || 1);
+  tex.needsUpdate = true;
+  smoothLineTextures[key] = tex;
+  return tex;
+}
+
+function makeSmoothPaintMaterial(color, { ribbon = false, offset = -3 } = {}) {
+  const map = getSmoothLineTexture(ribbon);
+  return new THREE.MeshLambertMaterial({
+    color,
+    ...(map ? { map, transparent: true, depthWrite: false } : {}),
+    polygonOffset: true,
+    polygonOffsetFactor: offset,
+    polygonOffsetUnits: offset,
+  });
+}
+
 // Crisp painted tarmac marking hovering slightly above the deck with polygon offset.
 function makeMarking(w, l, x, z, y, mat) {
   const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, l), mat);
   mesh.rotation.x = -Math.PI / 2;
   mesh.position.set(x, y, z);
+  mesh.renderOrder = 2;
   return mesh;
 }
 
 const airportGroups = new Map();
+window.addEventListener('skywatch-theme-change', () => {
+  for (const entry of airportGroups.values()) {
+    if (entry.glassMat && !entry.online) applySatelliteOnlineState(entry, false);
+  }
+});
 const radars = [];
+
+// Emit deduplicated pavement and centerline ribbons for all routes on an
+// airport so shared trunks render once with zero coplanar Z-fighting.
+function addRoundedGroundRoutes(island, specs, pavement, paint) {
+  const polylines = specs.map(([vertices, width = 12, endHeading, startHeading]) => {
+    const start = vertices[0], end = vertices.at(-1);
+    const runwayExit = (start[0] === 56 && start[1] === -66) || (start[0] === 4 && start[1] === -30.5);
+    const runwayEntry = (end[0] === 56 && end[1] === 46) || (end[0] === 4 && end[1] === 30);
+    return {
+      width,
+      points: productionRoute(vertices, {
+        startHeading: startHeading ?? (runwayExit ? -Math.PI / 2 : undefined),
+        endHeading: endHeading ?? (runwayEntry ? -Math.PI / 2 : undefined),
+      }),
+    };
+  });
+  const pavementMat = pavement.clone();
+  pavementMat.polygonOffset = true;
+  pavementMat.polygonOffsetFactor = -1;
+  pavementMat.polygonOffsetUnits = -1;
+  // Group deduplication by pavement width (typically all 12u).
+  const byWidth = new Map();
+  for (const r of polylines) {
+    if (!byWidth.has(r.width)) byWidth.set(r.width, []);
+    byWidth.get(r.width).push(r.points);
+  }
+  for (const [width, group] of byWidth.entries()) {
+    for (const run of dedupePolylines(group)) {
+      const slab = routeRibbon(THREE, run, width, TARMAC_TOP_Y + 0.015, pavementMat);
+      slab.renderOrder = 1;
+      island.add(slab);
+    }
+  }
+  for (const run of dedupePolylines(polylines.map((r) => r.points))) {
+    const line = routeRibbon(THREE, run, 0.7, TARMAC_TOP_Y + 0.09, paint);
+    line.renderOrder = 3;
+    island.add(line);
+  }
+}
+
+function buildReaperRamp(island, { pad, slots, hold, hangars }) {
+  const rampMat = new THREE.MeshStandardMaterial({ color: 0x353b44, roughness: 0.88 });
+  const hangarMat = new THREE.MeshStandardMaterial({ color: 0x59636e, roughness: 0.7, metalness: 0.25 });
+  const roofMat = new THREE.MeshStandardMaterial({ color: 0x3d4650, roughness: 0.6, metalness: 0.35 });
+  const doorMat = new THREE.MeshStandardMaterial({ color: 0x1f262d, roughness: 0.8 });
+  const yellow = makeSmoothPaintMaterial(0xffc857);
+  const violet = makeSmoothPaintMaterial(0xa996ff);
+  const red = makeSmoothPaintMaterial(0xd93829);
+  const markY = TARMAC_TOP_Y + 0.08;
+
+  for (const [x, z, w, l] of pad) {
+    const slab = makeDeckSlab(w, l, TARMAC_TOP_Y - 0.03, 0.35, rampMat);
+    slab.position.set(x, slab.position.y, z);
+    island.add(slab);
+  }
+  // Stand boxes: a violet "R" stand outline per slot (curved yellow lead-in
+  // lines are painted by the deduplicated ground-route ribbons).
+  for (const [x, z, heading] of slots) {
+    const dir = Math.cos(heading) >= 0 ? 1 : -1; // nose toward the lane
+    island.add(makeMarking(0.6, 18, x - dir * 7, z, markY, violet));
+    island.add(makeMarking(14, 0.6, x, z - 9, markY, violet));
+    island.add(makeMarking(14, 0.6, x, z + 9, markY, violet));
+  }
+  if (hold) {
+    const [hx, hz, horizontal] = hold;
+    island.add(makeMarking(horizontal ? 12 : 0.55, horizontal ? 0.55 : 12, hx, hz, markY, yellow));
+    island.add(makeMarking(horizontal ? 12 : 0.55, horizontal ? 0.55 : 12, hx + (horizontal ? 0 : 1.1), hz + (horizontal ? 1.1 : 0), markY, red));
+  }
+  for (const [x, z, w, d, rot] of hangars) {
+    const h = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(w, 4.2, d), hangarMat);
+    body.position.y = 2.1;
+    h.add(body);
+    const roof = new THREE.Mesh(new THREE.BoxGeometry(w + 1.2, 0.7, d + 1.2), roofMat);
+    roof.position.y = 4.4;
+    h.add(roof);
+    const door = new THREE.Mesh(new THREE.BoxGeometry(w * 0.7, 3.4, 0.2), doorMat);
+    door.position.set(0, 1.7, d / 2 + 0.05);
+    h.add(door);
+    h.position.set(x, TARMAC_TOP_Y - 0.03, z);
+    h.rotation.y = rot;
+    island.add(h);
+  }
+}
 
 function buildHomeAirport(ap) {
   const island = new THREE.Group();
@@ -161,23 +309,19 @@ function buildHomeAirport(ap) {
   const pierWallMat = new THREE.MeshStandardMaterial({ color: 0x626b75, roughness: 0.85 });
   const terminalMat = new THREE.MeshStandardMaterial({ color: 0x4c6070, roughness: 0.6, metalness: 0.2 });
   const glassMat = new THREE.MeshStandardMaterial({ color: 0x7fd4f0, roughness: 0.2, metalness: 0.45 });
-  const lineMat = new THREE.MeshLambertMaterial({
-    color: 0xe6eae0, polygonOffset: true, polygonOffsetFactor: -2,
-  });
-  const yellowLineMat = new THREE.MeshLambertMaterial({
-    color: 0xffc857, polygonOffset: true, polygonOffsetFactor: -2,
-  });
-  const redBoxMat = new THREE.MeshLambertMaterial({
-    color: 0xd93829, polygonOffset: true, polygonOffsetFactor: -2,
-  });
+  const lineMat = makeSmoothPaintMaterial(0xe6eae0, { offset: -2 });
+  const yellowLineMat = makeSmoothPaintMaterial(0xffc857, { offset: -2 });
+  const yellowRibbonMat = makeSmoothPaintMaterial(0xffc857, { ribbon: true, offset: -3 });
+  const redBoxMat = makeSmoothPaintMaterial(0xd93829, { offset: -2 });
 
   // Alpine island: pebble shore, meadows and fir forest, the Tower on a
   // flat-topped summit (west), snowy peaks behind it, and flattened airfield
   // pads under Runway 36, parallel Taxiway Alpha, holding bay, and gate pier.
   const towerSpot = { x: -46, z: -4 };
   const flagSpot = { x: -34, z: 7 };
-  const terrain = buildAlpineIsland(island, {
+  const terrain = environment.island(island, {
     seed: 1.3,
+    sceneryClear: [{ x: 56, z: 0, hw: 18, hl: 300 }],
     center: [14, -4],
     radius: 138,
     hilliness: 4.5,
@@ -185,6 +329,7 @@ function buildHomeAirport(ap) {
     pads: [
       { x: 70, z: -8, hw: 30, hl: 75 },  // Runway 36 + grass median + Taxiway Alpha
       { x: 123, z: 0, hw: 26, hl: 102 }, // Extended 10-gate concourse pier
+      { x: 84, z: -116, hw: 26, hl: 34 }, // Reaper ramp north of the return loop
     ],
     peaks: [
       { ...towerSpot, h: 15, r: 44, flat: 7, crag: 0.25 },
@@ -271,18 +416,19 @@ function buildHomeAirport(ap) {
     }
   }
 
-  // Dedicated Parallel Taxiway Alpha: 14 wide x 134 long at [84, -8].
-  const taxiway = makeDeckSlab(14, 134, TARMAC_TOP_Y, 0.4, taxiMat);
+  // Dedicated Parallel Taxiway Alpha: 16 wide x 134 long at [84, -8] so jumbo
+  // nose gear stays inside both edges when turning into Alpha queue slots.
+  const taxiway = makeDeckSlab(16, 134, TARMAC_TOP_Y, 0.4, taxiMat);
   taxiway.position.x = 84;
   taxiway.position.z = -8;
   island.add(taxiway);
 
-  // Taxiway Alpha continuous yellow centerline + blue taxiway edge lights.
-  island.add(makeMarking(0.85, 126, 84, -10, markY, yellowLineMat));
+  // Taxiway Alpha blue edge lights (yellow centerline is painted cleanly by
+  // the deduplicated rounded ground routes below).
   const blueLightMat = new THREE.MeshBasicMaterial({ color: 0x38a6ff });
   const amberLightMat = new THREE.MeshBasicMaterial({ color: 0xffb830 });
   for (let tz = -68; tz <= 52; tz += 15) {
-    for (const side of [-7.3, 7.3]) {
+    for (const side of [-8.3, 8.3]) {
       const bL = new THREE.Mesh(new THREE.SphereGeometry(0.32, 6, 6), blueLightMat);
       bL.position.set(84 + side, markY + 0.3, tz);
       island.add(bL);
@@ -295,8 +441,9 @@ function buildHomeAirport(ap) {
     const conn = makeDeckSlab(16, 12, TARMAC_TOP_Y, 0.4, taxiMat);
     conn.position.set(71.5, conn.position.y, cz);
     island.add(conn);
-    island.add(makeMarking(20, 0.8, 72, cz, markY, yellowLineMat));
   }
+  // Midfield connector line (north z=-66 uses the smooth curved exit ribbon).
+  island.add(makeMarking(20, 0.7, 72, -10, markY, yellowLineMat));
 
   // Arrival return loop passes north of Alpha's six holding slots.
   // Matches the server route: (56,-66) -> (70,-66) -> (70,-88)
@@ -306,15 +453,11 @@ function buildHomeAirport(ap) {
     loop.position.set(x, loop.position.y, z);
     island.add(loop);
   }
-  island.add(makeMarking(14, 0.8, 63, -66, markY, yellowLineMat));
-  island.add(makeMarking(0.8, 22, 70, -77, markY, yellowLineMat));
-  island.add(makeMarking(33, 0.8, 86.5, -88, markY, yellowLineMat));
 
   // Wide South Departure Holding Bay at [74, 46] with hold-short bars & guard lights.
   const holdBay = makeDeckSlab(24, 22, TARMAC_TOP_Y, 0.4, taxiMat);
   holdBay.position.set(74, holdBay.position.y, 46);
   island.add(holdBay);
-  island.add(makeMarking(24, 0.85, 72, 46, markY, yellowLineMat));
   island.add(makeMarking(0.65, 18, 68.2, 46, markY, yellowLineMat));
   island.add(makeMarking(0.65, 18, 69.3, 46, markY, yellowLineMat));
   island.add(makeMarking(3.6, 5.0, 72.5, 53.5, markY, redBoxMat));
@@ -338,9 +481,9 @@ function buildHomeAirport(ap) {
     const bridgePad = makeDeckSlab(16, 12, TARMAC_TOP_Y - 0.02, 0.4, taxiMat);
     bridgePad.position.set(95, bridgePad.position.y, cz);
     island.add(bridgePad);
-    island.add(makeMarking(18, 0.75, 93, cz, markY, yellowLineMat));
   }
-  island.add(makeMarking(0.75, 178, 103, 0, markY, yellowLineMat));
+  // Midfield apron bridge line (north z=-66 & south z=46 use curved route ribbons).
+  island.add(makeMarking(19, 0.7, 93.5, -10, markY, yellowLineMat));
 
   // Extended Terminal Concourse + central glass atrium along x = 139.
   const terminal = new THREE.Mesh(new THREE.BoxGeometry(10, 6.4, 186), terminalMat);
@@ -353,17 +496,54 @@ function buildHomeAirport(ap) {
   terminalGlass.position.set(133.8, TARMAC_TOP_Y + 3.8, 0);
   island.add(terminalGlass);
 
-  // Gate stand markings + jetbridges for all 10 gates.
+  // Gate stand stop bars + jetbridges for all 10 gates (lead-in lines come from
+  // the curved route ribbons so there are no width steps or double-painted bars).
   const bridgeMat = new THREE.MeshStandardMaterial({ color: 0x9aa9b5, roughness: 0.5, metalness: 0.3 });
   for (const [gx, gz] of ap.gates) {
-    island.add(makeMarking(16, 0.75, gx, gz, markY, yellowLineMat));
-    island.add(makeMarking(0.75, 8, gx + 5.5, gz, markY, yellowLineMat));
+    island.add(makeMarking(5.5, 0.7, gx + 2.75, gz, markY, yellowLineMat));
+    island.add(makeMarking(0.7, 8, gx + 5.5, gz, markY, yellowLineMat));
 
     const bridge = new THREE.Mesh(new THREE.BoxGeometry(9.0, 1.5, 1.8), bridgeMat);
     bridge.position.set(gx + 10.5, TARMAC_TOP_Y + 2.8, gz - 3.2);
     island.add(bridge);
   }
 
+  // Reaper ramp (scheduled jobs): spine x=84 off the return loop at z=-88,
+  // four stands (server RAMP_SLOTS_HOME), well clear of gates and Alpha.
+  buildReaperRamp(island, {
+    pad: [[84, -114, 50, 38], [84, -91, 14, 8], [84, -142, 44, 12]],
+    slots: [[68, -104, 0], [100, -104, Math.PI], [68, -126, 0], [100, -126, Math.PI]],
+    hold: [84, -95, true],
+    hangars: [[73, -142, 16, 10, 0], [95, -142, 16, 10, 0]],
+  });
+  // Due jobs hold short at the south apron connector (server HOME_HOLD).
+  const reaperHoldMat = makeSmoothPaintMaterial(0xa996ff, { offset: -2 });
+  island.add(makeMarking(0.55, 11, 89.2, 46, markY, reaperHoldMat));
+  island.add(makeMarking(0.55, 11, 88.2, 46, markY, reaperHoldMat));
+
+  // Full arrival loop and departure branches use deduplicated G2-smooth fillets.
+  const homeRoutes = [];
+  for (const [gx, gz] of ap.gates) {
+    homeRoutes.push([[56, -66], [70, -66], [70, -88], [103, -88], [103, gz], [gx, gz]]);
+    homeRoutes.push([[[gx, gz], [103, gz], [103, 46], [84, 46], [56, 46]], 12, -Math.PI / 2, 0]);
+  }
+  for (const [x, z, heading] of [[78, 46, Math.PI], [84, 22, Math.PI / 2], [84, 0, Math.PI / 2], [84, -22, Math.PI / 2], [84, -44, Math.PI / 2], [84, -66, Math.PI / 2]]) {
+    homeRoutes.push([[[56, -66], [70, -66], [70, -88], [103, -88], [103, z], [x, z]], 12, heading]);
+  }
+  homeRoutes.push([[[84, -66], [84, 46], [56, 46]], 12, -Math.PI / 2, Math.PI / 2]);
+  // Full ramp routes retain the same endpoint blends as moving aircraft.
+  for (const [x, z, heading] of [[68, -104, 0], [100, -104, Math.PI], [68, -126, 0], [100, -126, Math.PI]]) {
+    homeRoutes.push([[[56, -66], [70, -66], [70, -88], [84, -88], [84, z], [x, z]], 12, heading]);
+    homeRoutes.push([[[x, z], [84, z], [84, -88], [103, -88], [103, 46], [84, 46], [56, 46]], 12, -Math.PI / 2, heading]);
+    homeRoutes.push([[[x, z], [84, z], [84, -88], [103, -88], [103, 46], [96, 46]], 12, Math.PI, heading]);
+    homeRoutes.push([[[96, 46], [103, 46], [103, -88], [84, -88], [84, z], [x, z]], 12, heading, Math.PI]);
+  }
+  addRoundedGroundRoutes(
+    island,
+    homeRoutes.map((r) => (Array.isArray(r[0][0]) ? r : [r])),
+    taxiMat,
+    yellowRibbonMat,
+  );
   // Airport name banner above the tower.
   const label = makeBannerLabel(ap.name.toUpperCase(), 0xffffff, SWISS_RED, 10);
   label.position.set(towerSpot.x, 63, towerSpot.z);
@@ -393,24 +573,22 @@ function buildSatelliteAirport(ap, idx) {
   const apronMat = new THREE.MeshStandardMaterial({ color: 0x394049, roughness: 0.85 });
   const terminalMat = new THREE.MeshStandardMaterial({ color: 0x4c6070, roughness: 0.6, metalness: 0.2 });
   const glassMat = new THREE.MeshStandardMaterial({ color: 0x7fd4f0, roughness: 0.2, metalness: 0.45 });
-  const lineMat = new THREE.MeshLambertMaterial({
-    color: 0xe6eae0, polygonOffset: true, polygonOffsetFactor: -2,
-  });
-  const yellowLineMat = new THREE.MeshLambertMaterial({
-    color: 0xffc857, polygonOffset: true, polygonOffsetFactor: -2,
-  });
+  const lineMat = makeSmoothPaintMaterial(0xe6eae0, { offset: -2 });
+  const yellowLineMat = makeSmoothPaintMaterial(0xffc857, { offset: -2 });
+  const yellowRibbonMat = makeSmoothPaintMaterial(0xffc857, { ribbon: true, offset: -3 });
 
   // Alpine islet: the tower on a grassy knoll west of the runway, a small
   // rocky peak (snow-dusted) to one side, firs and a chalet or two.
   const knollZ = (idx % 2 === 0 ? 1 : -1) * 36;
   const flagSpot = { x: -26, z: -knollZ * 0.3 };
-  const terrain = buildAlpineIsland(island, {
+  const terrain = environment.island(island, {
     seed,
+    sceneryClear: [{ x: 4, z: 0, hw: 14, hl: 230 }],
     center: [2, 0],
     radius: 72,
     hilliness: 3,
     snowLine: 11,
-    pads: [{ x: 20, z: 0, hw: 30, hl: 41 }],
+    pads: [{ x: 20, z: 0, hw: 30, hl: 41 }, { x: 21, z: -57, hw: 21, hl: 18 }],
     peaks: [
       { x: -36, z: 0, h: 4.6, r: 20, flat: 5, crag: 0.15 },
       { x: -34, z: knollZ, h: 14, r: 24, crag: 0.5 },
@@ -479,9 +657,12 @@ function buildSatelliteAirport(ap, idx) {
     connector.position.set(10, connector.position.y, z);
     island.add(connector);
   }
-  island.add(makeMarking(12, 0.7, 10, 30, markY, yellowLineMat));
-  island.add(makeMarking(12, 0.7, 10, -30.5, markY, yellowLineMat));
-  island.add(makeMarking(0.7, 61.2, 16, -0.25, markY, yellowLineMat));
+
+  // Jumbo nose gear sweeps beyond the narrow runway edge during the
+  // heading blend. This is production pavement, checked against rotated tyres.
+  const turnPad = makeDeckSlab(28, 16, TARMAC_TOP_Y - 0.03, 0.35, apronMat);
+  turnPad.position.set(4, turnPad.position.y, 30);
+  island.add(turnPad);
 
   // Elevated apron + small terminal + 4 gates.
   // Apron and terminal sit far enough east that a nose-in jet (gate x = +24,
@@ -498,9 +679,32 @@ function buildSatelliteAirport(ap, idx) {
   island.add(tGlass);
 
   for (const [gx, gz] of ap.gates) {
-    island.add(makeMarking(10, 0.7, gx - cx + 2, gz - cz, markY, yellowLineMat));
+    island.add(makeMarking(4.8, 0.7, gx - cx + 2.4, gz - cz, markY, yellowLineMat));
+    island.add(makeMarking(0.7, 6.0, gx - cx + 4.8, gz - cz, markY, yellowLineMat));
   }
 
+  // Two-stand Reaper ramp north of the apron (server RAMP_SLOTS_SATELLITE),
+  // fed by the apron lane (x = 16) extended north.
+  buildReaperRamp(island, {
+    pad: [[26, -57, 28, 34], [16, -36.5, 8, 3], [5, -60, 14, 16]],
+    slots: [[30, -46, Math.PI], [30, -66, Math.PI]],
+    hold: null,
+    hangars: [[5, -60, 10, 12, Math.PI / 2]],
+  });
+
+  const satRoutes = [];
+  for (const [gx, gz] of ap.gates) {
+    const x = gx - cx, z = gz - cz;
+    satRoutes.push([[[4, -30.5], [16, -30.5], [16, z], [x, z]], 12]);
+    satRoutes.push([[[x, z], [16, z], [16, 30], [4, 30]], 12, -Math.PI / 2, 0]);
+  }
+  for (const z of [-46, -66]) {
+    satRoutes.push([[[4, -30.5], [16, -30.5], [16, z], [30, z]], 12, Math.PI]);
+    satRoutes.push([[[30, z], [16, z], [16, 30], [4, 30]], 12, -Math.PI / 2, Math.PI]);
+    satRoutes.push([[[30, z], [16, z], [16, 30]], 12, Math.PI, Math.PI]);
+    satRoutes.push([[[16, 30], [16, z], [30, z]], 12, Math.PI, Math.PI]);
+  }
+  addRoundedGroundRoutes(island, satRoutes, apronMat, yellowRibbonMat);
   // Device name banner (updated dynamically when online/offline changes).
   const label = makeBannerLabel(
     ap.online ? ap.name.toUpperCase() : `${ap.name.toUpperCase()} (OFF)`,
@@ -780,7 +984,8 @@ function buildAircraftLabelTexture(a, accentHex) {
   ctx.lineTo(4, r);
   ctx.quadraticCurveTo(4, 4, r, 4);
   ctx.closePath();
-  ctx.fillStyle = a.state === 'parked' ? 'rgba(10, 18, 26, 0.68)' : 'rgba(6, 16, 26, 0.82)';
+  const dim = a.state === 'parked';
+  ctx.fillStyle = dim ? 'rgba(10, 18, 26, 0.68)' : 'rgba(6, 16, 26, 0.82)';
   ctx.fill();
 
   const accent = '#' + new THREE.Color(accentHex).getHexString();
@@ -804,7 +1009,9 @@ function buildAircraftLabelTexture(a, accentHex) {
 
   // Secondary line: callsign + role/state.
   let stateLabel;
-  if (a.kind === 'tanker') {
+  if (isReaper(a)) {
+    stateLabel = reaperLabelStatus(a);
+  } else if (a.kind === 'tanker') {
     const match = (a.hold_reason || '').match(/(\d+)/);
     stateLabel = match ? `TANKER · ON HOLD (${match[1]})` : 'TANKER · ON HOLD';
   } else if (a.state === 'refueling') {
@@ -830,7 +1037,15 @@ function buildAircraftLabelTexture(a, accentHex) {
   return tex;
 }
 
+const REAPER_ACCENT = 0xa996ff; // lavender: scheduled jobs, never thread states
 function labelAccentFor(a) {
+  if (isReaper(a)) {
+    const job = a.scheduled_job;
+    if (job.phase === 'disabled') return 0x6b7380;
+    if (job.last_run_status === 'failed' && !job.running) return 0xff5d6c;
+    if (job.phase === 'parked') return 0x8f86bf;
+    return REAPER_ACCENT;
+  }
   if (a.kind === 'tanker') return 0xffb020;
   if (a.state === 'refueling') return 0xffb020;
   if (a.state === 'departing') return 0x4dff9e;
@@ -844,7 +1059,11 @@ function labelAccentFor(a) {
 }
 
 function updateAircraftLabel(entry, a) {
-  const extra = a.kind === 'tanker' ? (a.hold_reason || '') : `${a.refuel_connected}|${a.data_stale}`;
+  const extra = a.kind === 'tanker'
+    ? (a.hold_reason || '')
+    : isReaper(a)
+      ? `${reaperLabelStatus(a)}|${a.scheduled_job.last_run_status}|${a.data_stale}`
+      : `${a.refuel_connected}|${a.data_stale}`;
   const key = `${a.title || ''}|${a.state}|${a.topic || ''}|${a.callsign}|${extra}`;
   if (entry.labelKey === key) return;
   entry.labelKey = key;
@@ -1084,12 +1303,13 @@ function makeContrailsFor(a) {
     })];
   }
   if (isFlagshipAgent(a)) {
-    // Flagship 747 streams four crisp high-altitude contrails from its four engines!
+    // Flagship 747-400 streams four crisp high-altitude contrails from its
+    // four underwing turbofan exhausts (model space is in true metres).
     return [
-      [-9.3, -1.42, -3.65],
-      [-5.1, -1.98, -0.58],
-      [5.1, -1.98, -0.58],
-      [9.3, -1.42, -3.65],
+      [-21.2, -1.07, -7.0],
+      [-11.9, -2.47, 1.2],
+      [11.9, -2.47, 1.2],
+      [21.2, -1.07, -7.0],
     ].map((localOffset) => new ContrailRibbon({
       localOffset,
       maxPoints: 130,
@@ -1134,6 +1354,7 @@ const PIPE_RADIAL = 6;
 const PIPE_RADIUS = 0.42;
 const PIPE_PULSES = 4;
 const PIPE_MAX_DIST = 105;
+const DROGUE_LENGTH = 2.0;
 
 const _pipeP0 = new THREE.Vector3();
 const _pipeP1 = new THREE.Vector3();
@@ -1194,8 +1415,8 @@ class RefuelPipe {
     this.tubeMesh.frustumCulled = false;
     this.group.add(this.tubeMesh);
 
-    // Flared high-visibility drogue basket opening toward the receiver receptacle.
-    this.drogueGeo = new THREE.CylinderGeometry(1.38, 0.45, 2.4, 12, 1, true);
+    // Flared high-visibility drogue basket cupped coaxial with the receiver nose.
+    this.drogueGeo = new THREE.CylinderGeometry(1.05, 0.38, DROGUE_LENGTH, 16, 1, true);
     this.drogueMat = new THREE.MeshBasicMaterial({
       color: 0xffa824,
       side: THREE.DoubleSide,
@@ -1241,14 +1462,25 @@ class RefuelPipe {
     this.group.visible = true;
 
     // Tanker aft vector (-Z in model space) & receiver forward vector (+Z).
-    _pipeBack.set(0, 0, -1).transformDirection(tankerEntry.group.matrixWorld);
-    _pipeFwd.set(0, 0, 1).transformDirection(receiverEntry.group.matrixWorld);
+    _pipeBack.set(0, 0, -1).transformDirection(tankerEntry.group.matrixWorld).normalize();
+    _pipeFwd.set(0, 0, 1).transformDirection(receiverEntry.group.matrixWorld).normalize();
 
-    const sag = Math.min(8.0, dist * 0.14);
-    _pipeC1.copy(_pipeP0).addScaledVector(_pipeBack, dist * 0.34);
+    // Place flared drogue basket coaxial with the receiver nose: wide mouth (+Y)
+    // cupped over the nose tip (_pipeP1) and narrow collar (-Y) meeting the hose.
+    const collarOffset = DROGUE_LENGTH * 0.95;
+    this.drogue.position.copy(_pipeP1).addScaledVector(_pipeFwd, DROGUE_LENGTH * 0.45);
+    _pipeTan.copy(_pipeFwd).negate();
+    _pipeQuat.setFromUnitVectors(_pipeUp, _pipeTan);
+    this.drogue.quaternion.copy(_pipeQuat);
+
+    // End the hose at the drogue's narrow collar with a straight horizontal entry
+    // along _pipeFwd so the catenary never kinks upward into the cone.
+    _pipeP1.addScaledVector(_pipeFwd, collarOffset);
+    const hoseDist = _pipeP0.distanceTo(_pipeP1);
+    const sag = Math.min(7.5, hoseDist * 0.13);
+    _pipeC1.copy(_pipeP0).addScaledVector(_pipeBack, hoseDist * 0.36);
     _pipeC1.y -= sag;
-    _pipeC2.copy(_pipeP1).addScaledVector(_pipeFwd, dist * 0.28);
-    _pipeC2.y -= sag * 0.45;
+    _pipeC2.copy(_pipeP1).addScaledVector(_pipeFwd, hoseDist * 0.28);
 
     for (let i = 0; i <= PIPE_SEGS; i++) {
       cubicBezierPoint(this.pts[i], _pipeP0, _pipeC1, _pipeC2, _pipeP1, i / PIPE_SEGS);
@@ -1282,13 +1514,7 @@ class RefuelPipe {
     posAttr.needsUpdate = true;
     this.tubeGeo.computeVertexNormals();
 
-    // Place flared drogue basket just ahead of the receiver's receptacle.
-    _pipeTan.subVectors(this.pts[PIPE_SEGS], this.pts[PIPE_SEGS - 1]).normalize();
-    this.drogue.position.copy(_pipeP1).addScaledVector(_pipeTan, -1.1);
-    _pipeQuat.setFromUnitVectors(_pipeUp, _pipeTan);
-    this.drogue.quaternion.copy(_pipeQuat);
-
-    // Animate glowing token pulses flowing from tanker (t=0) to waiting plane (t=1).
+    // Animate glowing token pulses flowing from tanker (t=0) to drogue collar (t=1).
     for (let i = 0; i < this.pulses.length; i++) {
       const t = (now * 0.42 + i / this.pulses.length) % 1;
       cubicBezierPoint(this.pulses[i].position, _pipeP0, _pipeC1, _pipeC2, _pipeP1, t);
@@ -1409,14 +1635,14 @@ function ensureMesh(a) {
   built.target = built.group.position.clone();
   built.heading = a.heading;
   built.targetHeading = a.heading;
-  built.snapX = a.position[0];
-  built.snapZ = a.position[1];
+  built.lead = built.group.position.clone();
+  built.leadHeading = a.heading;
+  built.motion = createMotionTracker();
   built.altitude = a.position[2];
   built.speed = a.speed ?? 0;
   built.dustClock = 0;
   built.roll = 0;
   built.pitch = 0;
-  built.flightPitch = 0;
   built.group.rotation.y = Math.PI / 2 - a.heading;
   built.state = a.state;
   built.kind = a.kind;
@@ -1428,6 +1654,11 @@ function ensureMesh(a) {
   }
   built.prop = built.group.getObjectByName('prop');
   built.gear = built.group.getObjectByName('gear');
+  if (built.gear) {
+    // Spawn already in position so gear never cycles on initial load.
+    built.gearProgress = gearTarget(a.state, a.position[2]);
+    built.gear.userData.setProgress(built.gearProgress);
+  }
 
   enableShadows(built.group, { receive: false });
   scene.add(built.group);
@@ -1443,6 +1674,21 @@ function setColor(entry, a) {
   const hex = new THREE.Color(colorStr);
   for (const m of entry.tintMaterials) {
     m.color.copy(hex);
+  }
+}
+
+// Paused scheduled jobs park semi-transparent (materials are per aircraft).
+function setDimmed(entry, dimmed) {
+  if (entry.dimmed === dimmed) return;
+  entry.dimmed = dimmed;
+  for (const m of entry.disposeMaterials) {
+    if (m.userData.baseOpacity === undefined) {
+      m.userData.baseOpacity = m.opacity;
+      m.userData.baseTransparent = m.transparent;
+    }
+    m.transparent = dimmed || m.userData.baseTransparent;
+    m.opacity = dimmed ? 0.38 * m.userData.baseOpacity : m.userData.baseOpacity;
+    m.needsUpdate = true;
   }
 }
 
@@ -1572,6 +1818,7 @@ function startFollow(id) {
   const entry = meshes.get(id);
   const a = currentSnapshot.get(id);
   if (!entry || !a) return;
+  if (shouldReleaseFollow(a.state, a.position?.[2])) return;
   followId = id;
   followLastPos = entry.group.position.clone();
   followSwoop = true;
@@ -1631,6 +1878,7 @@ function releaseHeldKeys() {
 }
 
 window.addEventListener('keydown', (ev) => {
+  if (document.getElementById('theme-picker').open) return;
   if (ev.key === 'Escape' && followId !== null) {
     stopFollow(true);
     closeRadio();
@@ -1741,7 +1989,8 @@ function sendJson(obj) {
 
 setupRadio({
   send: (id, text) => sendJson({ type: 'message', aircraft_id: id, text }),
-  approve: (id) => sendJson({ type: 'approve', aircraft_id: id }),
+  approve: (id, request_id) => sendJson({ type: 'approve', aircraft_id: id, request_id }),
+  reject: (id, request_id) => sendJson({ type: 'reject', aircraft_id: id, request_id }),
   close: () => stopFollow(true),
 });
 
@@ -1763,12 +2012,19 @@ function connect() {
   ws.addEventListener('message', (ev) => {
     let frame;
     try { frame = JSON.parse(ev.data); } catch { return; }
+    if (frame.type === 'command_result') {
+      appendHistory(frame.aircraft_id, frame.ok ? 'backend' : 'error', frame.message);
+      return;
+    }
     if (frame.type !== 'snapshot' && frame.type !== 'delta') return;
     applySnapshot(frame.snapshot);
   });
 }
 
 function applySnapshot(snapshot) {
+  lastSnapshotAt = performance.now() / 1000;
+  // Simulated time keeps turn and climb rates steady however frames arrive.
+  const simTime = snapshot.sim_time ?? lastSnapshotAt;
   currentSnapshot.clear();
   for (const a of snapshot.aircraft || []) currentSnapshot.set(a.id, a);
   const aircraft = snapshot.aircraft || [];
@@ -1789,20 +2045,9 @@ function applySnapshot(snapshot) {
     entry.target.set(a.position[0], y, a.position[1]);
     entry.targetHeading = a.heading;
     detectRunwayEvent(a, entry, lastStates.get(a.id), entry.altitude);
-    const snapDx = a.position[0] - entry.snapX;
-    const snapDz = a.position[1] - entry.snapZ;
-    const snapDh = Math.hypot(snapDx, snapDz);
-    const snapDAlt = a.position[2] - entry.altitude;
     const onGround = ['parked', 'ready', 'taxi', 'landed'].includes(a.state)
       || ((a.state === 'takeoff' || a.state === 'departing') && a.position[2] <= 0);
-    if (onGround) {
-      entry.flightPitch = 0;
-    } else if (snapDh >= 0.05 && snapDh < 200 && Math.abs(snapDAlt) < 25) {
-      // Negative rotation.x pitches the +Z nose UP; positive pitches nose DOWN.
-      entry.flightPitch = -Math.atan2(snapDAlt, snapDh);
-    }
-    entry.snapX = a.position[0];
-    entry.snapZ = a.position[1];
+    trackSnapshot(entry.motion, a, simTime, onGround);
     entry.altitude = a.position[2];
     entry.speed = a.speed ?? 0;
     entry.landingPitch = a.landing_pitch ?? null;
@@ -1813,6 +2058,7 @@ function applySnapshot(snapshot) {
     }
     entry.state = a.state;
     setColor(entry, a);
+    setDimmed(entry, isReaper(a) && a.scheduled_job.phase === 'disabled');
     updateAircraftLabel(entry, a);
     entry.ring.visible = a.state === 'holding' || a.kind === 'tanker';
   }
@@ -1838,6 +2084,9 @@ function applySnapshot(snapshot) {
     : `${airportCount} airports · ${aircraft.length} aircraft`;
 
   if (snapshot.omitted_threads) countEl.textContent += ` · ${snapshot.omitted_threads} threads outside display capacity`;
+  if (snapshot.omitted_jobs) {
+    countEl.textContent += ` · ${snapshot.omitted_jobs} more scheduled job${snapshot.omitted_jobs === 1 ? '' : 's'}`;
+  }
 
   const selectedId = selectedAircraftId();
   if (selectedId !== null) {
@@ -1899,13 +2148,13 @@ function detectRunwayEvent(a, entry, from, prevAlt) {
 
   if (rolling && from !== a.state && from !== 'takeoff' && alt <= 0) {
     rwy.takeoffRoll(x, z);
-    showEventBanner(a, 'takeoff', a.state === 'departing' ? 'Final departure' : 'Departure');
+    showEventBanner(a, 'takeoff', a.state === 'departing' ? 'Final departure' : isReaper(a) ? 'Scheduled job · launch' : 'Departure');
   }
   if (rolling && prevAlt <= 0 && alt > 0) {
     rwy.liftoff(x, z, entry.group.position.y);
   }
   if (a.state === 'landing' && from !== 'landing') {
-    showEventBanner(a, 'landing', 'Arrival · on approach');
+    showEventBanner(a, 'landing', isReaper(a) ? 'Scheduled job · returning' : 'Arrival · on approach');
   }
   if (from === 'landing' && a.state === 'landed') {
     rwy.touchdown(x, z);
@@ -1913,12 +2162,32 @@ function detectRunwayEvent(a, entry, from, prevAlt) {
   }
 }
 
+const REAPER_EVENTS = {
+  taxi: 'taxiing — Reaper ramp',
+  ready: 'holding short — job due',
+  takeoff: 'job run started — rolling, Runway 36',
+  cruising: 'on station — job running',
+  landing: 'job run finished — on approach',
+  landed: 'touchdown — returning to ramp',
+  parked: 'parked on the Reaper ramp',
+};
+
 function handleStateChange(a, from, to) {
   const base = {
     aircraftId: a.id,
     callsign: a.callsign,
     title: a.title || '',
   };
+  if (isReaper(a)) {
+    // Scheduled jobs have their own vocabulary: never thread-state messages.
+    const reason = REAPER_EVENTS[to];
+    if (from !== undefined && reason) {
+      const kind = to === 'takeoff' ? 'takeoff' : (to === 'landing' || to === 'landed') ? 'landing' : 'routine';
+      alerts.addRoutineEvent({ ...base, eventKey: `reaper:${to}`, reason, kind });
+      if (selectedAircraftId() === a.id) appendHistory(a.id, '·', `${a.callsign} ${reason}`);
+    }
+    return;
+  }
   if (a.kind === 'tanker' && from === undefined) {
     alerts.addRoutineEvent({
       ...base,
@@ -2146,31 +2415,22 @@ canvas.addEventListener('pointerup', (ev) => {
 
 const currentSnapshot = new Map();
 const clock = new THREE.Clock();
+let lastSnapshotAt = 0;
 
 function animate() {
   requestAnimationFrame(animate);
-  const dt = clock.getDelta();
-  const k = 1 - Math.exp(-INTERP_RATE * dt);
+  const dt = clampFrameDt(clock.getDelta());
 
   const now = performance.now() / 1000;
+  const liveFeed = now - lastSnapshotAt < SNAPSHOT_STALE_AFTER;
   const reduceMotion = reducedMotionQuery.matches;
   for (const [id, entry] of meshes.entries()) {
     entry.group.position.y -= entry.clearanceAdjustment || 0;
     entry.clearanceAdjustment = 0;
-    const wrapped = entry.state !== 'departing' && entry.group.position.distanceToSquared(entry.target) > 40000;
-    if (wrapped) {
-      entry.group.position.copy(entry.target);
+    if (followPose(entry, dt)) {
       if (entry.contrails) for (const c of entry.contrails) c.clear();
       if (entry.localFlair) entry.localFlair.reset();
-    } else {
-      entry.group.position.lerp(entry.target, k);
     }
-
-    let dh = entry.targetHeading - entry.heading;
-    while (dh > Math.PI) dh -= 2 * Math.PI;
-    while (dh < -Math.PI) dh += 2 * Math.PI;
-    const stepH = dh * k;
-    entry.heading += stepH;
     entry.group.rotation.y = Math.PI / 2 - entry.heading;
 
     // Bank smoothly into turns when airborne; keep wings level on the ground.
@@ -2179,14 +2439,11 @@ function animate() {
     const departingAirborne = entry.state === 'departing' && alt > 0;
     const airborne = ['cruising', 'holding', 'refueling', 'landing'].includes(entry.state)
       || takeoffAirborne || departingAirborne;
-    const omega = dt > 0.001 ? stepH / dt : 0;
     const maxBank = entry.kind === 'tanker'
       ? 0.22
       : (entry.isFlagship ? 0.26 : (entry.kind === 'fighter' ? 0.52 : (entry.model_class === 'frontier' ? 0.32 : 0.4)));
-    const targetRoll = airborne
-      ? Math.max(-maxBank, Math.min(maxBank, omega * 1.15))
-      : 0;
-    entry.roll += (targetRoll - entry.roll) * (1 - Math.exp(-5 * dt));
+    const turnRate = airborne && liveFeed ? entry.motion.turnRate : 0;
+    entry.roll = stepRoll(entry.roll, turnRate, maxBank, dt);
 
     const stunt = entry.localFlair ? entry.localFlair.updateStunt(entry, dt, airborne) : null;
     const totalRoll = entry.roll + (stunt ? stunt.roll : 0);
@@ -2198,7 +2455,7 @@ function animate() {
     const maxDescent = entry.kind === 'fighter' ? 0.44 : (entry.isFlagship ? 0.30 : (entry.model_class === 'frontier' ? 0.34 : 0.36));
     let targetPitch = 0;
     if (airborne) {
-      targetPitch = THREE.MathUtils.clamp((entry.flightPitch || 0) * 1.15, -maxClimb, maxDescent);
+      targetPitch = THREE.MathUtils.clamp(entry.motion.flightPitch * 1.15, -maxClimb, maxDescent);
       if (entry.state === 'landing' && entry.landingPitch !== null) {
         targetPitch = -entry.landingPitch;
       } else if (entry.state === 'landing' && alt < 6 && targetPitch > 0) {
@@ -2225,14 +2482,15 @@ function animate() {
 
     // Preserve wheel/deck clearance as the airframe rotates around its origin.
     // Remove this adjustment before the next interpolation step to avoid drift.
-    if (['landing', 'landed'].includes(entry.state)) {
+    const contact = groundContactWeight(entry.state, alt);
+    if (contact > 0) {
       const sx = Math.sin(entry.pitch), cx = Math.cos(entry.pitch);
       const sz = Math.sin(totalRoll), cz = Math.cos(totalRoll);
       let bottom = Infinity;
       for (const p of entry.contactPoints) {
         bottom = Math.min(bottom, cx * (sz * p.x + cz * p.y) - sx * p.z);
       }
-      entry.clearanceAdjustment = -bottom * entry.scale - entry.wheelDrop;
+      entry.clearanceAdjustment = contact * (-bottom * entry.scale - entry.wheelDrop);
       entry.group.position.y += entry.clearanceAdjustment;
     }
 
@@ -2306,12 +2564,11 @@ function animate() {
 
     // Retract landing gear while en route or climbing away after takeoff.
     if (entry.gear) {
-      entry.gear.visible =
-        entry.state !== 'cruising'
-        && entry.state !== 'holding'
-        && entry.state !== 'refueling'
-        && !((entry.state === 'departing' || entry.state === 'takeoff') && alt > 18)
-        && !(entry.state === 'landing' && alt > 70);
+      const target = gearTarget(entry.state, alt);
+      if (entry.gearProgress !== target) {
+        entry.gearProgress = advanceGear(entry.gearProgress, target, dt);
+        entry.gear.userData.setProgress(easeGear(entry.gearProgress));
+      }
     }
 
     if (entry.kind === 'fighter') {
@@ -2393,10 +2650,11 @@ function animate() {
   }
 
   // Follow camera: track the selected aircraft while keeping OrbitControls active.
-  const camDt = Math.min(dt, 0.1);
   if (followId !== null) {
     const entry = meshes.get(followId);
-    if (entry) {
+    if (entry && shouldReleaseFollow(entry.state, entry.altitude)) {
+      stopFollow(true);
+    } else if (entry) {
       const pos = entry.group.position;
       if (followLastPos) {
         const move = pos.clone().sub(followLastPos);
@@ -2406,7 +2664,7 @@ function animate() {
       }
       followLastPos = pos.clone();
 
-      const camK = 1 - Math.exp(-5.5 * camDt);
+      const camK = 1 - Math.exp(-5.5 * dt);
       controls.target.lerp(pos, camK);
 
       if (followSwoop) {
@@ -2418,7 +2676,7 @@ function animate() {
       }
     }
   } else if (airportGlideTarget) {
-    const camK = 1 - Math.exp(-5.0 * camDt);
+    const camK = 1 - Math.exp(-5.0 * dt);
     camera.position.lerp(airportGlideTarget.cam, camK);
     controls.target.lerp(airportGlideTarget.target, camK);
     if (camera.position.distanceTo(airportGlideTarget.cam) < 2.0
@@ -2426,7 +2684,7 @@ function animate() {
       airportGlideTarget = null;
     }
   } else if (returnOverview) {
-    const camK = 1 - Math.exp(-4.5 * camDt);
+    const camK = 1 - Math.exp(-4.5 * dt);
     camera.position.lerp(OVERVIEW_CAM, camK);
     controls.target.lerp(OVERVIEW_TARGET, camK);
     if (camera.position.distanceTo(OVERVIEW_CAM) < 2.0 && controls.target.distanceTo(OVERVIEW_TARGET) < 1.0) {

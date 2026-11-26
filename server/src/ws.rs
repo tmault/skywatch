@@ -21,7 +21,14 @@ pub enum ClientFrame {
     /// Chat message from a pilot/agent.
     Message { aircraft_id: u64, text: String },
     /// ATC approval to leave holding.
-    Approve { aircraft_id: u64 },
+    Approve {
+        aircraft_id: u64,
+        request_id: Option<String>,
+    },
+    Reject {
+        aircraft_id: u64,
+        request_id: Option<String>,
+    },
 }
 
 /// Wire format of client→server frames.
@@ -35,6 +42,13 @@ enum ClientMsg {
     },
     Approve {
         aircraft_id: u64,
+        #[serde(default)]
+        request_id: Option<String>,
+    },
+    Reject {
+        aircraft_id: u64,
+        #[serde(default)]
+        request_id: Option<String>,
     },
 }
 
@@ -42,6 +56,7 @@ enum ClientMsg {
 #[derive(Clone)]
 pub struct HubState {
     pub world: SharedWorld,
+    pub demo: bool,
     /// Broadcast channel of delta frames; the sim ticker publishes here.
     pub deltas: broadcast::Sender<String>,
     /// mpsc channel consumed by the adapter layer (Task 4).
@@ -60,23 +75,46 @@ pub fn delta_json(snapshot: &WorldSnapshot) -> String {
 /// Handle a parsed client frame: log it, apply immediate world effects,
 /// forward it to the adapter channel.
 async fn handle_frame(state: &HubState, frame: ClientFrame) {
+    let aircraft_id = match &frame {
+        ClientFrame::Message { aircraft_id, .. }
+        | ClientFrame::Approve { aircraft_id, .. }
+        | ClientFrame::Reject { aircraft_id, .. } => *aircraft_id,
+    };
+    if state
+        .world
+        .lock()
+        .await
+        .aircraft
+        .iter()
+        .any(|a| a.id == aircraft_id && a.scheduled_job.is_some())
+    {
+        return;
+    }
     match &frame {
         ClientFrame::Message { aircraft_id, text } => {
-            tracing::info!(aircraft_id, text, "client message");
+            tracing::info!(aircraft_id, "client message");
+            let _ = text;
         }
-        ClientFrame::Approve { aircraft_id } => {
+        ClientFrame::Approve { aircraft_id, .. } => {
             tracing::info!(aircraft_id, "client approve");
             // Interactive demo effect: release a holding aircraft immediately.
             let mut world = state.world.lock().await;
             if let Some(a) = world
                 .aircraft
                 .iter_mut()
-                .find(|a| a.id == *aircraft_id && a.state == AircraftState::Holding)
+                // Scheduled-job Reapers are read-only: approval never touches them.
+                .find(|a| {
+                    state.demo
+                        && a.id == *aircraft_id
+                        && a.state == AircraftState::Holding
+                        && a.scheduled_job.is_none()
+                })
             {
                 tracing::info!(aircraft_id, callsign = %a.callsign, "releasing holding aircraft");
                 a.release();
             }
         }
+        ClientFrame::Reject { .. } => {}
     }
     if state.adapter_tx.send(frame).await.is_err() {
         tracing::warn!("adapter channel closed; frame dropped");
@@ -115,11 +153,14 @@ async fn handle_socket(socket: WebSocket, state: HubState) {
                     Ok(ClientMsg::Message { aircraft_id, text }) => {
                         handle_frame(&state, ClientFrame::Message { aircraft_id, text }).await;
                     }
-                    Ok(ClientMsg::Approve { aircraft_id }) => {
-                        handle_frame(&state, ClientFrame::Approve { aircraft_id }).await;
+                    Ok(ClientMsg::Approve { aircraft_id, request_id }) => {
+                        handle_frame(&state, ClientFrame::Approve { aircraft_id, request_id }).await;
                     }
-                    Err(e) => {
-                        tracing::debug!(%text, error = %e, "ignoring unknown client frame");
+                    Ok(ClientMsg::Reject { aircraft_id, request_id }) => {
+                        handle_frame(&state, ClientFrame::Reject { aircraft_id, request_id }).await;
+                    }
+                    Err(_) => {
+                        tracing::debug!("ignoring unknown client frame");
                     }
                 }
             }
@@ -147,6 +188,48 @@ mod tests {
     use crate::world::{Aircraft, Kind};
 
     #[tokio::test]
+    async fn scheduled_jobs_ignore_messages_and_approvals_before_forwarding() {
+        let mut w = World::new();
+        let mut a = Aircraft::new("REAP1", Kind::Drone);
+        a.hold("last scheduled run failed");
+        a.scheduled_job = Some(crate::world::ScheduledJob::default());
+        let id = a.id;
+        w.add(a);
+        let world = Arc::new(Mutex::new(w));
+        let (deltas, _) = broadcast::channel(8);
+        let (adapter_tx, mut adapter_rx) = mpsc::channel(8);
+        let state = HubState {
+            demo: false,
+            world: Arc::clone(&world),
+            deltas,
+            adapter_tx,
+        };
+        handle_frame(
+            &state,
+            ClientFrame::Approve {
+                aircraft_id: id,
+                request_id: None,
+            },
+        )
+        .await;
+        handle_frame(
+            &state,
+            ClientFrame::Message {
+                aircraft_id: id,
+                text: "Anon message".into(),
+            },
+        )
+        .await;
+        assert!(adapter_rx.try_recv().is_err());
+        let w = world.lock().await;
+        assert_eq!(w.aircraft[0].state, AircraftState::Holding);
+        assert_eq!(
+            w.aircraft[0].hold_reason.as_deref(),
+            Some("last scheduled run failed")
+        );
+    }
+
+    #[tokio::test]
     async fn approve_releases_holding_aircraft_and_forwards_frame() {
         let world: SharedWorld = Arc::new(Mutex::new(World::new()));
         let mut a = Aircraft::new("SKY1", Kind::Agent);
@@ -157,12 +240,20 @@ mod tests {
         let (deltas, _dr) = broadcast::channel(64);
         let (adapter_tx, mut adapter_rx) = mpsc::channel(64);
         let state = HubState {
+            demo: true,
             world: Arc::clone(&world),
             deltas,
             adapter_tx,
         };
 
-        handle_frame(&state, ClientFrame::Approve { aircraft_id: id }).await;
+        handle_frame(
+            &state,
+            ClientFrame::Approve {
+                aircraft_id: id,
+                request_id: None,
+            },
+        )
+        .await;
 
         let world = state.world.lock().await;
         let a = world.aircraft.iter().find(|a| a.id == id).unwrap();
@@ -171,11 +262,37 @@ mod tests {
         drop(world);
 
         match adapter_rx.recv().await.unwrap() {
-            ClientFrame::Approve { aircraft_id } => assert_eq!(aircraft_id, id),
+            ClientFrame::Approve { aircraft_id, .. } => assert_eq!(aircraft_id, id),
             other => panic!("unexpected frame: {other:?}"),
         }
     }
 
+    #[tokio::test]
+    async fn live_approval_does_not_release_before_backend_acceptance() {
+        let world: SharedWorld = Arc::new(Mutex::new(World::new()));
+        let mut a = Aircraft::new("SKY1", Kind::Agent);
+        a.hold("permission");
+        let id = a.id;
+        world.lock().await.add(a);
+        let (deltas, _) = broadcast::channel(8);
+        let (adapter_tx, mut rx) = mpsc::channel(8);
+        let state = HubState {
+            world: world.clone(),
+            demo: false,
+            deltas,
+            adapter_tx,
+        };
+        handle_frame(
+            &state,
+            ClientFrame::Approve {
+                aircraft_id: id,
+                request_id: Some("per1".into()),
+            },
+        )
+        .await;
+        assert_eq!(world.lock().await.aircraft[0].state, AircraftState::Holding);
+        assert!(matches!(rx.recv().await, Some(ClientFrame::Approve { .. })));
+    }
     #[tokio::test]
     async fn approve_non_holding_aircraft_is_noop() {
         let world: SharedWorld = Arc::new(Mutex::new(World::new()));
@@ -187,12 +304,20 @@ mod tests {
         let (deltas, _dr) = broadcast::channel(64);
         let (adapter_tx, _adapter_rx) = mpsc::channel(64);
         let state = HubState {
+            demo: true,
             world: Arc::clone(&world),
             deltas,
             adapter_tx,
         };
 
-        handle_frame(&state, ClientFrame::Approve { aircraft_id: id }).await;
+        handle_frame(
+            &state,
+            ClientFrame::Approve {
+                aircraft_id: id,
+                request_id: None,
+            },
+        )
+        .await;
 
         let world = state.world.lock().await;
         let a = world.aircraft.iter().find(|a| a.id == id).unwrap();

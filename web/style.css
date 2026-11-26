@@ -789,3 +789,33 @@ button.tick-line.active {
     animation: none;
   }
 }
+
+#radio-hold-reason.reaper-details { white-space: pre-line; color: #c3b6f5; }
+#radio-hold-reason.reaper-failed { color: #ff8895; }
+
+#theme-trigger { font: inherit; letter-spacing: inherit; color: inherit; background: transparent; border: 0; padding: 4px 0; cursor: pointer; }
+#theme-trigger:focus-visible, #theme-picker button:focus-visible, #theme-picker input:focus-visible { outline: 2px solid #91dbff; outline-offset: 4px; }
+#theme-picker { color: var(--text); background: #171e27; border: 1px solid #778799; border-radius: 16px; padding: 24px; width: min(390px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); }
+#theme-picker::backdrop { background: #07121b88; }
+#theme-picker h2 { margin: 0 0 8px; font-size: 24px; }
+#theme-picker p { color: #c4d0dd; line-height: 1.5; }
+#theme-picker fieldset { border: 0; padding: 0; margin: 20px 0; }
+#theme-picker legend { font-weight: 600; margin-bottom: 10px; }
+#theme-picker label { display: block; padding: 12px 8px; border-radius: 8px; cursor: pointer; }
+#theme-picker label:has(:checked) { background: #304459; }
+#theme-picker input { accent-color: #8bd7ff; margin-right: 8px; }
+#theme-picker label span { display: block; padding-left: 25px; color: #c4d0dd; font-size: 13px; margin-top: 5px; }
+.theme-done { background: #c8eaff; color: #152535; border: 0; border-radius: 8px; padding: 10px 20px; font: inherit; cursor: pointer; }
+#theme-trigger { pointer-events: auto; }
+
+/* Subscription fuel depot: keyboard entry and equivalent text for every tank. */
+#fuel-depot-button { position: fixed; left: 18px; bottom: 18px; z-index: 15; padding: 9px 14px; color: #f4f9fc; background: #172d3ee8; border: 1px solid #94acb9; border-radius: 6px; cursor: pointer; }
+#hud-right-meta #fuel-depot-button { position: static; pointer-events: auto; padding: 4px 10px; font-size: 13px; font-weight: 600; border-radius: 2px; background: rgba(16, 19, 24, 0.84); border: 1px solid rgba(255, 255, 255, 0.24); }
+#hud-right-meta #fuel-depot-button:hover { background: rgba(34, 48, 62, 0.94); }
+#fuel-depot-button:focus-visible, #fuel-depot-panel button:focus-visible, #fuel-depot-panel:focus-visible { outline: 3px solid #7ee6df; outline-offset: 2px; }
+#fuel-depot-panel { position: fixed; z-index: 30; right: 18px; top: 80px; width: min(440px, calc(100vw - 36px)); max-height: calc(100vh - 160px); overflow: auto; box-sizing: border-box; padding: 20px; color: #f4f9fc; background: #122838f5; border: 1px solid #94acb9; border-radius: 9px; font: 14px/1.5 system-ui; }
+#fuel-depot-panel[hidden] { display: none; }
+#fuel-depot-panel h2 { margin: 0 0 12px; font-size: 20px; }
+#fuel-depot-panel h3 { margin-bottom: 5px; font-size: 16px; }
+#fuel-depot-panel article { border-top: 1px solid #688292; margin-top: 14px; overflow-wrap: anywhere; }
+#fuel-depot-panel button { color: #102936; background: #e3eff3; border: 0; border-radius: 4px; padding: 6px 12px; cursor: pointer; }

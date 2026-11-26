@@ -87,24 +87,54 @@ class Client:
         return json.loads(next(c['text'] for c in result['content'] if c['type'] == 'text'))
 
 
-def list_peer_threads(client, environment_id):
+def list_projects(client, environment_id):
+    """Project id -> title; raises if the listing is incomplete."""
     projects = {}
-    try:
-        cursor = None
-        while True:
-            args = {'environmentId': environment_id, 'limit': 100}
-            if cursor is not None:
-                args['cursor'] = cursor
-            page = client.call('t3_project_list', args)
-            for proj in page.get('projects', []):
-                title = (proj.get('title') or '').strip()
-                if proj.get('id') and title:
-                    projects[proj['id']] = title
-            cursor = page.get('nextCursor')
-            if cursor is None:
-                break
-    except Exception:
-        pass
+    cursor = None
+    while True:
+        args = {'environmentId': environment_id, 'limit': 100}
+        if cursor is not None:
+            args['cursor'] = cursor
+        page = client.call('t3_project_list', args)
+        for proj in page.get('projects', []):
+            if proj.get('id'):
+                projects[proj['id']] = (proj.get('title') or '').strip()
+        cursor = page.get('nextCursor')
+        if cursor is None:
+            return projects
+
+
+# Schedule trigger fields Skywatch may show. Webhook filters, signatures,
+# secrets and dedupe keys are dropped before anything leaves this process.
+SCHEDULE_FIELDS = ('type', 'everyMs', 'timeOfDay', 'weekdays', 'runAt')
+# Task fields Skywatch may show. The prompt never leaves this process.
+TASK_FIELDS = ('scheduledTaskId', 'title', 'enabled', 'boundThreadId', 'nextRunAt',
+               'lastRunAt', 'lastRunStatus', 'runCount')
+
+
+def safe_task(task, project_title):
+    row = {key: task[key] for key in TASK_FIELDS if key in task}
+    schedule = task.get('schedule') if isinstance(task.get('schedule'), dict) else {}
+    row['schedule'] = {key: schedule[key] for key in SCHEDULE_FIELDS if key in schedule}
+    if project_title:
+        row['project'] = project_title
+    return row
+
+
+def list_peer_scheduled_tasks(client, environment_id, projects):
+    """Read-only listing of every project's scheduled tasks, or None if any
+    project could not be listed (a partial list must not look like deletions)."""
+    rows = []
+    for project_id, title in projects.items():
+        page = client.call('list_scheduled_tasks', {'environmentId': environment_id, 'projectId': project_id})
+        for task in page.get('tasks', []):
+            if isinstance(task, dict) and task.get('scheduledTaskId'):
+                rows.append(safe_task(task, title))
+    return rows
+
+
+def list_peer_threads(client, environment_id, projects):
+    projects = {pid: title for pid, title in (projects or {}).items() if title}
 
     rows = []
     seen = set()
@@ -156,12 +186,22 @@ def main():
     result = []
     for peer in peers:
         item = {'environment_id': peer['environmentId'], 'label': peer['label'],
-                'online': peer['status'] == 'reachable', 'threads': None}
+                'online': peer['status'] == 'reachable', 'threads': None,
+                'scheduled_tasks': None}
         if item['online']:
             try:
-                item['threads'] = list_peer_threads(client, peer['environmentId'])
+                projects = list_projects(client, peer['environmentId'])
+            except Exception:
+                projects = None
+            try:
+                item['threads'] = list_peer_threads(client, peer['environmentId'], projects)
             except Exception:
                 item['online'] = False
+            if item['online'] and projects is not None and request.get('scheduledTasks'):
+                try:
+                    item['scheduled_tasks'] = list_peer_scheduled_tasks(client, peer['environmentId'], projects)
+                except Exception:
+                    pass
         result.append(item)
     return result
 

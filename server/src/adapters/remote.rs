@@ -9,6 +9,9 @@ pub struct Peer {
     pub label: String,
     pub online: bool,
     pub threads: Option<Vec<Value>>,
+    /// Safe scheduled-task summaries (`None` when the peer could not be listed).
+    #[serde(default)]
+    pub scheduled_tasks: Option<Vec<Value>>,
 }
 #[derive(Default)]
 pub struct Cache {
@@ -22,6 +25,10 @@ impl Cache {
             if update.threads.is_none() {
                 update.online = false;
                 update.threads = self.peers.get(&update.environment_id).and_then(|p| p.threads.clone());
+            }
+            // A failed task listing keeps the last known jobs; a successful one is authoritative.
+            if update.scheduled_tasks.is_none() {
+                update.scheduled_tasks = self.peers.get(&update.environment_id).and_then(|p| p.scheduled_tasks.clone());
             }
             if let (Some(previous), Some(current)) = (self.peers.get(&update.environment_id).and_then(|p| p.threads.as_ref()), update.threads.as_mut()) {
                 for old in previous {
@@ -43,9 +50,21 @@ pub fn owner(key: &str) -> Option<(String, String)> {
 mod tests {
     use super::*;
     #[test]
+    fn failed_job_listing_keeps_jobs_and_authoritative_empty_removes_them() {
+        let mut cache = Cache::default();
+        let peer = |jobs| Peer { environment_id: "anon-device".into(), label: "Anon".into(),
+            online: true, threads: Some(vec![]), scheduled_tasks: jobs };
+        cache.merge(vec![peer(Some(vec![serde_json::json!({"scheduledTaskId":"anon-job"})]))]);
+        let failed = cache.merge(vec![peer(None)]);
+        assert_eq!(failed[0].scheduled_tasks.as_ref().unwrap().len(), 1);
+        let empty = cache.merge(vec![peer(Some(vec![]))]);
+        assert!(empty[0].scheduled_tasks.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
     fn partial_peer_polls_preserve_last_known_threads_and_identity() {
         let mut cache = Cache::default();
-        let peer = |online, threads| Peer { environment_id: "mac".into(), label: "Mac".into(), online, threads };
+        let peer = |online, threads| Peer { environment_id: "mac".into(), label: "Mac".into(), online, threads, scheduled_tasks: None };
         cache.merge(vec![peer(true, Some(vec![serde_json::json!({"threadId":"one"})]))]);
         let failed = cache.merge(vec![peer(false, None)]);
         assert_eq!(failed[0].threads.as_ref().unwrap().len(), 1);
